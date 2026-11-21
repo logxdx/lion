@@ -240,14 +240,14 @@ template <int K, int NT, bool EX, int NB>
 __device__ __forceinline__ void prologue_q(const GemvArgs& a, int8_t* xq, float* xd, float* xf, int nb) {
     if constexpr (EX) {
         for (int i = threadIdx.x; i < K; i += NT) xf[i] = a.xf_in[i];
-        return;
+    } else {
+        for (int i = threadIdx.x; i < nb * (K / 16); i += NT) {
+            const int b = i / (K / 16), j = i % (K / 16);
+            int4 v = *(const int4*)(a.xq_in + (size_t)b * K + j * 16);
+            *(int4*)(xq + (size_t)b * K + perm_idx<K>(j * 16)) = v;
+        }
+        for (int i = threadIdx.x; i < nb * (K / 32); i += NT) xd[i] = a.xd_in[i];
     }
-    for (int i = threadIdx.x; i < nb * (K / 16); i += NT) {
-        const int b = i / (K / 16), j = i % (K / 16);
-        int4 v = *(const int4*)(a.xq_in + (size_t)b * K + j * 16);
-        *(int4*)(xq + (size_t)b * K + perm_idx<K>(j * 16)) = v;
-    }
-    for (int i = threadIdx.x; i < nb * (K / 32); i += NT) xd[i] = a.xd_in[i];
 }
 
 // ---- per-warp dot products of RB consecutive rows with NB shared-memory activations ----

@@ -57,7 +57,7 @@ struct Request {
 // ================================================================================================
 struct SchedConfig {
     int idle_chunk = 4096;   // prompt tokens per feed() when nothing is decoding
-    int busy_chunk = 512;    // ... while other sequences are decoding (one decode step after each chunk)
+    int busy_chunk = 1024;   // ... while others decode (one decode step per chunk); swept: bench/server_load.py stall
     int max_queue = 64;
     int checkpoint_every = 16384;  // extra checkpoints inside long prompts
     int max_checkpoints = 6;
@@ -719,7 +719,7 @@ static void usage() {
             "  --max-tokens N             default max_tokens (default 4096)\n"
             "  --temp F --top-k N --top-p F --min-p F --repeat-penalty F --repeat-last-n N   default sampling\n"
             "  --reasoning-preserve       keep reasoning of earlier assistant turns in the prompt\n"
-            "  --busy-chunk N             prompt tokens per step while others decode (default 512)\n"
+            "  --busy-chunk N             prompt tokens per step while others decode (default 1024; 512 = smoother streams, slower new prompts)\n"
             "  --idle-chunk N             prompt tokens per step otherwise (default 4096)\n"
             "  --max-queue N              queued requests before 503 (default 64)\n"
             "  --cache-ram-mib N          RAM prompt-cache tier (default 4096, 0 = off)\n"

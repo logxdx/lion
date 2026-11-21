@@ -197,7 +197,8 @@ int main(int argc, char** argv) {
                 // different lengths per slot: exercises per-slot positions and the SWA ring
                 std::string q = std::string("Explain ") + topics[i % 8] + " in detail." + std::string(i * 40, ' ');
                 for (int r = 0; r < i * 30; r++) q += " Please be thorough.";
-                prompts[i] = tk.encode(render_chat({{"user", q}}, "", false, true));
+                const std::vector<Msg> one = {{"user", q}};
+                prompts[i] = tk.encode(render_chat(one, "", false, true));
             }
             std::vector<int> slots(N);
             for (int i = 0; i < N; i++) { slots[i] = i; eng.prefill(prompts[i], i); }
@@ -277,7 +278,8 @@ int main(int argc, char** argv) {
         eng.use_batched_prefill = !seq_prefill && !exact;  // exact reference: every token via the f32 path
 
         if (dump_logits) {
-            std::string text = raw ? prompt : render_chat({{"user", prompt}}, system, think, true);
+            const std::vector<Msg> one = {{"user", prompt}};
+            std::string text = raw ? prompt : render_chat(one, system, think, true);
             auto ids = tk.encode(text);
             eng.prefill(ids);
             SamplingParams g; g.temperature = 0; g.repeat_penalty = 1.0f;

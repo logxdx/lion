@@ -109,6 +109,55 @@ over the last 64 tokens; `--repeat-last-n -1` = whole context). Options: `--temp
 `--kv q8|f16`. The library API (`src/engine.h`) exposes per-slot `prefill(tokens, slot)` and
 `generate_multi(slots, ...)` for concurrent sequences.
 
+## OpenAI-compatible server (`build/liquid-server`)
+
+```sh
+./serve.sh                                   # 4 slots x 100k context, q8 KV, RAM + disk prompt cache, port 8080
+build/liquid-server -m $M -np 4 -c 100000 --port 8080 --cache-ram-mib 4096 --cache-disk-mib 16384
+curl localhost:8080/v1/chat/completions -d '{"messages":[{"role":"user","content":"hi"}],"stream":true}'
+```
+
+Endpoints: `POST /v1/chat/completions` (stream + non-stream, `tools` -> `tool_calls`, `reasoning_content`,
+`chat_template_kwargs.enable_thinking/preserve_thinking`, `stop`, `seed`, `max_tokens`/`max_completion_tokens`,
+`temperature/top_p/top_k/min_p/repeat_penalty/repeat_last_n`, `stream_options.include_usage`, `ignore_eos`),
+`POST /v1/completions` (text or token ids), `GET /v1/models`, `GET /health`, `GET /slots` (slot + cache state),
+`POST /tokenize`. Responses carry `usage.prompt_tokens_details.cached_tokens` and llama.cpp-style `timings`
+(queue, prefill, restore, decode, cache tier). Point an agent at `http://127.0.0.1:8080/v1`, model `lfm3`.
+
+How it works:
+- **HTTP**: cpp-httplib + nlohmann/json, vendored header-only, no runtime dependencies. Chosen by measurement on this
+  box (`bench` in the task log): 381k small req/s, 6.8 M SSE events/s, 0.48 ms per 476 KB (100k-token) POST,
+  1.8 ms JSON parse; the GPU needs ~1k token events/s, so the HTTP layer has >1000x headroom. Bounded worker pool,
+  read/write timeouts, 256 MB body cap, client disconnect -> generation cancelled, SIGINT/SIGTERM -> graceful stop.
+- **Chat template**: C++ port of the GGUF jinja template (tools, tool calls/responses, thinking keep/strip), byte-
+  identical to llama-server's `/apply-template` on the test conversations (`tests/compare_template.py`); output is
+  parsed into reasoning / content / tool calls (typed by each tool's JSON schema), streaming-safe.
+- **Scheduler** (one GPU thread): FIFO queue (`--max-queue`, then 503) -> free slot with the longest reusable prefix
+  -> prompt fed in chunks; while other slots decode, one decode step runs after every `--busy-chunk` prompt tokens,
+  so a long new prompt no longer freezes running streams. Finished sequences leave the batch at once.
+- **Prefix reuse**: LFM3's conv layers cannot be rewound, so every slot keeps state checkpoints (conv state + the
+  256-token sliding-window KV, ~1.9 MB) at the end of each prompt and every 16k tokens; a new request resumes from
+  the newest checkpoint inside its shared prefix. All restore paths are bit-identical (`tests/test_engine_api.cpp`).
+- **RAM / disk tiers** (`--cache-ram-mib`, `--cache-disk-mib`, `--cache-dir`): a slot's conversation is moved down
+  a tier before the slot is reused for something else (pinned RAM, LRU), RAM spills to disk on a background
+  thread, files are written atomically, keyed by model + KV geometry, and reloaded at startup; on shutdown the
+  RAM tier is flushed to disk.
+
+Measured (Q8_0, q8 KV, same GPU; llama.cpp = llama-server with the `[lfm3]` preset settings, same cache budgets):
+
+| scenario | llama-server | liquid-server |
+|---|---|---|
+| 4 concurrent streams (512-token prompts, 256 tokens each), tok/s overall | 338 | **401** |
+| 8 requests on 4 slots, tok/s overall | 336 | **422** |
+| new ~24k-token prompt while 3 streams decode: its TTFT | 3194 ms | **3127 ms** |
+| ... the 3 running streams meanwhile (total tok/s, worst gap) | 16.9, 288 ms | **25.9, 146 ms** |
+| agent trace: 6 agents x 8 turns on 4 slots (3k system + 1.5k tool result per turn): wall | 24.8 s | **22.0 s** |
+| ... TTFT p50 / p90 | 1577 / 2140 ms | **1238 / 1603 ms** |
+
+Cache tiers for a 48k-token conversation (`bench/cache_tiers.py`): cold prefill 6382 ms; next turn in the same
+slot 27 ms; after eviction to RAM 26 ms restore; after a server restart 82 ms restore from disk (warm page cache;
+a cold read of the 318 MB entry at the NVMe's measured 1.4 GB/s adds ~220 ms).
+
 ## Design
 
 **Weights** are repacked on the GPU at load time (lossless, bit-identical values):
@@ -162,10 +211,13 @@ attention phase), `bench/attn_sweep.sh`, `bench/kv_ab.sh`, `LIQUID_OCC=1` (atten
 
 - Specialised: LFM3-1.7B dimensions are checked at load and hard-wired (2048/7680/16 heads/128 dims, conv 7);
   only `Q8_0` and `Q6_K` weights. Other LFM3 sizes or quant types are rejected.
-- No HTTP server; concurrency is available through the library API and the benchmark mode. Prefill runs one
-  sequence at a time (decode of other sequences waits while a slot prefills).
-- Multi-turn chat appends to the cache when the rendered conversation extends it, otherwise re-prefills (the
-  recurrent conv state cannot be rewound).
+- Server: up to 8 slots (compile-time `MAX_SLOTS`); one model per process; `n > 1`, logprobs and
+  presence/frequency penalties are not implemented; tool-call arguments are streamed as one delta per call.
+  Prompt chunks are interleaved with decode steps rather than fused into one batch (the running streams slow
+  to ~8 tok/s each during a long prefill instead of stopping).
+- A disk-tier restore runs on the GPU thread (~0.1-0.3 s for a 48k-token conversation); other streams pause
+  for that time. Reuse needs a checkpoint inside the shared prefix: when an agent's earlier reply re-tokenizes
+  differently, the tokens after the last checkpoint are prefilled again (llama.cpp behaves the same).
 - Memory: KV per token 6.5 KiB (q8) / 12 KiB (f16) per sequence. Measured: 4 x 100k with q8 KV = 4.4 GB total
   (Q8_0 weights). `-c 262144` (the model's full context) allocates and runs: 3.5 GB with q8 KV, 4.9 GB with f16;
   long prompts were benchmarked up to 130k tokens.
