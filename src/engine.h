@@ -13,6 +13,7 @@ namespace gguf { class File; }
 namespace le {
 
 enum WType { W_Q8 = 0, W_Q6 = 1 };
+constexpr int MAX_SLOTS = 8;  // concurrent sequences (batched decode)
 
 // Repacked quantized matrix: N output rows x K inputs (see kernels for the exact layouts).
 struct QWeight {
@@ -50,35 +51,45 @@ struct Layer {
     QWeight w_down;
     float *attn_norm = nullptr, *ffn_norm = nullptr, *post_attn_norm = nullptr, *post_ffn_norm = nullptr;
     float *conv_w = nullptr;            // [n_embd][7]
-    float *conv_state = nullptr;        // [n_embd][6]
+    float *conv_state = nullptr;        // [slot][n_embd][6]
     float *q_norm = nullptr, *k_norm = nullptr, *rope_ff = nullptr;
-    void *kc = nullptr, *vc = nullptr;  // [n_kv][cap][128] f16, or int8 with --kv q8
-    half *ks = nullptr, *vs = nullptr;  // q8 KV: per-32 scales [n_kv][cap][4]
+    void *kc = nullptr, *vc = nullptr;  // [slot][n_kv][cap][128] f16, or int8 with --kv q8
+    half *ks = nullptr, *vs = nullptr;  // q8 KV: per-32 scales [slot][n_kv][cap][4]
     int cap = 0;
+    size_t kv_slot_bytes = 0, kvs_slot_elems = 0;  // per-slot strides of kc/vc and ks/vs
 };
 
 struct Timing { double prefill_ms = 0, decode_ms = 0; int prefill_tokens = 0, decode_tokens = 0; };
 
 class Engine {
 public:
-    // exact: debug reference mode (f32 activations, exactly dequantized weights; slow)
+    // max_ctx: context per sequence; n_slots: concurrent sequences (1..MAX_SLOTS)
+    // exact: debug reference mode (f32 activations, exactly dequantized weights; slow; 1 slot)
     // kv_q8: store the KV cache as q8_0 (int8 + f16 scale per 32) instead of f16
-    Engine(const std::string& gguf_path, int max_ctx, bool verbose = true, bool exact = false, bool kv_q8 = false);
+    Engine(const std::string& gguf_path, int max_ctx, bool verbose = true, bool exact = false, bool kv_q8 = false,
+           int n_slots = 1);
     bool kv_q8() const { return kv_q8_; }
     ~Engine();
 
     const Config& config() const { return cfg_; }
-    int n_past() const { return n_past_; }
+    int n_past(int slot = 0) const { return n_past_[slot]; }
     int max_ctx() const { return max_ctx_; }
+    int n_slots() const { return n_slots_; }
+    size_t gpu_bytes() const { return arena_size_; }
 
-    void reset();  // clear KV / conv state
-    // Feed tokens (prompt). Returns nothing; logits of the last token are ready for sampling.
-    void prefill(const std::vector<int>& tokens);
-    // Generate up to n tokens; calls on_token for each (return false to stop). Stops at stop tokens
-    // (the stop token is returned to the callback but NOT consumed into the state).
+    void reset(int slot = -1);  // clear KV / conv state of one slot (-1: all)
+    // Feed prompt tokens into a slot (the last token stays pending until generation).
+    void prefill(const std::vector<int>& tokens, int slot = 0);
+    // Generate up to n tokens in slot 0; on_token is called per token (return false to stop). Stops at stop
+    // tokens (returned to the callback but NOT consumed into the state).
     std::vector<int> generate(int n, const SamplingParams& sp, const std::vector<int>& stop,
                               bool (*on_token)(int, void*) = nullptr, void* ud = nullptr);
-    // logits of the last processed token (host copy), for testing
+    // Batched decode of several slots at once (weights are streamed once per step for all of them).
+    // on_token(slot, token, ud): return false to stop that slot.
+    std::vector<std::vector<int>> generate_multi(const std::vector<int>& slots, int n, const SamplingParams& sp,
+                                                 const std::vector<int>& stop,
+                                                 bool (*on_token)(int, int, void*) = nullptr, void* ud = nullptr);
+    // logits of the last processed token of batch row 0 (host copy), for testing
     std::vector<float> logits();
     // per-kernel timing of eager decode steps (stderr)
     void profile_decode(int steps);
@@ -88,18 +99,19 @@ public:
 
 private:
     Config cfg_;
-    int max_ctx_ = 0, n_past_ = 0, pending_ = -1;
+    int max_ctx_ = 0, n_slots_ = 1;
+    int n_past_[MAX_SLOTS] = {}, pending_[MAX_SLOTS];
     bool kv_q8_ = false;
     std::vector<Layer> L_;
     QWeight emb_;                 // token_embd == output (tied)
     float* out_norm_ = nullptr;
-    void* arena_ = nullptr;
-    size_t arena_off_ = 0, arena_size_ = 0;
+    size_t arena_size_ = 0;
 
     struct Bufs;
     std::unique_ptr<Bufs> B_;
     cudaStream_t st_ = nullptr;
-    cudaGraphExec_t g_decode_ = nullptr, g_step_nohead_ = nullptr;
+    cudaGraphExec_t g_decode_[MAX_SLOTS + 1] = {};  // by batch size
+    cudaGraphExec_t g_step_nohead_ = nullptr;
     bool verbose_ = true;
 
     void* alloc(size_t bytes);
@@ -107,10 +119,11 @@ private:
     void upload_qweight(const gguf::File& f, QWeight& w, const std::vector<std::string>& parts, int tile_in, int tile_out);
     float* upload_f32(const gguf::File& f, const std::string& name);
     void build_graphs();
-    void enqueue_step(bool with_head, cudaStream_t s);
-    void enqueue_sample(cudaStream_t s);
-    void prefill_batched(const int* tokens, int n);
-    void set_sampling(const SamplingParams& sp, const std::vector<int>& stop);
+    void enqueue_step(bool with_head, int nb, cudaStream_t s);
+    void enqueue_sample(int nb, cudaStream_t s);
+    void prefill_batched(int slot, const int* tokens, int n);
+    void set_sampling(int slot, const SamplingParams& sp, const std::vector<int>& stop);
+    void set_slots(const int* slots, int nb);
 };
 
 }  // namespace le

@@ -231,13 +231,25 @@ __global__ void __launch_bounds__(768) k_qk_rope_cache(const float* qkvg, int p0
 // flash attention (prefill): grid (ceil(T/32), 4 kv heads); 8 warps = 4 q heads x 2 token tiles of 16
 // ------------------------------------------------------------------------------------------------
 constexpr int FA_BQ = 32, FA_BK = 64;
+#ifndef FA_DB
+#define FA_DB 0  // 1: double-buffered K/V tiles (f16 KV path), 64 KB dynamic smem
+#endif
+constexpr size_t FA_DB_SMEM = (size_t)4 * FA_BK * 128 * 2;
 
 template <bool Q8>
 __global__ void __launch_bounds__(256) k_flash_prefill(const half* qh, const float* qkvg, const void* kc, const void* vc,
                                                        const half* ks, const half* vs, int cap, int window, int p0,
                                                        int T, int8_t* oq, float* od) {
+#if FA_DB
+    extern __shared__ __align__(128) uint8_t fa_dyn[];
+    half* const KsB = (half*)fa_dyn;                 // [2][FA_BK*128]
+    half* const VsB = KsB + 2 * FA_BK * 128;          // [2][FA_BK*128]
+    half* Ks = KsB;
+    half* Vs = VsB;
+#else
     __shared__ __align__(128) half Ks[FA_BK * 128];
     __shared__ __align__(128) half Vs[FA_BK * 128];
+#endif
     const int kvh = blockIdx.y, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int g = lane >> 2, tig = lane & 3;
     const int qhd = kvh * 4 + (warp & 3);          // query head of this warp
@@ -269,8 +281,40 @@ __global__ void __launch_bounds__(256) k_flash_prefill(const half* qh, const flo
 
     const half* kbase = (const half*)kc + (size_t)kvh * cap * 128;
     const half* vbase = (const half*)vc + (size_t)kvh * cap * 128;
+#if FA_DB
+    // FA_DB experiment: valid for the f16 KV path only (q8 instantiation is not used with it)
+    auto issue_tile = [&](int kb_, half* Kd, half* Vd) {
+        for (int i = threadIdx.x; i < FA_BK * 16; i += 256) {
+            const int r = i >> 4, c = i & 15;
+            const int kp = kb_ + r;
+            const bool ok = kp <= qp_last;
+            const size_t off = (size_t)((ok ? kp : kb_) % cap) * 128 + c * 8;
+            const int sc = (c & 8) | ((c ^ r) & 7);
+            cp_async16(Kd + r * 128 + sc * 8, kbase + off, ok);
+            cp_async16(Vd + r * 128 + sc * 8, vbase + off, ok);
+        }
+        cp_commit();
+    };
+    issue_tile(k_lo, KsB, VsB);
+    int it_ = 0;
+#endif
     for (int kb = k_lo; kb <= qp_last; kb += FA_BK) {
+#if FA_DB
+        {
+            __syncthreads();  // every warp is done with the buffer the next prefetch overwrites
+            const int cur = it_ & 1;
+            if (kb + FA_BK <= qp_last) issue_tile(kb + FA_BK, KsB + (cur ^ 1) * FA_BK * 128, VsB + (cur ^ 1) * FA_BK * 128);
+            else cp_commit();  // keep the group count uniform
+            cp_wait<1>();
+            Ks = KsB + cur * FA_BK * 128;
+            Vs = VsB + cur * FA_BK * 128;
+            it_++;
+        }
         __syncthreads();
+        if (false) {
+#else
+        __syncthreads();
+#endif
         // load K/V tile: 64 rows x 16 chunks of 16B each, swizzled
         if constexpr (Q8) {
             // 64 rows x 8 chunks of 16 int8 -> dequantise to f16 into the same swizzled tiles
@@ -329,6 +373,9 @@ __global__ void __launch_bounds__(256) k_flash_prefill(const half* qh, const flo
         cp_commit();
         cp_wait<0>();
         }
+#if FA_DB
+        }
+#endif
         __syncthreads();
         if (t0 >= T) continue;
         // S = Q K^T  (16 x 64)

@@ -30,6 +30,8 @@ static void usage() {
             "                     sampling (defaults from the model card: 0.1 / 50 / 1.0 / 0 / 1.1 / 64)\n"
             "  --greedy           temperature 0, no penalty\n"
             "  --bench            benchmark: --pp N prompt tokens, --tg N generated tokens, --reps N\n"
+            "  --parallel N       with --bench: N concurrent sequences (batched decode), aggregate t/s\n"
+            "  --test-multi N     check: N prompts decoded together == each decoded alone (greedy)\n"
             "  --tokenize TEXT    print token ids\n"
             "  --dump-logits      after the prompt, print the top-10 next-token logits\n"
             "  --seq-prefill      process the prompt token by token (debug)\n"
@@ -99,7 +101,7 @@ int main(int argc, char** argv) {
     bool interactive = false, raw = false, think = true, bench = false, dump_logits = false, quiet = false;
     bool seq_prefill = false, show_special = false, do_tokenize = false, exact = false, profile = false;
     bool kv_q8 = false;
-    int n_predict = 2048, ctx = 32768, pp = 512, tg = 128, reps = 3;
+    int n_predict = 2048, ctx = 32768, pp = 512, tg = 128, reps = 3, parallel = 1, test_multi = 0;
     SamplingParams sp;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -134,6 +136,8 @@ int main(int argc, char** argv) {
         else if (a == "--pp") pp = std::stoi(next());
         else if (a == "--tg") tg = std::stoi(next());
         else if (a == "--reps") reps = std::stoi(next());
+        else if (a == "--parallel" || a == "-np") parallel = std::stoi(next());
+        else if (a == "--test-multi") test_multi = std::stoi(next());
         else if (a == "--tokenize") { do_tokenize = true; tok_text = next(); }
         else if (a == "--dump-logits") dump_logits = true;
         else if (a == "--seq-prefill") seq_prefill = true;
@@ -177,6 +181,69 @@ int main(int argc, char** argv) {
             eng.profile_prefill(std::min(pp, 32768));
             eng.prefill(toks);
             eng.profile_decode(21);
+            return 0;
+        }
+        if (test_multi > 0) {
+            // N different prompts decoded in one batch must give exactly the tokens each gives alone
+            const int N = test_multi;
+            Engine eng(model, std::max(ctx, 4096), !quiet, false, kv_q8, N);
+            SamplingParams g; g.temperature = 0; g.repeat_penalty = 1.0f;
+            const char* topics[8] = {"the history of the printing press", "how vaccines train the immune system",
+                                     "why the sky is blue", "the rules of chess", "how a compiler works",
+                                     "the water cycle", "black holes", "the French revolution"};
+            std::vector<std::vector<int>> prompts(N);
+            for (int i = 0; i < N; i++) {
+                // different lengths per slot: exercises per-slot positions and the SWA ring
+                std::string q = std::string("Explain ") + topics[i % 8] + " in detail." + std::string(i * 40, ' ');
+                for (int r = 0; r < i * 30; r++) q += " Please be thorough.";
+                prompts[i] = tk.encode(render_chat({{"user", q}}, "", false, true));
+            }
+            std::vector<int> slots(N);
+            for (int i = 0; i < N; i++) { slots[i] = i; eng.prefill(prompts[i], i); }
+            auto batched = eng.generate_multi(slots, tg, g, {});
+            int fails = 0;
+            for (int i = 0; i < N; i++) {
+                eng.reset(0);
+                eng.prefill(prompts[i], 0);
+                auto alone = eng.generate(tg, g, {});
+                size_t k = 0;
+                while (k < alone.size() && k < batched[i].size() && alone[k] == batched[i][k]) k++;
+                const bool ok = k == alone.size() && alone.size() == batched[i].size();
+                fails += !ok;
+                printf("slot %d: prompt %zu tok, batched %zu / alone %zu tokens, first mismatch at %zu -> %s\n", i,
+                       prompts[i].size(), batched[i].size(), alone.size(), k, ok ? "IDENTICAL" : "DIFF");
+            }
+            printf("%s\n", fails ? "FAIL" : "PASS");
+            return fails ? 1 : 0;
+        }
+        if (bench && parallel > 1) {
+            const int N = parallel;
+            Engine eng(model, std::max(ctx, pp + tg + 16), !quiet, false, kv_q8, N);
+            SamplingParams g; g.temperature = 0; g.repeat_penalty = 1.0f;
+            std::vector<int> slots(N);
+            for (int i = 0; i < N; i++) slots[i] = i;
+            std::vector<double> pps, tgs;
+            for (int r = 0; r < reps + 1; r++) {
+                eng.reset();
+                eng.timing = Timing{};
+                for (int i = 0; i < N; i++) {
+                    std::vector<int> toks(pp);
+                    for (int j = 0; j < pp; j++) toks[j] = 1000 + ((j + 7 * i) * 7919) % 100000;
+                    eng.prefill(toks, i);
+                }
+                const double pms = eng.timing.prefill_ms;
+                eng.timing.decode_ms = 0; eng.timing.decode_tokens = 0;
+                eng.generate_multi(slots, tg, g, {});
+                if (r == 0) continue;
+                pps.push_back(eng.timing.prefill_tokens / (pms / 1e3));
+                tgs.push_back(eng.timing.decode_tokens / (eng.timing.decode_ms / 1e3));
+            }
+            auto mean = [](const std::vector<double>& v) { double m = 0; for (double x : v) m += x; return m / v.size(); };
+            const std::string mname = model.substr(model.find_last_of('/') + 1);
+            printf("| model | streams | ctx/stream | prefill t/s | decode aggregate t/s | decode per stream t/s | GPU MiB |\n");
+            printf("|---|---|---|---|---|---|---|\n");
+            printf("| %s | %d | %d | %.1f | %.1f | %.1f | %.0f |\n", mname.c_str(), N, pp - 1, mean(pps), mean(tgs),
+                   mean(tgs) / N, eng.gpu_bytes() / 1048576.0);
             return 0;
         }
         if (bench) {
