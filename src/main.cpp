@@ -35,7 +35,7 @@ static void usage() {
             "  --tokenize TEXT    print token ids\n"
             "  --dump-logits      after the prompt, print the top-10 next-token logits\n"
             "  --seq-prefill      process the prompt token by token (debug)\n"
-            "  --kv f16|q8        KV cache type (q8 = int8 + f16 scale per 32, half the bytes)\n"
+            "  --kv q8|f16        KV cache type (default q8: int8 + f16 scale per 32; f16 = most accurate)\n"
             "  --profile          per-kernel decode timing (use with --pp N for context length)\n"
             "  --exact            reference mode: f32 activations, exact dequantization (slow, debug)\n"
             "  --show-special     print control tokens\n"
@@ -100,7 +100,7 @@ int main(int argc, char** argv) {
     std::string model, prompt, system, tok_text;
     bool interactive = false, raw = false, think = true, bench = false, dump_logits = false, quiet = false;
     bool seq_prefill = false, show_special = false, do_tokenize = false, exact = false, profile = false;
-    bool kv_q8 = false;
+    bool kv_q8 = true;  // default q8_0 KV: faster decode at every context, half the memory (see README)
     int n_predict = 2048, ctx = 32768, pp = 512, tg = 128, reps = 3, parallel = 1, test_multi = 0;
     SamplingParams sp;
     for (int i = 1; i < argc; i++) {
@@ -155,6 +155,7 @@ int main(int argc, char** argv) {
         else { fprintf(stderr, "unknown option %s\n", a.c_str()); usage(); return 1; }
     }
     if (model.empty()) { usage(); return 1; }
+    if (exact) kv_q8 = false;  // the f32 reference keeps an f16 KV cache
     if (sp.seed == 0) sp.seed = (uint64_t)std::chrono::high_resolution_clock::now().time_since_epoch().count();
 
     try {
