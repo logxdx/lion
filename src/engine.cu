@@ -739,6 +739,7 @@ __global__ void __launch_bounds__(1024) k_select(const float* logits, int n, int
         out_tokens[ctrl[CTRL_NGEN]] = tok;
         ctrl[CTRL_NGEN] += 1;
         ctrl[CTRL_STAMP] += 1;
+        ctrl[CTRL_POS] += 1;  // this step consumed a token (must advance even when it sampled a stop token)
         for (int i = 0; i < sp->n_stop; i++)
             if (sp->stop[i] == tok) ctrl[CTRL_DONE] = 1;
     }
@@ -1096,7 +1097,7 @@ void Engine::enqueue_step(bool with_head, cudaStream_t s) {
         enqueue_sample(s);
         prof_mark("sampling", s);
     }
-    k_advance<<<1, 1, 0, s>>>(b.ctrl);
+    if (!with_head) k_advance<<<1, 1, 0, s>>>(b.ctrl);  // with a head, k_select advances the position
     prof_mark("advance", s);
 }
 
