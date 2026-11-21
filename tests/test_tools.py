@@ -74,7 +74,10 @@ text = out.get("plain_text_response", "")
 check("pdf page", "--- page 3 of 15" in text and "Encoder" in text, f"{dt:.1f} s, {len(text)} chars")
 status, out, dt = call("pdf", {"command": "page", "file": PDF_URL, "page": 1})
 text = out.get("plain_text_response", "")
-check("pdf page needing OCR points to ocr", "pdf ocr" in text, text[:90])
+# the pdf script caches OCR per file (/tmp/pi-pdf), so after an earlier run page 1 is already OCR text
+already_ocrd = "(OCR text" in text
+check("pdf page needing OCR points to ocr" + (" (OCR'd in an earlier run)" if already_ocrd else ""),
+      already_ocrd or "pdf ocr" in text, text[:90])
 status, out, dt = call("pdf", {"command": "ocr", "file": PDF_URL, "pages": "1"})
 text = out.get("plain_text_response", "")
 check("pdf ocr", "page 1:" in text or "already done" in text, f"{dt:.1f} s, {text.splitlines()[0] if text else out}")

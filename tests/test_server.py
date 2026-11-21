@@ -82,10 +82,14 @@ check("tool call", c["finish_reason"] == "tool_calls" and tc and tc[0]["function
 
 # 5. greedy server output == CLI for the same raw prompt
 prompt = "<|startoftext|><|im_start|>user\nWrite two sentences about the ocean.<|im_end|>\n<|im_start|>assistant\n<think></think>"
-cli = subprocess.run([a.cli, "-m", a.model, "-q", "--raw", "--greedy", "-n", "64", "-c", "4096", "-p", prompt],
-                     capture_output=True, text=True).stdout.rstrip("\n")
+run = subprocess.run([a.cli, "-m", a.model, "-q", "--raw", "--greedy", "-n", "64", "-c", "4096", "-p", prompt],
+                     capture_output=True, text=True)
+cli = run.stdout.rstrip("\n")
 srv = post("/v1/completions", {"prompt": prompt, "max_tokens": 64, "temperature": 0, "repeat_penalty": 1.0})["choices"][0]["text"]
-check("server == CLI (greedy)", srv.strip() == cli.strip(), f"server={srv[:50]!r} cli={cli[:50]!r}")
+if "out of memory" in run.stderr:  # the CLI needs ~2.1 GB next to the server: start the server smaller to run this
+    print("SKIP  server == CLI (greedy)  CLI out of GPU memory next to this server (try -np 2 -c 16384)")
+else:
+    check("server == CLI (greedy)", srv.strip() == cli.strip(), f"server={srv[:50]!r} cli={cli[:50]!r}")
 
 # 6. multi-turn prefix reuse
 conv = [{"role": "system", "content": "You are a helpful assistant. " * 40},
