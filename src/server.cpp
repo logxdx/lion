@@ -48,6 +48,7 @@ struct Request {
     clk::time_point t_arrive, t_admit, t_first;
     double prefill_ms = 0, decode_ms = 0;
     int n_cached = 0;             // prompt tokens served from a cache tier (no prefill)
+    double restore_ms = 0;        // time to load them from the RAM/disk tier
     std::string cache_tier;       // "", "vram", "ram", "disk"
 };
 
@@ -207,6 +208,7 @@ private:
                     e_.save_checkpoint(s.id, cp);  // the restored state is this slot's first checkpoint
                     s.cps.emplace_back(cache_n, std::move(cp));
                     start = cache_n;
+                    r->restore_ms = ms_since(t0);
                     log("req %llu: restored %d prompt tokens from the %s tier in %.1f ms", (unsigned long long)r->id, cache_n,
                         tier.c_str(), ms_since(t0));
                 } else {
@@ -464,7 +466,7 @@ struct ApiServer {
         const int fed = (int)r.prompt.size() - r.n_cached;
         return {{"queue_ms", queue_ms}, {"prompt_n", fed}, {"prompt_ms", r.prefill_ms},
                 {"prompt_per_second", r.prefill_ms > 0 ? fed / (r.prefill_ms / 1e3) : 0.0}, {"cache_n", r.n_cached},
-                {"cache_tier", r.cache_tier}, {"predicted_n", completion}, {"predicted_ms", r.decode_ms},
+                {"cache_tier", r.cache_tier}, {"restore_ms", r.restore_ms}, {"predicted_n", completion}, {"predicted_ms", r.decode_ms},
                 {"predicted_per_second", r.decode_ms > 0 ? completion / (r.decode_ms / 1e3) : 0.0}};
     }
 
@@ -593,6 +595,7 @@ struct ApiServer {
         r->stop_tokens = {tk.eos};
         const int eot = tk.id("<|endoftext|>");
         if (eot >= 0 && eot != tk.eos) r->stop_tokens.push_back(eot);
+        if (b.value("ignore_eos", false)) r->stop_tokens.clear();  // benchmark mode (llama-server compatible)
         if (!sched.submit(r)) {
             res.status = 503;
             res.set_content(err_json("server busy: request queue is full", "server_error").dump(), "application/json");
