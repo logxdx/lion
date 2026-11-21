@@ -1,6 +1,6 @@
 #!/bin/sh
 # Start liquid-server for agents: 4 concurrent sequences x 100k context, q8_0 KV, RAM + disk prompt cache.
-#   usage: [MODEL=...] [PORT=8080] [SLOTS=4] [CTX=100000] [LIQUID_CACHE_DIR=...] ./serve.sh [extra liquid-server args...]
+#   usage: [MODEL=...] [PORT=11434] [SLOTS=4] [CTX=100000] [LIQUID_CACHE_DIR=...] ./serve.sh [extra liquid-server args...]
 # Web UI (llama.cpp's, with web_search / web_fetch / pdf tools): http://127.0.0.1:$PORT/
 # Clients: base URL http://127.0.0.1:$PORT/v1, model "lfm3".
 # Measured on the RTX 4050 6 GB: 4 x 100k with Q8_0 weights uses ~4.4 GB of VRAM; pinned RAM tier 4 GiB.
@@ -9,7 +9,7 @@ MODEL=${MODEL:-$HOME/llama.cpp/models/lfm3-1.7b/LFM3-1.7B-Q8_0.gguf}
 # Disk prompt-cache tier on the SSD0 drive; when it is unplugged or fails, the server uses ~/.cache/liquid-engine.
 export LIQUID_CACHE_DIR=${LIQUID_CACHE_DIR:-/run/media/$USER/SSD0/liquid-engine-cache}
 exec "$HERE/build/liquid-server" -m "$MODEL" \
-    --host 127.0.0.1 --port "${PORT:-8080}" \
+    --host 127.0.0.1 --port "${PORT:-11434}" \
     -np "${SLOTS:-4}" -c "${CTX:-100000}" --kv q8 \
     --cache-ram-mib 4096 --cache-disk-mib 16384 \
     "$@"
