@@ -397,13 +397,20 @@ __global__ void __launch_bounds__(256) k_gemv(GemvArgs a) {
 // ------------------------------------------------------------------------------------------------
 // attention (decode): grid (n_kv=4, ATT_SMAX), 128 threads = 4 warps = the 4 query heads of a kv head
 // ------------------------------------------------------------------------------------------------
-constexpr int ATT_SMAX = 20, ATT_MIN_CHUNK = 128, PART_STRIDE = 132;
+#ifndef ATT_MIN_CHUNK
+#define ATT_MIN_CHUNK 32  // swept: bench/attn_sweep.sh (SWA layers are latency-bound)
+#endif
+#ifndef ATT_SMAX
+#define ATT_SMAX 20
+#endif
+constexpr int PART_STRIDE = 132;
 
 struct AttnArgs {
     const float* qkvg;  // q[2048] k[512] v[512] gate[16]
     const float *qn, *kn, *ff;
     float base, eps;
-    half *kc, *vc;
+    void *kc, *vc;
+    half *ks, *vs;  // q8 scales
     int cap, window;
     const int* ctrl;
     float* part;
@@ -455,10 +462,25 @@ __device__ __forceinline__ void attn_finalize(float* acc, float l, float gate_lo
     if ((lane & 7) == 0) od[(qh * 128 + lane * 4) >> 5] = d;
 }
 
+#ifdef ATT_TRACE  // debug: %globaltimer at phase boundaries of CTA (0,0)
+__device__ unsigned long long g_att_trace[16];
+__device__ __forceinline__ unsigned long long gtimer() {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %globaltimer;" : "=l"(t));
+    return t;
+}
+#define TR(i) do { if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0) g_att_trace[i] = gtimer(); } while (0)
+#else
+#define TR(i) do {} while (0)
+#endif
+
+template <bool Q8>
 __global__ void __launch_bounds__(128) k_attn_decode(AttnArgs a) {
+    TR(0);
     if (a.ctrl[CTRL_DONE]) return;
     const int h = blockIdx.x, s = blockIdx.y;
     l2_prefetch(a.pf, blockIdx.y * gridDim.x + blockIdx.x, gridDim.x * gridDim.y);  // before any early exit
+    TR(1);
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int t = a.ctrl[CTRL_POS];
     const int lo = a.window ? max(0, t - a.window + 1) : 0;
@@ -470,6 +492,7 @@ __global__ void __launch_bounds__(128) k_attn_decode(AttnArgs a) {
 
     __shared__ __align__(16) float qs[4][128];
     __shared__ float sc[4][128];
+    __shared__ __align__(16) float vred[4][4][128];  // [warp][head][dim] partial P.V sums
     __shared__ int is_last;
 
     const int qh = h * 4 + warp;
@@ -481,25 +504,62 @@ __global__ void __launch_bounds__(128) k_attn_decode(AttnArgs a) {
         const float scale = rsqrtf(128.f);
         *(float4*)&qs[warp][lane * 4] = make_float4(x[0] * scale, x[1] * scale, x[2] * scale, x[3] * scale);
     }
+    TR(2);
     if (s == S - 1 && warp < 2) {  // this split owns position t: write the new k (warp 0) / v (warp 1)
-        const size_t slot = ((size_t)h * a.cap + (t % a.cap)) * 128 + lane * 4;
+        const size_t row = (size_t)h * a.cap + (t % a.cap);
         float x[4];
         float4 v = *(const float4*)(a.qkvg + (warp == 0 ? 2048 : 2560) + h * 128 + lane * 4);
         x[0] = v.x; x[1] = v.y; x[2] = v.z; x[3] = v.w;
         if (warp == 0) rope_norm4(x, a.kn, a.ff, a.base, a.eps, t, lane);
-        half* dst = (warp == 0 ? a.kc : a.vc) + slot;
-        *(half2*)dst = __floats2half2_rn(x[0], x[1]);
-        *(half2*)(dst + 2) = __floats2half2_rn(x[2], x[3]);
+        store_kv_row4(x, warp == 0 ? a.kc : a.vc, warp == 0 ? a.ks : a.vs, row, lane, Q8);
     }
     __syncthreads();
+    TR(3);
 
     float m = -INFINITY, l = 0.f, acc[4] = {0.f, 0.f, 0.f, 0.f};
-    const half* kbase = a.kc + (size_t)h * a.cap * 128;
-    const half* vbase = a.vc + (size_t)h * a.cap * 128;
+    const half* kbase = (const half*)a.kc + (size_t)h * a.cap * 128;
+    const half* vbase = (const half*)a.vc + (size_t)h * a.cap * 128;
+    const int8_t* kqb = (const int8_t*)a.kc + (size_t)h * a.cap * 128;
+    const int8_t* vqb = (const int8_t*)a.vc + (size_t)h * a.cap * 128;
+    const half* ksb = a.ks + (size_t)h * a.cap * 4;
+    const half* vsb = a.vs + (size_t)h * a.cap * 4;
     for (int pb = p0; pb < p1; pb += 128) {
         const int p = pb + threadIdx.x;
         float s4[4] = {-INFINITY, -INFINITY, -INFINITY, -INFINITY};
-        if (p < p1) {
+        if (Q8 && p < p1) {
+            const int sl = p % a.cap;
+            const int4* kr = (const int4*)(kqb + (size_t)sl * 128);
+            int4 kq[8];
+#pragma unroll
+            for (int i = 0; i < 8; i++) kq[i] = kr[i];  // 128-byte row in flight at once
+            const uint2 sraw = *(const uint2*)(ksb + (size_t)sl * 4);
+            const float2 s01 = __half22float2(*(const half2*)&sraw.x), s23 = __half22float2(*(const half2*)&sraw.y);
+            const float dsc[4] = {s01.x, s01.y, s23.x, s23.y};
+            float t4[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+            for (int b = 0; b < 4; b++) {  // 32-dim block: integer-valued partial dots, then one scale
+                float e0 = 0, e1 = 0, e2 = 0, e3 = 0;
+#pragma unroll
+                for (int i = 0; i < 2; i++) {
+                    const int4 w = kq[b * 2 + i];
+                    const int ws[4] = {w.x, w.y, w.z, w.w};
+#pragma unroll
+                    for (int k = 0; k < 4; k++)
+#pragma unroll
+                        for (int j = 0; j < 4; j++) {
+#if ATT_K_ABL  // ablation: skip the int8->float conversion (wrong values)
+                            const float kf = __int_as_float(ws[k] & (0xFF << (8 * j)));
+#else
+                            const float kf = (float)(int8_t)(ws[k] >> (8 * j));
+#endif
+                            const int d = b * 32 + i * 16 + k * 4 + j;
+                            e0 += kf * qs[0][d]; e1 += kf * qs[1][d]; e2 += kf * qs[2][d]; e3 += kf * qs[3][d];
+                        }
+                }
+                t4[0] += e0 * dsc[b]; t4[1] += e1 * dsc[b]; t4[2] += e2 * dsc[b]; t4[3] += e3 * dsc[b];
+            }
+            s4[0] = t4[0]; s4[1] = t4[1]; s4[2] = t4[2]; s4[3] = t4[3];
+        } else if (!Q8 && p < p1) {
             const int4* kr = (const int4*)(kbase + (size_t)(p % a.cap) * 128);
             float d0 = 0, d1 = 0, d2 = 0, d3 = 0;
             int4 kvs[16];
@@ -524,6 +584,7 @@ __global__ void __launch_bounds__(128) k_attn_decode(AttnArgs a) {
 #pragma unroll
         for (int j = 0; j < 4; j++) sc[j][threadIdx.x] = s4[j];
         __syncthreads();
+        TR(4);
         // online softmax for head `warp`
         const int n = min(128, p1 - pb);
         float mx = -INFINITY;
@@ -542,24 +603,57 @@ __global__ void __launch_bounds__(128) k_attn_decode(AttnArgs a) {
         }
         l += warp_sum(ls);
         m = mn;
-        __syncwarp();
+        __syncthreads();  // probabilities of all 4 heads ready in sc
+        TR(5);
+        // V: warp w takes a quarter of the positions, loads each row once, accumulates all 4 heads
+        float pa[4][4];
+#pragma unroll
+        for (int hh = 0; hh < 4; hh++) pa[hh][0] = pa[hh][1] = pa[hh][2] = pa[hh][3] = 0.f;
+        const int qn_ = (n + 3) >> 2, jb = warp * qn_, je = min(n, jb + qn_);
         const int slot0 = pb % a.cap;
-        for (int j0 = 0; j0 < n; j0 += 8) {
-            uint2 vv[8];
+        for (int j0 = jb; j0 < je; j0 += 8) {
+            float vf[8][4];
 #pragma unroll
             for (int u = 0; u < 8; u++) {  // 8 rows in flight
                 int sl = slot0 + j0 + u;
                 sl -= sl >= a.cap ? a.cap : 0;
-                vv[u] = (j0 + u < n) ? *(const uint2*)(vbase + (size_t)sl * 128 + lane * 4) : make_uint2(0, 0);
+                const bool ok = j0 + u < je;
+                if constexpr (Q8) {
+                    const uint32_t vq = ok ? *(const uint32_t*)(vqb + (size_t)sl * 128 + lane * 4) : 0u;
+                    const float vd = ok ? __half2float(vsb[(size_t)sl * 4 + (lane >> 3)]) : 0.f;
+                    vf[u][0] = (float)(int8_t)(vq) * vd;
+                    vf[u][1] = (float)(int8_t)(vq >> 8) * vd;
+                    vf[u][2] = (float)(int8_t)(vq >> 16) * vd;
+                    vf[u][3] = (float)(int8_t)(vq >> 24) * vd;
+                } else {
+                    const uint2 vv = ok ? *(const uint2*)(vbase + (size_t)sl * 128 + lane * 4) : make_uint2(0, 0);
+                    const float2 v01 = __half22float2(*(const half2*)&vv.x), v23 = __half22float2(*(const half2*)&vv.y);
+                    vf[u][0] = v01.x; vf[u][1] = v01.y; vf[u][2] = v23.x; vf[u][3] = v23.y;
+                }
             }
 #pragma unroll
             for (int u = 0; u < 8; u++) {
-                const float pj = (j0 + u < n) ? sc[warp][j0 + u] : 0.f;
-                const float2 v01 = __half22float2(*(const half2*)&vv[u].x), v23 = __half22float2(*(const half2*)&vv[u].y);
-                acc[0] += pj * v01.x; acc[1] += pj * v01.y; acc[2] += pj * v23.x; acc[3] += pj * v23.y;
+                if (j0 + u >= je) break;
+#pragma unroll
+                for (int hh = 0; hh < 4; hh++) {
+                    const float pj = sc[hh][j0 + u];
+                    pa[hh][0] += pj * vf[u][0]; pa[hh][1] += pj * vf[u][1];
+                    pa[hh][2] += pj * vf[u][2]; pa[hh][3] += pj * vf[u][3];
+                }
             }
         }
+#pragma unroll
+        for (int hh = 0; hh < 4; hh++)
+            *(float4*)&vred[warp][hh][lane * 4] = make_float4(pa[hh][0], pa[hh][1], pa[hh][2], pa[hh][3]);
         __syncthreads();
+        // owner warp of head `warp` folds the 4 partials into its running (already rescaled) accumulator
+#pragma unroll
+        for (int k = 0; k < 4; k++) {
+            const float4 r = *(const float4*)&vred[k][warp][lane * 4];
+            acc[0] += r.x; acc[1] += r.y; acc[2] += r.z; acc[3] += r.w;
+        }
+        __syncthreads();
+        TR(6);
     }
 
     const float gate_logit = a.qkvg[3072 + qh];
@@ -572,6 +666,7 @@ __global__ void __launch_bounds__(128) k_attn_decode(AttnArgs a) {
     __syncthreads();
     if (threadIdx.x == 0) is_last = (atomicAdd(&a.counter[h], 1) == S - 1);
     __syncthreads();
+    TR(7);
     if (!is_last) return;
     __threadfence();
     float M = -INFINITY;
@@ -827,7 +922,8 @@ void Engine::upload_qweight(const gguf::File& f, QWeight& w, const std::vector<s
     }
 }
 
-Engine::Engine(const std::string& path, int max_ctx, bool verbose, bool exact) : max_ctx_(max_ctx), verbose_(verbose) {
+Engine::Engine(const std::string& path, int max_ctx, bool verbose, bool exact, bool kv_q8)
+    : max_ctx_(max_ctx), kv_q8_(kv_q8), verbose_(verbose) {
     g_exact_mask = exact ? 15 : 0;
     if (const char* m = getenv("LIQUID_EXACT_MASK")) g_exact_mask = atoi(m);
     auto t0 = std::chrono::steady_clock::now();
@@ -883,6 +979,16 @@ Engine::Engine(const std::string& path, int max_ctx, bool verbose, bool exact) :
     CK(cudaMallocHost(&b.h_ctrl, 64 * CTRL_N * 4));
     prefill_alloc(b.pf, cfg_, max_ctx_, [this](size_t n) { return alloc(n); });
     reset();
+    if (getenv("LIQUID_OCC")) {
+        int o16 = 0, o8 = 0;
+        cudaFuncAttributes fa16{}, fa8{};
+        CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&o16, k_attn_decode<false>, 128, 0));
+        CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&o8, k_attn_decode<true>, 128, 0));
+        CK(cudaFuncGetAttributes(&fa16, k_attn_decode<false>));
+        CK(cudaFuncGetAttributes(&fa8, k_attn_decode<true>));
+        fprintf(stderr, "[occ] k_attn_decode f16: %d CTAs/SM (%zu B smem, %d regs) | q8: %d CTAs/SM (%zu B smem, %d regs)\n",
+                o16, fa16.sharedSizeBytes, fa16.numRegs, o8, fa8.sharedSizeBytes, fa8.numRegs);
+    }
     build_graphs();
     auto t1 = std::chrono::steady_clock::now();
     if (verbose_)
@@ -954,8 +1060,13 @@ void Engine::load(const gguf::File& f) {
             l.k_norm = upload_f32(f, p + "attn_k_norm.weight");
             l.rope_ff = l.swa ? nullptr : rope_ff;
             l.cap = l.swa ? cfg_.swa_window + PF_TMAX : max_ctx_;  // SWA ring holds window + one prefill chunk
-            l.kc = (half*)alloc((size_t)4 * l.cap * 128 * 2);
-            l.vc = (half*)alloc((size_t)4 * l.cap * 128 * 2);
+            const size_t eb = kv_q8_ ? 1 : 2;
+            l.kc = alloc((size_t)4 * l.cap * 128 * eb);
+            l.vc = alloc((size_t)4 * l.cap * 128 * eb);
+            if (kv_q8_) {
+                l.ks = (half*)alloc((size_t)4 * l.cap * 4 * 2);
+                l.vs = (half*)alloc((size_t)4 * l.cap * 4 * 2);
+            }
         }
     }
 }
@@ -1057,12 +1168,16 @@ void Engine::enqueue_step(bool with_head, cudaStream_t s) {
             AttnArgs at{};
             at.qkvg = b.qkvg; at.qn = l.q_norm; at.kn = l.k_norm; at.ff = l.rope_ff;
             at.base = l.swa ? cfg_.rope_base_swa : cfg_.rope_base; at.eps = cfg_.eps;
-            at.kc = l.kc; at.vc = l.vc; at.cap = l.cap; at.window = l.swa ? cfg_.swa_window : 0;
+            at.kc = l.kc; at.vc = l.vc; at.ks = l.ks; at.vs = l.vs; at.cap = l.cap; at.window = l.swa ? cfg_.swa_window : 0;
             at.ctrl = b.ctrl; at.part = b.part; at.counter = b.counter; at.oq = b.oq; at.od = b.od;
             at.of = (g_exact_mask & 2) ? b.of : nullptr;
             at.pf = make_pf(l.w_out, PF ? 4096 : 0);  // attention barely touches DRAM: fetch all of o_proj
-            k_attn_decode<<<dim3(4, ATT_SMAX), 128, 0, s>>>(at);
-            prof_mark(l.swa ? "attn.core(swa)" : "attn.core(global)", s);
+            if (kv_q8_) k_attn_decode<true><<<dim3(4, ATT_SMAX), 128, 0, s>>>(at);
+            else k_attn_decode<false><<<dim3(4, ATT_SMAX), 128, 0, s>>>(at);
+            {
+                const int L = l.swa ? std::min(cfg_.swa_window, n_past_ + 1) : n_past_ + 1;  // profile mode only
+                prof_mark(l.swa ? "attn.core(swa)" : "attn.core(global)", s, 4.0 * L * (kv_q8_ ? 136 : 256) * 2);  // K+V bytes
+            }
             GemvArgs o{};
             o.ctrl = b.ctrl; o.w = l.w_out; o.ntiles = E / 16; o.xq_in = b.oq; o.xd_in = b.od; o.xf_in = b.of; o.out = b.o;
             o.pf = make_pf(l.w_gu, PF);
@@ -1175,6 +1290,14 @@ void Engine::profile_decode(int steps) {
     CK(cudaMemcpy(hc, b.ctrl, CTRL_N * 4, cudaMemcpyDeviceToHost));
     n_past_ = hc[CTRL_POS];
     pending_ = hc[CTRL_TOK];
+#ifdef ATT_TRACE
+    unsigned long long tr[16];
+    CK(cudaMemcpyFromSymbol(tr, g_att_trace, sizeof tr));
+    const char* nm[8] = {"entry", "prefetch", "q norm+rope", "kv write+sync", "K scores", "softmax", "V accum", "partial+atomic"};
+    fprintf(stderr, "attention CTA(0,0) phase times (last call, us):");
+    for (int i = 1; i < 8; i++) fprintf(stderr, " %s %.2f |", nm[i], tr[i] >= tr[i - 1] ? (tr[i] - tr[i - 1]) / 1e3 : -1.0);
+    fprintf(stderr, "\n");
+#endif
 }
 
 void Engine::enqueue_sample(cudaStream_t s) {
@@ -1312,10 +1435,22 @@ void Engine::prefill_batched(const int* tokens, int n) {
                 prof_mark("conv", st_);
             } else {
                 k_qk_rope_cache<<<T, 768, 0, st_>>>(p.big, p0, l.q_norm, l.k_norm, l.rope_ff,
-                                                    l.swa ? cfg_.rope_base_swa : cfg_.rope_base, eps, p.qh, l.kc, l.vc, l.cap);
-                k_flash_prefill<<<dim3((T + FA_BQ - 1) / FA_BQ, 4), 256, 0, st_>>>(
-                    p.qh, p.big, l.kc, l.vc, l.cap, l.swa ? cfg_.swa_window : 0, p0, T, p.yq, p.yd);
-                prof_mark(l.swa ? "attn(swa)" : "attn(global)", st_);
+                                                    l.swa ? cfg_.rope_base_swa : cfg_.rope_base, eps, p.qh, l.kc, l.vc,
+                                                    l.ks, l.vs, l.cap, kv_q8_);
+                prof_mark("attn.rope+kv_write", st_);
+                if (kv_q8_)
+                    k_flash_prefill<true><<<dim3((T + FA_BQ - 1) / FA_BQ, 4), 256, 0, st_>>>(
+                        p.qh, p.big, l.kc, l.vc, l.ks, l.vs, l.cap, l.swa ? cfg_.swa_window : 0, p0, T, p.yq, p.yd);
+                else
+                    k_flash_prefill<false><<<dim3((T + FA_BQ - 1) / FA_BQ, 4), 256, 0, st_>>>(
+                        p.qh, p.big, l.kc, l.vc, l.ks, l.vs, l.cap, l.swa ? cfg_.swa_window : 0, p0, T, p.yq, p.yd);
+                {
+                    // useful FLOPs: visible (query, key) pairs x 16 heads x 128 dims x (QK + PV) x 2
+                    double pairs = 0;
+                    const int W = l.swa ? cfg_.swa_window : 0;
+                    for (int t = 0; t < T; t++) pairs += W ? std::min(W, p0 + t + 1) : p0 + t + 1;
+                    prof_mark(l.swa ? "attn(swa)" : "attn(global)", st_, pairs * 16 * 128 * 4);
+                }
             }
             GemmArgs go{};
             go.A = p.yq; go.Ad = p.yd; go.T = T; go.w = l.w_out; go.out = p.O;

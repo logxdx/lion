@@ -65,6 +65,27 @@ __device__ __forceinline__ int perm_idx_rt(int e, int K) {
     return c * 1024 + hf * Gc * 16 + gl * 16 + p;
 }
 
+// q8_0 KV rows: 128 int8 + 4 f16 scales (one per 32 dims), same block format as ggml q8_0.
+// A warp holds one row as 4 values per lane (dims lane*4..lane*4+3); 8 lanes form a block.
+__device__ __forceinline__ void store_kv_row4(const float* x, void* data, half* scales, size_t row, int lane, bool q8) {
+    if (!q8) {
+        half* dst = (half*)data + row * 128 + lane * 4;
+        *(half2*)dst = __floats2half2_rn(x[0], x[1]);
+        *(half2*)(dst + 2) = __floats2half2_rn(x[2], x[3]);
+        return;
+    }
+    float amax = fmaxf(fmaxf(fabsf(x[0]), fabsf(x[1])), fmaxf(fabsf(x[2]), fabsf(x[3])));
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 1));
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 2));
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 4));
+    const float d = amax / 127.f, id = d > 0 ? 1.f / d : 0.f;
+    uint32_t pk = 0;
+#pragma unroll
+    for (int j = 0; j < 4; j++) pk |= (uint32_t)(uint8_t)(int8_t)roundf(x[j] * id) << (8 * j);
+    *(uint32_t*)((int8_t*)data + row * 128 + lane * 4) = pk;
+    if ((lane & 7) == 0) scales[row * 4 + (lane >> 3)] = __float2half(d);
+}
+
 // L2 prefetch of the next kernel's weights: first `bytes` of every row of up to 3 arrays
 struct Prefetch {
     const uint8_t* p[3];

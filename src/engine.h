@@ -52,7 +52,8 @@ struct Layer {
     float *conv_w = nullptr;            // [n_embd][7]
     float *conv_state = nullptr;        // [n_embd][6]
     float *q_norm = nullptr, *k_norm = nullptr, *rope_ff = nullptr;
-    half *kc = nullptr, *vc = nullptr;  // [n_kv][cap][128]
+    void *kc = nullptr, *vc = nullptr;  // [n_kv][cap][128] f16, or int8 with --kv q8
+    half *ks = nullptr, *vs = nullptr;  // q8 KV: per-32 scales [n_kv][cap][4]
     int cap = 0;
 };
 
@@ -61,7 +62,9 @@ struct Timing { double prefill_ms = 0, decode_ms = 0; int prefill_tokens = 0, de
 class Engine {
 public:
     // exact: debug reference mode (f32 activations, exactly dequantized weights; slow)
-    Engine(const std::string& gguf_path, int max_ctx, bool verbose = true, bool exact = false);
+    // kv_q8: store the KV cache as q8_0 (int8 + f16 scale per 32) instead of f16
+    Engine(const std::string& gguf_path, int max_ctx, bool verbose = true, bool exact = false, bool kv_q8 = false);
+    bool kv_q8() const { return kv_q8_; }
     ~Engine();
 
     const Config& config() const { return cfg_; }
@@ -86,6 +89,7 @@ public:
 private:
     Config cfg_;
     int max_ctx_ = 0, n_past_ = 0, pending_ = -1;
+    bool kv_q8_ = false;
     std::vector<Layer> L_;
     QWeight emb_;                 // token_embd == output (tied)
     float* out_norm_ = nullptr;

@@ -200,8 +200,8 @@ __global__ void k_conv_state_update(const float* bcx, int T, float* state) {
 
 // q/k RMS norm + NEOX rope; q -> qh (f16, pre-scaled by 1/sqrt(128)), k/v -> cache (f16)
 __global__ void __launch_bounds__(768) k_qk_rope_cache(const float* qkvg, int p0, const float* qn, const float* kn,
-                                                       const float* ff, float base, float eps, half* qh, half* kc,
-                                                       half* vc, int cap) {
+                                                       const float* ff, float base, float eps, half* qh, void* kc,
+                                                       void* vc, half* ks, half* vs, int cap, bool q8) {
     const int t = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int pos = p0 + t;
     const float* row = qkvg + (size_t)t * 3088;
@@ -218,13 +218,12 @@ __global__ void __launch_bounds__(768) k_qk_rope_cache(const float* qkvg, int p0
         float4 v = *(const float4*)(row + 2048 + h * 128 + lane * 4);
         x[0] = v.x; x[1] = v.y; x[2] = v.z; x[3] = v.w;
         rope_norm4(x, kn, ff, base, eps, pos, lane);
-        half* dst = kc + ((size_t)h * cap + pos % cap) * 128 + lane * 4;
-        *(uint2*)dst = make_uint2(pack_h2(x[0], x[1]), pack_h2(x[2], x[3]));
+        store_kv_row4(x, kc, ks, (size_t)h * cap + pos % cap, lane, q8);
     } else {
         const int h = warp - 20;
         float4 v = *(const float4*)(row + 2560 + h * 128 + lane * 4);
-        half* dst = vc + ((size_t)h * cap + pos % cap) * 128 + lane * 4;
-        *(uint2*)dst = make_uint2(pack_h2(v.x, v.y), pack_h2(v.z, v.w));
+        x[0] = v.x; x[1] = v.y; x[2] = v.z; x[3] = v.w;
+        store_kv_row4(x, vc, vs, (size_t)h * cap + pos % cap, lane, q8);
     }
 }
 
@@ -233,8 +232,10 @@ __global__ void __launch_bounds__(768) k_qk_rope_cache(const float* qkvg, int p0
 // ------------------------------------------------------------------------------------------------
 constexpr int FA_BQ = 32, FA_BK = 64;
 
-__global__ void __launch_bounds__(256) k_flash_prefill(const half* qh, const float* qkvg, const half* kc, const half* vc,
-                                                       int cap, int window, int p0, int T, int8_t* oq, float* od) {
+template <bool Q8>
+__global__ void __launch_bounds__(256) k_flash_prefill(const half* qh, const float* qkvg, const void* kc, const void* vc,
+                                                       const half* ks, const half* vs, int cap, int window, int p0,
+                                                       int T, int8_t* oq, float* od) {
     __shared__ __align__(128) half Ks[FA_BK * 128];
     __shared__ __align__(128) half Vs[FA_BK * 128];
     const int kvh = blockIdx.y, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -266,11 +267,56 @@ __global__ void __launch_bounds__(256) k_flash_prefill(const half* qh, const flo
     float ma = -INFINITY, mb = -INFINITY, la = 0.f, lb = 0.f;
     const float LOG2E = 1.4426950408889634f;
 
-    const half* kbase = kc + (size_t)kvh * cap * 128;
-    const half* vbase = vc + (size_t)kvh * cap * 128;
+    const half* kbase = (const half*)kc + (size_t)kvh * cap * 128;
+    const half* vbase = (const half*)vc + (size_t)kvh * cap * 128;
     for (int kb = k_lo; kb <= qp_last; kb += FA_BK) {
         __syncthreads();
         // load K/V tile: 64 rows x 16 chunks of 16B each, swizzled
+        if constexpr (Q8) {
+            // 64 rows x 8 chunks of 16 int8 -> dequantise to f16 into the same swizzled tiles
+            for (int i = threadIdx.x; i < FA_BK * 8; i += 256) {
+                const int r = i >> 3, c16 = i & 7;
+                const int kp = kb + r;
+                const bool ok = kp <= qp_last;
+                const size_t row = (size_t)kvh * cap + (ok ? kp : kb) % cap;
+#pragma unroll
+                for (int kv = 0; kv < 2; kv++) {
+                    const int8_t* src = (const int8_t*)(kv ? vc : kc) + row * 128 + c16 * 16;
+                    const int4 q = ok ? *(const int4*)src : make_int4(0, 0, 0, 0);
+                    const float d = ok ? __half2float((kv ? vs : ks)[row * 4 + (c16 >> 1)]) : 0.f;
+                    const int w[4] = {q.x, q.y, q.z, q.w};
+                    uint32_t hv[8];
+#if FA_Q8_ABL  // ablation: copy bytes, skip the conversion (wrong values, same memory traffic)
+#pragma unroll
+                    for (int k = 0; k < 4; k++) { hv[k * 2] = w[k]; hv[k * 2 + 1] = w[k] ^ __float_as_uint(d); }
+#elif defined(FA_Q8_OLDCONV)  // reference conversion (bisect/debug)
+#pragma unroll
+                    for (int k = 0; k < 4; k++) {
+                        hv[k * 2] = pack_h2((float)(int8_t)(w[k]) * d, (float)(int8_t)(w[k] >> 8) * d);
+                        hv[k * 2 + 1] = pack_h2((float)(int8_t)(w[k] >> 16) * d, (float)(int8_t)(w[k] >> 24) * d);
+                    }
+#else
+                    // int8 -> f16 without I2F: bytes^0x80 placed under exponent 0x64 give 1024+u exactly,
+                    // minus 1152 gives x; one f16 multiply by the block scale (same single rounding as before)
+                    const half2 d2 = __float2half2_rn(d);
+                    const half2 bias = __halves2half2(__ushort_as_half(0x6480), __ushort_as_half(0x6480));
+#pragma unroll
+                    for (int k = 0; k < 4; k++) {
+                        const uint32_t x = (uint32_t)w[k] ^ 0x80808080u;
+                        uint32_t a = __byte_perm(x, 0x64646464u, 0x4140), b = __byte_perm(x, 0x64646464u, 0x4342);
+                        const half2 ha = __hmul2(__hsub2(*(const half2*)&a, bias), d2);
+                        const half2 hb = __hmul2(__hsub2(*(const half2*)&b, bias), d2);
+                        hv[k * 2] = *(const uint32_t*)&ha;
+                        hv[k * 2 + 1] = *(const uint32_t*)&hb;
+                    }
+#endif
+                    half* T_ = kv ? Vs : Ks;
+                    const int c0 = c16 * 2, c1 = c16 * 2 + 1;
+                    *(uint4*)(T_ + r * 128 + ((c0 & 8) | ((c0 ^ r) & 7)) * 8) = make_uint4(hv[0], hv[1], hv[2], hv[3]);
+                    *(uint4*)(T_ + r * 128 + ((c1 & 8) | ((c1 ^ r) & 7)) * 8) = make_uint4(hv[4], hv[5], hv[6], hv[7]);
+                }
+            }
+        } else {
         for (int i = threadIdx.x; i < FA_BK * 16; i += 256) {
             const int r = i >> 4, c = i & 15;
             const int kp = kb + r;
@@ -282,6 +328,7 @@ __global__ void __launch_bounds__(256) k_flash_prefill(const half* qh, const flo
         }
         cp_commit();
         cp_wait<0>();
+        }
         __syncthreads();
         if (t0 >= T) continue;
         // S = Q K^T  (16 x 64)
