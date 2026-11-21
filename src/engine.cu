@@ -4,12 +4,12 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <stdexcept>
 
 #include "engine.h"
 #include "gguf.h"
 #include "kernels.cuh"
-#include "prefill.cuh"
 
 #define CK(x)                                                                                      \
     do {                                                                                           \
@@ -26,6 +26,24 @@ namespace le {
 enum { CTRL_TOK = 0, CTRL_POS = 1, CTRL_DONE = 2, CTRL_NGEN = 3, CTRL_STAMP = 4, CTRL_N = 8 };
 // debug reference mode: bit0 conv blocks, bit1 attention blocks, bit2 ffn, bit3 lm head (f32 activations)
 static int g_exact_mask = 0;
+
+// eager-mode kernel profiler (--profile): events between launches, aggregated by label
+struct Prof {
+    bool on = false;
+    std::vector<cudaEvent_t> ev;
+    std::vector<std::string> name;
+    std::vector<double> bytes;
+};
+static Prof g_prof;
+static void prof_mark(const char* name, cudaStream_t s, double bytes = 0) {
+    if (!g_prof.on) return;
+    cudaEvent_t e;
+    cudaEventCreate(&e);
+    cudaEventRecord(e, s);
+    g_prof.ev.push_back(e);
+    g_prof.name.push_back(name);
+    g_prof.bytes.push_back(bytes);
+}
 
 size_t QWeight::bytes() const {
     if (type == W_Q8) return (size_t)N * K + (size_t)N * (K / 32) * 2;
@@ -708,6 +726,10 @@ __global__ void __launch_bounds__(1024) k_select(const float* logits, int n, int
     }
 }
 
+}  // namespace le
+#include "prefill.cuh"
+namespace le {
+
 // ================================================================================================
 // host side
 // ================================================================================================
@@ -751,14 +773,16 @@ void Engine::upload_qweight(const gguf::File& f, QWeight& w, const std::vector<s
     if (dt != gguf::Q8_0 && dt != gguf::Q6_K) throw std::runtime_error(parts[0] + ": only Q8_0/Q6_K supported");
     w.type = dt == gguf::Q8_0 ? W_Q8 : W_Q6;
     w.N = N; w.K = K;
+    const size_t NP = (size_t)(N + 127) / 128 * 128;  // GEMM tiles read whole 128-row blocks
+    auto zalloc = [&](size_t n) { void* p = alloc(n); CK(cudaMemset(p, 0, n)); return p; };
     if (w.type == W_Q8) {
-        w.q = (uint8_t*)alloc((size_t)N * K);
-        w.d = (half*)alloc((size_t)N * (K / 32) * 2);
+        w.q = (uint8_t*)zalloc(NP * K);
+        w.d = (half*)zalloc(NP * (K / 32) * 2);
     } else {
-        w.q = (uint8_t*)alloc((size_t)N * K / 2);
-        w.h = (uint8_t*)alloc((size_t)N * K / 4);
-        w.sc = (int8_t*)alloc((size_t)N * K / 16);
-        w.d = (half*)alloc((size_t)N * (K / 256) * 2);
+        w.q = (uint8_t*)zalloc(NP * K / 2);
+        w.h = (uint8_t*)zalloc(NP * K / 4);
+        w.sc = (int8_t*)zalloc(NP * K / 16);
+        w.d = (half*)zalloc(NP * (K / 256) * 2);
     }
     int off = 0;
     for (size_t pi = 0; pi < parts.size(); pi++) {
@@ -910,7 +934,7 @@ void Engine::load(const gguf::File& f) {
             l.q_norm = upload_f32(f, p + "attn_q_norm.weight");
             l.k_norm = upload_f32(f, p + "attn_k_norm.weight");
             l.rope_ff = l.swa ? nullptr : rope_ff;
-            l.cap = l.swa ? cfg_.swa_window : max_ctx_;
+            l.cap = l.swa ? cfg_.swa_window + PF_TMAX : max_ctx_;  // SWA ring holds window + one prefill chunk
             l.kc = (half*)alloc((size_t)4 * l.cap * 128 * 2);
             l.vc = (half*)alloc((size_t)4 * l.cap * 128 * 2);
         }
@@ -942,7 +966,9 @@ static void launch_gemv(GemvArgs a, int max_grid, cudaStream_t s, bool ex = fals
 void Engine::enqueue_step(bool with_head, cudaStream_t s) {
     auto& b = *B_;
     const int E = cfg_.n_embd;
+    prof_mark("start", s);
     k_embed<<<1, 256, 0, s>>>(emb_, b.ctrl, b.hist, b.resA);
+    prof_mark("embed", s);
     float* cur = b.resA;                          // residual stream (ping-pong A/B, static per graph)
     auto other = [&](float* x) { return x == b.resA ? b.resB : b.resA; };
     const float* prev_f = nullptr;                // ffn output of previous layer (null for layer 0)
@@ -959,12 +985,15 @@ void Engine::enqueue_step(bool with_head, cudaStream_t s) {
             a.ntiles = E / 32;
             a.conv_w = l.conv_w; a.conv_state = l.conv_state; a.yq = b.yq; a.yd = b.yd; a.yf = b.yf;
             launch_gemv<2048, PRO_NORM, EPI_CONV, 96, 2>(a, 160, s, g_exact_mask & 1);
+            prof_mark("conv.in_proj+conv", s, l.w_in.bytes());
             GemvArgs o{};
             o.ctrl = b.ctrl; o.w = l.w_out; o.ntiles = E / 16; o.xq_in = b.yq; o.xd_in = b.yd; o.xf_in = b.yf; o.out = b.o;
             launch_gemv<2048, PRO_Q, EPI_STORE, 16, 2>(o, 128, s, g_exact_mask & 1);
+            prof_mark("conv.out_proj", s, l.w_out.bytes());
         } else {
             a.ntiles = l.w_in.N / 16; a.out = b.qkvg;
             launch_gemv<2048, PRO_NORM, EPI_STORE, 16, 2>(a, 193, s, g_exact_mask & 2);
+            prof_mark("attn.qkvg", s, l.w_in.bytes());
             AttnArgs at{};
             at.qkvg = b.qkvg; at.qn = l.q_norm; at.kn = l.k_norm; at.ff = l.rope_ff;
             at.base = l.swa ? cfg_.rope_base_swa : cfg_.rope_base; at.eps = cfg_.eps;
@@ -972,9 +1001,11 @@ void Engine::enqueue_step(bool with_head, cudaStream_t s) {
             at.ctrl = b.ctrl; at.part = b.part; at.counter = b.counter; at.oq = b.oq; at.od = b.od;
             at.of = (g_exact_mask & 2) ? b.of : nullptr;
             k_attn_decode<<<dim3(4, ATT_SMAX), 128, 0, s>>>(at);
+            prof_mark(l.swa ? "attn.core(swa)" : "attn.core(global)", s);
             GemvArgs o{};
             o.ctrl = b.ctrl; o.w = l.w_out; o.ntiles = E / 16; o.xq_in = b.oq; o.xd_in = b.od; o.xf_in = b.of; o.out = b.o;
             launch_gemv<2048, PRO_Q, EPI_STORE, 16, 2>(o, 128, s, g_exact_mask & 2);
+            prof_mark("attn.o_proj", s, l.w_out.bytes());
         }
         // ffn input: x = cur + postnorm(o) -> other(cur) ; h = ffn_norm(x)
         GemvArgs g{};
@@ -983,9 +1014,11 @@ void Engine::enqueue_step(bool with_head, cudaStream_t s) {
         g.resid_out = other(cur); cur = other(cur);
         g.yq = b.aq; g.yd = b.ad; g.yf = b.af;
         launch_gemv<2048, PRO_NORM, EPI_SWIGLU, 64, 2>(g, 240, s, g_exact_mask & 4);
+        prof_mark("ffn.gate_up+swiglu", s, l.w_gu.bytes());
         GemvArgs d{};
         d.ctrl = b.ctrl; d.w = l.w_down; d.ntiles = E / 16; d.xq_in = b.aq; d.xd_in = b.ad; d.xf_in = b.af; d.out = b.f;
         launch_gemv<7680, PRO_Q, EPI_STORE, 16, 1>(d, 128, s, g_exact_mask & 4);
+        prof_mark("ffn.down", s, l.w_down.bytes());
         prev_f = b.f; prev_post = l.post_ffn_norm;
     }
     if (with_head) {
@@ -994,9 +1027,55 @@ void Engine::enqueue_step(bool with_head, cudaStream_t s) {
         h.resid_in = cur; h.o_in = b.f; h.w_post = prev_post; h.w_pre = out_norm_; h.resid_out = nullptr;
         h.out = b.logits;
         launch_gemv<2048, PRO_NORM, EPI_STORE, 64, 2>(h, 400, s, g_exact_mask & 8);
+        prof_mark("lm_head", s, emb_.bytes());
         enqueue_sample(s);
+        prof_mark("sampling", s);
     }
     k_advance<<<1, 1, 0, s>>>(b.ctrl);
+    prof_mark("advance", s);
+}
+
+void Engine::profile_decode(int steps) {
+    // eager launches (no graph) with events between kernels; graph replay is faster than this
+    auto& b = *B_;
+    SamplingParams g; g.temperature = 0; g.repeat_penalty = 1.0f;
+    set_sampling(g, {});
+    int* hc = b.h_ctrl;
+    hc[0] = pending_ >= 0 ? pending_ : 1; hc[1] = n_past_; hc[2] = 0; hc[3] = 0;
+    CK(cudaMemcpyAsync(b.ctrl, hc, 4 * 4, cudaMemcpyHostToDevice, st_));
+    std::map<std::string, std::pair<double, double>> agg;  // name -> (ms, bytes)
+    std::map<std::string, int> cnt;
+    std::vector<std::string> order;
+    for (int it = 0; it < steps; it++) {
+        g_prof = Prof{};
+        g_prof.on = true;
+        enqueue_step(true, st_);
+        g_prof.on = false;
+        CK(cudaStreamSynchronize(st_));
+        for (size_t i = 1; i < g_prof.ev.size(); i++) {
+            float ms;
+            cudaEventElapsedTime(&ms, g_prof.ev[i - 1], g_prof.ev[i]);
+            if (it == 0) continue;  // warmup
+            auto& a = agg[g_prof.name[i]];
+            if (!cnt.count(g_prof.name[i])) order.push_back(g_prof.name[i]);
+            a.first += ms; a.second += g_prof.bytes[i]; cnt[g_prof.name[i]]++;
+        }
+        for (auto e : g_prof.ev) cudaEventDestroy(e);
+    }
+    double tot = 0, totb = 0;
+    for (auto& kv : agg) { tot += kv.second.first; totb += kv.second.second; }
+    const int n = steps - 1;
+    fprintf(stderr, "%-22s %6s %10s %8s %9s\n", "kernel", "calls", "us/token", "share", "GB/s");
+    for (auto& name : order) {
+        auto& a = agg[name];
+        fprintf(stderr, "%-22s %6d %10.1f %7.1f%% %9.1f\n", name.c_str(), cnt[name] / n, a.first * 1e3 / n,
+                100 * a.first / tot, a.second > 0 ? a.second / (a.first * 1e-3) / 1e9 : 0.0);
+    }
+    fprintf(stderr, "%-22s %6s %10.1f          %9.1f   (eager; graph replay removes launch gaps)\n", "total", "",
+            tot * 1e3 / n, totb / (tot * 1e-3) / 1e9);
+    CK(cudaMemcpy(hc, b.ctrl, CTRL_N * 4, cudaMemcpyDeviceToHost));
+    n_past_ = hc[CTRL_POS];
+    pending_ = hc[CTRL_TOK];
 }
 
 void Engine::enqueue_sample(cudaStream_t s) {
@@ -1107,13 +1186,47 @@ std::vector<float> Engine::logits() {
 }
 
 void Engine::prefill_batched(const int* tokens, int n) {
-    // placeholder until the batched path lands: sequential steps
-    int* h = B_->h_ctrl;
-    for (int i = 0; i < n; i++) {
-        h[(i % 64) * CTRL_N] = tokens[i];
-        CK(cudaMemcpyAsync(B_->ctrl + CTRL_TOK, h + (i % 64) * CTRL_N, 4, cudaMemcpyHostToDevice, st_));
-        CK(cudaGraphLaunch(g_step_nohead_, st_));
-        if (i % 64 == 63) CK(cudaStreamSynchronize(st_));
+    auto& b = *B_;
+    auto& p = b.pf;
+    const float eps = cfg_.eps;
+    for (int off = 0; off < n; off += PF_TMAX) {
+        const int T = std::min(PF_TMAX, n - off);
+        const int p0 = n_past_ + off;
+        memcpy(p.h_toks, tokens + off, T * 4);
+        CK(cudaMemcpyAsync(p.toks, p.h_toks, T * 4, cudaMemcpyHostToDevice, st_));
+        k_embed_batch<<<T, 256, 0, st_>>>(emb_, p.toks, p0, b.hist, p.X);
+        const float* prevF = nullptr;
+        const float* prev_post = nullptr;
+        for (int il = 0; il < cfg_.n_layer; il++) {
+            const Layer& l = L_[il];
+            k_prep<<<T, 256, 0, st_>>>(p.X, prevF, prev_post, l.attn_norm, eps, p.xq, p.xd);
+            GemmArgs gi{};
+            gi.A = p.xq; gi.Ad = p.xd; gi.T = T; gi.w = l.w_in; gi.out = p.big;
+            launch_gemm<2048, GE_STORE>(gi, st_);
+            if (l.conv) {
+                k_conv_prefill<<<T, 256, 0, st_>>>(p.big, l.conv_w, l.conv_state, p.yq, p.yd);
+                k_conv_state_update<<<8, 256, 0, st_>>>(p.big, T, l.conv_state);
+            } else {
+                k_qk_rope_cache<<<T, 768, 0, st_>>>(p.big, p0, l.q_norm, l.k_norm, l.rope_ff,
+                                                    l.swa ? cfg_.rope_base_swa : cfg_.rope_base, eps, p.qh, l.kc, l.vc, l.cap);
+                k_flash_prefill<<<dim3((T + FA_BQ - 1) / FA_BQ, 4), 256, 0, st_>>>(
+                    p.qh, p.big, l.kc, l.vc, l.cap, l.swa ? cfg_.swa_window : 0, p0, T, p.yq, p.yd);
+            }
+            GemmArgs go{};
+            go.A = p.yq; go.Ad = p.yd; go.T = T; go.w = l.w_out; go.out = p.O;
+            launch_gemm<2048, GE_STORE>(go, st_);
+            k_prep<<<T, 256, 0, st_>>>(p.X, p.O, l.post_attn_norm, l.ffn_norm, eps, p.xq, p.xd);
+            GemmArgs gg{};
+            gg.A = p.xq; gg.Ad = p.xd; gg.T = T; gg.w = l.w_gu; gg.yq = p.aq; gg.yd = p.ad;
+            launch_gemm<2048, GE_SWIGLU>(gg, st_);
+            GemmArgs gd{};
+            gd.A = p.aq; gd.Ad = p.ad; gd.T = T; gd.w = l.w_down; gd.out = p.F;
+            launch_gemm<7680, GE_STORE>(gd, st_);
+            prevF = p.F;
+            prev_post = l.post_ffn_norm;
+        }
+        CK(cudaGetLastError());
+        CK(cudaStreamSynchronize(st_));
     }
 }
 

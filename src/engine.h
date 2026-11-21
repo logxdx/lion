@@ -77,6 +77,8 @@ public:
                               bool (*on_token)(int, void*) = nullptr, void* ud = nullptr);
     // logits of the last processed token (host copy), for testing
     std::vector<float> logits();
+    // per-kernel timing of eager decode steps (stderr)
+    void profile_decode(int steps);
     Timing timing;
     bool use_batched_prefill = true;
 

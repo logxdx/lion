@@ -33,6 +33,7 @@ static void usage() {
             "  --tokenize TEXT    print token ids\n"
             "  --dump-logits      after the prompt, print the top-10 next-token logits\n"
             "  --seq-prefill      process the prompt token by token (debug)\n"
+            "  --profile          per-kernel decode timing (use with --pp N for context length)\n"
             "  --exact            reference mode: f32 activations, exact dequantization (slow, debug)\n"
             "  --show-special     print control tokens\n"
             "  -q                 quiet (no stats)\n");
@@ -95,7 +96,7 @@ static bool on_tok(int id, void* ud) {
 int main(int argc, char** argv) {
     std::string model, prompt, system, tok_text;
     bool interactive = false, raw = false, think = true, bench = false, dump_logits = false, quiet = false;
-    bool seq_prefill = false, show_special = false, do_tokenize = false, exact = false;
+    bool seq_prefill = false, show_special = false, do_tokenize = false, exact = false, profile = false;
     int n_predict = 2048, ctx = 32768, pp = 512, tg = 128, reps = 3;
     SamplingParams sp;
     for (int i = 1; i < argc; i++) {
@@ -135,6 +136,7 @@ int main(int argc, char** argv) {
         else if (a == "--dump-logits") dump_logits = true;
         else if (a == "--seq-prefill") seq_prefill = true;
         else if (a == "--exact") exact = true;
+        else if (a == "--profile") profile = true;
         else if (a == "--show-special") show_special = true;
         else if (a == "-q") quiet = true;
         else if (a == "-h" || a == "--help") { usage(); return 0; }
@@ -160,6 +162,14 @@ int main(int argc, char** argv) {
         int eot = tk.id("<|endoftext|>");
         if (eot >= 0 && eot != tk.eos) stop.push_back(eot);
 
+        if (profile) {
+            Engine eng(model, std::max(ctx, pp + 64), !quiet);
+            std::vector<int> toks(pp);
+            for (int i = 0; i < pp; i++) toks[i] = 1000 + (i * 7919) % 100000;
+            eng.prefill(toks);
+            eng.profile_decode(21);
+            return 0;
+        }
         if (bench) {
             Engine eng(model, std::max(ctx, pp + tg + 16), !quiet);
             SamplingParams g; g.temperature = 0; g.repeat_penalty = 1.0f;
