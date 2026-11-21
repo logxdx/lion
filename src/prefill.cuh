@@ -231,25 +231,37 @@ __global__ void __launch_bounds__(768) k_qk_rope_cache(const float* qkvg, int p0
 // flash attention (prefill): grid (ceil(T/32), 4 kv heads); 8 warps = 4 q heads x 2 token tiles of 16
 // ------------------------------------------------------------------------------------------------
 constexpr int FA_BQ = 32, FA_BK = 64;
-#ifndef FA_DB
-#define FA_DB 0  // 1: double-buffered K/V tiles (f16 KV path), 64 KB dynamic smem
-#endif
-constexpr size_t FA_DB_SMEM = (size_t)4 * FA_BK * 128 * 2;
+constexpr size_t FA_SMEM = (size_t)4 * FA_BK * 128 * 2;  // double-buffered f16 K and V tiles (64 KB, dynamic)
+
+// dequantise one 16-value q8 chunk (+ its block scale) into two swizzled 8-half chunks of tile row r.
+// int8 -> f16 without I2F: bytes^0x80 under exponent 0x64 give 1024+u exactly, minus 1152 gives x; then one
+// f16 multiply by the scale (bit-identical to __float2half((float)x * d), see tests/dequant_q8_test.cu)
+__device__ __forceinline__ void fa_store_q8_chunk(half* T_, int r, int c16, int4 q, float d) {
+    const int w[4] = {q.x, q.y, q.z, q.w};
+    uint32_t hv[8];
+    const half2 d2 = __float2half2_rn(d);
+    const half2 bias = __halves2half2(__ushort_as_half(0x6480), __ushort_as_half(0x6480));
+#pragma unroll
+    for (int k = 0; k < 4; k++) {
+        const uint32_t x = (uint32_t)w[k] ^ 0x80808080u;
+        uint32_t a = __byte_perm(x, 0x64646464u, 0x4140), b = __byte_perm(x, 0x64646464u, 0x4342);
+        const half2 ha = __hmul2(__hsub2(*(const half2*)&a, bias), d2);
+        const half2 hb = __hmul2(__hsub2(*(const half2*)&b, bias), d2);
+        hv[k * 2] = *(const uint32_t*)&ha;
+        hv[k * 2 + 1] = *(const uint32_t*)&hb;
+    }
+    const int c0 = c16 * 2, c1 = c16 * 2 + 1;
+    *(uint4*)(T_ + r * 128 + ((c0 & 8) | ((c0 ^ r) & 7)) * 8) = make_uint4(hv[0], hv[1], hv[2], hv[3]);
+    *(uint4*)(T_ + r * 128 + ((c1 & 8) | ((c1 ^ r) & 7)) * 8) = make_uint4(hv[4], hv[5], hv[6], hv[7]);
+}
 
 template <bool Q8>
 __global__ void __launch_bounds__(256) k_flash_prefill(const half* qh, const float* qkvg, const void* kc, const void* vc,
                                                        const half* ks, const half* vs, int cap, int window, int p0,
                                                        int T, int8_t* oq, float* od) {
-#if FA_DB
     extern __shared__ __align__(128) uint8_t fa_dyn[];
-    half* const KsB = (half*)fa_dyn;                 // [2][FA_BK*128]
-    half* const VsB = KsB + 2 * FA_BK * 128;          // [2][FA_BK*128]
-    half* Ks = KsB;
-    half* Vs = VsB;
-#else
-    __shared__ __align__(128) half Ks[FA_BK * 128];
-    __shared__ __align__(128) half Vs[FA_BK * 128];
-#endif
+    half* const KsB = (half*)fa_dyn;          // [2][FA_BK*128]
+    half* const VsB = KsB + 2 * FA_BK * 128;  // [2][FA_BK*128]
     const int kvh = blockIdx.y, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int g = lane >> 2, tig = lane & 3;
     const int qhd = kvh * 4 + (warp & 3);          // query head of this warp
@@ -279,11 +291,12 @@ __global__ void __launch_bounds__(256) k_flash_prefill(const half* qh, const flo
     float ma = -INFINITY, mb = -INFINITY, la = 0.f, lb = 0.f;
     const float LOG2E = 1.4426950408889634f;
 
+    // ---- K/V tile pipeline: tile i+1 is in flight while tile i is computed ----
     const half* kbase = (const half*)kc + (size_t)kvh * cap * 128;
     const half* vbase = (const half*)vc + (size_t)kvh * cap * 128;
-#if FA_DB
-    // FA_DB experiment: valid for the f16 KV path only (q8 instantiation is not used with it)
-    auto issue_tile = [&](int kb_, half* Kd, half* Vd) {
+    auto issue_f16 = [&](int kb_, int buf) {  // cp.async: 64 rows x 16 chunks of 16 B, swizzled
+        half* Kd = KsB + buf * FA_BK * 128;
+        half* Vd = VsB + buf * FA_BK * 128;
         for (int i = threadIdx.x; i < FA_BK * 16; i += 256) {
             const int r = i >> 4, c = i & 15;
             const int kp = kb_ + r;
@@ -295,89 +308,53 @@ __global__ void __launch_bounds__(256) k_flash_prefill(const half* qh, const flo
         }
         cp_commit();
     };
-    issue_tile(k_lo, KsB, VsB);
-    int it_ = 0;
-#endif
-    for (int kb = k_lo; kb <= qp_last; kb += FA_BK) {
-#if FA_DB
-        {
-            __syncthreads();  // every warp is done with the buffer the next prefetch overwrites
-            const int cur = it_ & 1;
-            if (kb + FA_BK <= qp_last) issue_tile(kb + FA_BK, KsB + (cur ^ 1) * FA_BK * 128, VsB + (cur ^ 1) * FA_BK * 128);
+    int4 pq[2][2];   // q8: prefetched raw chunks [item][k|v] (64 rows x 8 chunks = 2 items per thread)
+    float pd[2][2];
+    auto fetch_q8 = [&](int kb_) {
+#pragma unroll
+        for (int it = 0; it < 2; it++) {
+            const int i = threadIdx.x + it * 256, r = i >> 3, c16 = i & 7;
+            const int kp = kb_ + r;
+            const bool ok = kp <= qp_last;
+            const size_t row = (size_t)kvh * cap + (ok ? kp : kb_) % cap;
+#pragma unroll
+            for (int kv = 0; kv < 2; kv++) {
+                const int8_t* src = (const int8_t*)(kv ? vc : kc) + row * 128 + c16 * 16;
+                pq[it][kv] = ok ? *(const int4*)src : make_int4(0, 0, 0, 0);
+                pd[it][kv] = ok ? __half2float((kv ? vs : ks)[row * 4 + (c16 >> 1)]) : 0.f;
+            }
+        }
+    };
+    auto store_q8 = [&](int buf) {
+#pragma unroll
+        for (int it = 0; it < 2; it++) {
+            const int i = threadIdx.x + it * 256, r = i >> 3, c16 = i & 7;
+            fa_store_q8_chunk(KsB + buf * FA_BK * 128, r, c16, pq[it][0], pd[it][0]);
+            fa_store_q8_chunk(VsB + buf * FA_BK * 128, r, c16, pq[it][1], pd[it][1]);
+        }
+    };
+    if constexpr (Q8) { fetch_q8(k_lo); store_q8(0); }
+    else issue_f16(k_lo, 0);
+
+    int iter = 0;
+    for (int kb = k_lo; kb <= qp_last; kb += FA_BK, iter++) {
+        const int cur = iter & 1;
+        const bool has_next = kb + FA_BK <= qp_last;
+        __syncthreads();  // all warps are done with buffer cur^1 (computed last iteration)
+        if constexpr (Q8) {
+            if (has_next) fetch_q8(kb + FA_BK);  // global loads overlap this tile's math; stored after it
+        } else {
+            if (has_next) issue_f16(kb + FA_BK, cur ^ 1);
             else cp_commit();  // keep the group count uniform
             cp_wait<1>();
-            Ks = KsB + cur * FA_BK * 128;
-            Vs = VsB + cur * FA_BK * 128;
-            it_++;
+            __syncthreads();  // tile `cur` landed for everyone
         }
-        __syncthreads();
-        if (false) {
-#else
-        __syncthreads();
-#endif
-        // load K/V tile: 64 rows x 16 chunks of 16B each, swizzled
-        if constexpr (Q8) {
-            // 64 rows x 8 chunks of 16 int8 -> dequantise to f16 into the same swizzled tiles
-            for (int i = threadIdx.x; i < FA_BK * 8; i += 256) {
-                const int r = i >> 3, c16 = i & 7;
-                const int kp = kb + r;
-                const bool ok = kp <= qp_last;
-                const size_t row = (size_t)kvh * cap + (ok ? kp : kb) % cap;
-#pragma unroll
-                for (int kv = 0; kv < 2; kv++) {
-                    const int8_t* src = (const int8_t*)(kv ? vc : kc) + row * 128 + c16 * 16;
-                    const int4 q = ok ? *(const int4*)src : make_int4(0, 0, 0, 0);
-                    const float d = ok ? __half2float((kv ? vs : ks)[row * 4 + (c16 >> 1)]) : 0.f;
-                    const int w[4] = {q.x, q.y, q.z, q.w};
-                    uint32_t hv[8];
-#if FA_Q8_ABL  // ablation: copy bytes, skip the conversion (wrong values, same memory traffic)
-#pragma unroll
-                    for (int k = 0; k < 4; k++) { hv[k * 2] = w[k]; hv[k * 2 + 1] = w[k] ^ __float_as_uint(d); }
-#elif defined(FA_Q8_OLDCONV)  // reference conversion (bisect/debug)
-#pragma unroll
-                    for (int k = 0; k < 4; k++) {
-                        hv[k * 2] = pack_h2((float)(int8_t)(w[k]) * d, (float)(int8_t)(w[k] >> 8) * d);
-                        hv[k * 2 + 1] = pack_h2((float)(int8_t)(w[k] >> 16) * d, (float)(int8_t)(w[k] >> 24) * d);
-                    }
-#else
-                    // int8 -> f16 without I2F: bytes^0x80 placed under exponent 0x64 give 1024+u exactly,
-                    // minus 1152 gives x; one f16 multiply by the block scale (same single rounding as before)
-                    const half2 d2 = __float2half2_rn(d);
-                    const half2 bias = __halves2half2(__ushort_as_half(0x6480), __ushort_as_half(0x6480));
-#pragma unroll
-                    for (int k = 0; k < 4; k++) {
-                        const uint32_t x = (uint32_t)w[k] ^ 0x80808080u;
-                        uint32_t a = __byte_perm(x, 0x64646464u, 0x4140), b = __byte_perm(x, 0x64646464u, 0x4342);
-                        const half2 ha = __hmul2(__hsub2(*(const half2*)&a, bias), d2);
-                        const half2 hb = __hmul2(__hsub2(*(const half2*)&b, bias), d2);
-                        hv[k * 2] = *(const uint32_t*)&ha;
-                        hv[k * 2 + 1] = *(const uint32_t*)&hb;
-                    }
-#endif
-                    half* T_ = kv ? Vs : Ks;
-                    const int c0 = c16 * 2, c1 = c16 * 2 + 1;
-                    *(uint4*)(T_ + r * 128 + ((c0 & 8) | ((c0 ^ r) & 7)) * 8) = make_uint4(hv[0], hv[1], hv[2], hv[3]);
-                    *(uint4*)(T_ + r * 128 + ((c1 & 8) | ((c1 ^ r) & 7)) * 8) = make_uint4(hv[4], hv[5], hv[6], hv[7]);
-                }
-            }
-        } else {
-        for (int i = threadIdx.x; i < FA_BK * 16; i += 256) {
-            const int r = i >> 4, c = i & 15;
-            const int kp = kb + r;
-            const bool ok = kp <= qp_last;
-            const size_t off = (size_t)((ok ? kp : kb) % cap) * 128 + c * 8;
-            const int sc = (c & 8) | ((c ^ r) & 7);
-            cp_async16(Ks + r * 128 + sc * 8, kbase + off, ok);
-            cp_async16(Vs + r * 128 + sc * 8, vbase + off, ok);
+        const half* Ks = KsB + cur * FA_BK * 128;
+        const half* Vs = VsB + cur * FA_BK * 128;
+        if (t0 >= T) {
+            if constexpr (Q8) { if (has_next) store_q8(cur ^ 1); }
+            continue;
         }
-        cp_commit();
-        cp_wait<0>();
-        }
-#if FA_DB
-        }
-#endif
-        __syncthreads();
-        if (t0 >= T) continue;
         // S = Q K^T  (16 x 64)
         float s[8][4];
 #pragma unroll
@@ -470,6 +447,7 @@ __global__ void __launch_bounds__(256) k_flash_prefill(const half* qh, const flo
             o[i][0] += x.x; o[i][1] += x.y; o[i][2] += y.x; o[i][3] += y.y;
         }
 #endif
+        if constexpr (Q8) { if (has_next) store_q8(cur ^ 1); }  // next tile, converted while others still compute
     }
     if (t0 >= T) return;
     la += __shfl_xor_sync(0xffffffff, la, 1);

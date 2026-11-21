@@ -1622,18 +1622,17 @@ void Engine::prefill_batched(int slot, const int* tokens, int n) {
                                                     l.swa ? cfg_.rope_base_swa : cfg_.rope_base, eps, p.qh, kc, vc,
                                                     ks, vs, l.cap, kv_q8_);
                 prof_mark("attn.rope+kv_write", st_);
-                if (kv_q8_)
-                    k_flash_prefill<true><<<dim3((T + FA_BQ - 1) / FA_BQ, 4), 256, 0, st_>>>(
-                        p.qh, p.big, kc, vc, ks, vs, l.cap, l.swa ? cfg_.swa_window : 0, p0, T, p.yq, p.yd);
-                else {
-                    const size_t fsm = FA_DB ? FA_DB_SMEM : 0;
+                {
                     static bool fa_init = false;
-                    if (FA_DB && !fa_init) {
-                        CK(cudaFuncSetAttribute(k_flash_prefill<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)fsm));
+                    if (!fa_init) {
+                        CK(cudaFuncSetAttribute(k_flash_prefill<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)FA_SMEM));
+                        CK(cudaFuncSetAttribute(k_flash_prefill<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)FA_SMEM));
                         fa_init = true;
                     }
-                    k_flash_prefill<false><<<dim3((T + FA_BQ - 1) / FA_BQ, 4), 256, fsm, st_>>>(
-                        p.qh, p.big, kc, vc, ks, vs, l.cap, l.swa ? cfg_.swa_window : 0, p0, T, p.yq, p.yd);
+                    const dim3 fg((T + FA_BQ - 1) / FA_BQ, 4);
+                    const int W = l.swa ? cfg_.swa_window : 0;
+                    if (kv_q8_) k_flash_prefill<true><<<fg, 256, FA_SMEM, st_>>>(p.qh, p.big, kc, vc, ks, vs, l.cap, W, p0, T, p.yq, p.yd);
+                    else k_flash_prefill<false><<<fg, 256, FA_SMEM, st_>>>(p.qh, p.big, kc, vc, ks, vs, l.cap, W, p0, T, p.yq, p.yd);
                 }
                 {
                     // useful FLOPs: visible (query, key) pairs x 16 heads x 128 dims x (QK + PV) x 2

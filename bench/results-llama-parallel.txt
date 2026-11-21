@@ -1,1 +1,0 @@
-llama-server streams=1 pp=512: prefill 8697.1 t/s, decode aggregate 110.3 t/s, per stream 110.3 t/s
