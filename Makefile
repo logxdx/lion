@@ -1,13 +1,17 @@
 # liquid-engine: LFM3-1.7B inference on an RTX 4050 (sm_89) + Raptor Lake host.
 NVCC     ?= /opt/cuda/bin/nvcc
 ARCH     ?= sm_89
-CXXFLAGS := -O3 -march=native -std=c++17 -Wall
+CUDA_INC ?= /opt/cuda/include
+CUDA_LIB ?= /opt/cuda/lib64
+CXXFLAGS := -O3 -march=native -std=c++17 -Wall -I$(CUDA_INC)
 NVFLAGS  := -O3 -std=c++17 -arch=$(ARCH) --use_fast_math -Xcompiler "-O3 -march=native" -lineinfo
 
 BUILD := build
-OBJS  := $(BUILD)/engine.o $(BUILD)/tokenizer.o $(BUILD)/main.o
+CORE  := $(BUILD)/engine.o $(BUILD)/tokenizer.o
+SERVER_OBJS := $(BUILD)/server.o $(BUILD)/chat.o $(BUILD)/prompt_cache.o $(BUILD)/httplib.o
 
-all: $(BUILD)/liquid
+all: $(BUILD)/liquid $(BUILD)/liquid-server
+tests: $(BUILD)/test_engine_api $(BUILD)/test_chat
 
 $(BUILD):
 	mkdir -p $(BUILD)
@@ -19,12 +23,34 @@ $(BUILD)/tokenizer.o: src/tokenizer.cpp src/tokenizer.h src/unicode_data.h src/g
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(BUILD)/main.o: src/main.cpp src/engine.h src/tokenizer.h src/gguf.h | $(BUILD)
-	$(CXX) $(CXXFLAGS) -I/opt/cuda/include -c $< -o $@
+	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(BUILD)/liquid: $(OBJS)
-	$(NVCC) -arch=$(ARCH) $(OBJS) -o $@ -lcudart
+$(BUILD)/server.o: src/server.cpp src/engine.h src/tokenizer.h src/chat.h src/prompt_cache.h | $(BUILD)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD)/chat.o: src/chat.cpp src/chat.h | $(BUILD)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD)/prompt_cache.o: src/prompt_cache.cpp src/prompt_cache.h src/engine.h | $(BUILD)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD)/httplib.o: third_party/httplib.cpp third_party/httplib.h | $(BUILD)
+	$(CXX) -O2 -std=c++17 -c $< -o $@
+
+$(BUILD)/liquid: $(CORE) $(BUILD)/main.o
+	$(NVCC) -arch=$(ARCH) $^ -o $@ -lcudart
+
+$(BUILD)/liquid-server: $(CORE) $(SERVER_OBJS)
+	$(NVCC) -arch=$(ARCH) $^ -o $@ -lcudart -lpthread
+
+$(BUILD)/test_engine_api: tests/test_engine_api.cpp $(CORE)
+	$(CXX) $(CXXFLAGS) -c $< -o $(BUILD)/test_engine_api.o
+	$(NVCC) -arch=$(ARCH) $(BUILD)/test_engine_api.o $(CORE) -o $@ -lcudart
+
+$(BUILD)/test_chat: tests/test_chat.cpp $(BUILD)/chat.o
+	$(CXX) $(CXXFLAGS) $^ -o $@
 
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all clean
+.PHONY: all tests clean
