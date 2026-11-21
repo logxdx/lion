@@ -131,41 +131,41 @@ __global__ void __launch_bounds__(256) k_prep(float* X, const float* O, const fl
 // short conv over a chunk. bcx: [T][6144] in repacked row order (tiles of [b32 c32 x32]).
 __device__ __forceinline__ int bcx_col(int part, int ch) { return (ch >> 5) * 96 + part * 32 + (ch & 31); }
 
-__global__ void __launch_bounds__(256) k_conv_prefill(const float* bcx, const float* conv_w, const float* state,
+// short conv over a chunk: CTA = 32 tokens x 128 channels; b*x for tokens t0-6..t0+31 staged in smem
+__global__ void __launch_bounds__(256) k_conv_prefill(const float* bcx, const float* conv_w, const float* state, int T,
                                                       int8_t* yq, float* yd) {
-    constexpr int E = 2048;
-    const int t = blockIdx.x, c0 = threadIdx.x * 8;
-    float y[8], amax = 0;
-#pragma unroll
-    for (int i = 0; i < 8; i++) {
-        const int ch = c0 + i;
+    constexpr int E = 2048, TB = 32, CB = 128;
+    __shared__ float bx[TB + 6][CB];
+    const int t0 = blockIdx.x * TB, ch0 = blockIdx.y * CB;
+    for (int i = threadIdx.x; i < (TB + 6) * CB; i += 256) {
+        const int r = i / CB, cl = i % CB, ch = ch0 + cl;
+        const int tok = t0 - 6 + r;
+        float v = 0.f;
+        if (tok >= 0 && tok < T) {
+            const float* row = bcx + (size_t)tok * 6144;
+            v = row[bcx_col(0, ch)] * row[bcx_col(2, ch)];
+        } else if (tok < 0) {
+            v = state[ch * 6 + 6 + tok];
+        }
+        bx[r][cl] = v;
+    }
+    __syncthreads();
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    for (int item = warp; item < TB * (CB / 32); item += 8) {
+        const int r = item / (CB / 32), cg = item % (CB / 32);
+        const int t = t0 + r;
+        if (t >= T) continue;  // uniform per warp
+        const int cl = cg * 32 + lane, ch = ch0 + cl;
         const float* cw = conv_w + ch * 7;
         float acc = 0;
 #pragma unroll
-        for (int j = 0; j < 7; j++) {
-            const int tt = t - 6 + j;
-            float bx;
-            if (tt >= 0) {
-                const float* row = bcx + (size_t)tt * 6144;
-                bx = row[bcx_col(0, ch)] * row[bcx_col(2, ch)];
-            } else {
-                bx = state[ch * 6 + 6 + tt];  // state[j'] = bx at relative position j'-6
-            }
-            acc += cw[j] * bx;
-        }
-        y[i] = bcx[(size_t)t * 6144 + bcx_col(1, ch)] * acc;
-        amax = fmaxf(amax, fabsf(y[i]));
+        for (int j = 0; j < 7; j++) acc += cw[j] * bx[r + j][cl];
+        const float y = bcx[(size_t)t * 6144 + bcx_col(1, ch)] * acc;
+        const float amax = warp_max(fabsf(y));
+        const float d = amax / 127.f, id = d > 0 ? 1.f / d : 0.f;
+        yq[(size_t)t * E + ch] = (int8_t)roundf(y * id);
+        if (lane == 0) yd[(size_t)t * (E / 32) + (ch >> 5)] = d;
     }
-    amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 1));
-    amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 2));
-    const float d = amax / 127.f, id = d > 0 ? 1.f / d : 0.f;
-    uint32_t lo = 0, hi = 0;
-#pragma unroll
-    for (int i = 0; i < 4; i++) lo |= (uint32_t)(uint8_t)(int8_t)roundf(y[i] * id) << (8 * i);
-#pragma unroll
-    for (int i = 0; i < 4; i++) hi |= (uint32_t)(uint8_t)(int8_t)roundf(y[4 + i] * id) << (8 * i);
-    *(uint2*)(yq + (size_t)t * E + c0) = make_uint2(lo, hi);
-    if ((threadIdx.x & 3) == 0) yd[(size_t)t * (E / 32) + (c0 >> 5)] = d;
 }
 
 __global__ void k_conv_state_update(const float* bcx, int T, float* state) {
@@ -411,22 +411,24 @@ struct GemmSmem<W_Q8> {
     int8_t b[2][GB_N * GB_K];
     float ad[2][GB_M * 4];
     half bd[2][GB_N * 4];
+    float ws[4][GB_N];          // weight scales of the current k tile, [group][row]
 };
 template <>
 struct GemmSmem<W_Q6> {
     int8_t a[2][GB_M * GB_K];
-    uint8_t lo[2][GB_N * 80];   // 64 B per row + 16 pad
-    uint8_t hi[2][GB_N * 48];   // 32 B per row + 16 pad
+    uint8_t lo[2][GB_N * 64];
+    uint8_t hi[2][GB_N * 32];
     int8_t sc[2][GB_N * 8];
     float ad[2][GB_M * 4];
+    int8_t b[GB_N * GB_K];      // unpacked (q-32) tile, same swizzled layout as the Q8 tile
+    float ws[8][GB_N];          // sub-scale * d, [sub-block][row]
 };
 
 template <int WT, int K>
 __device__ __forceinline__ void gemm_load_stage(GemmSmem<WT>& sm, int st, const GemmArgs& g, int m0, int n0, int kt) {
     const int tid = threadIdx.x;
-    // A: 128 rows x 8 chunks
 #pragma unroll
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 4; i++) {  // A: 128 rows x 8 chunks
         const int idx = tid + i * 256, r = idx >> 3, c = idx & 7;
         const int t = m0 + r;
         const bool ok = t < g.T;
@@ -453,13 +455,49 @@ __device__ __forceinline__ void gemm_load_stage(GemmSmem<WT>& sm, int st, const 
 #pragma unroll
         for (int i = 0; i < 2; i++) {
             const int idx = tid + i * 256, r = idx >> 2, c = idx & 3;
-            cp_async16(sm.lo[st] + r * 80 + c * 16, g.w.q + (size_t)(n0 + r) * (K / 2) + kt * 64 + c * 16);
+            cp_async16(sm.lo[st] + r * 64 + c * 16, g.w.q + (size_t)(n0 + r) * (K / 2) + kt * 64 + c * 16);
         }
         {
             const int r = tid >> 1, c = tid & 1;
-            cp_async16(sm.hi[st] + r * 48 + c * 16, g.w.h + (size_t)(n0 + r) * (K / 4) + kt * 32 + c * 16);
+            cp_async16(sm.hi[st] + r * 32 + c * 16, g.w.h + (size_t)(n0 + r) * (K / 4) + kt * 32 + c * 16);
         }
         if (tid < 128) cp_async8(sm.sc[st] + tid * 8, g.w.sc + (size_t)(n0 + tid) * (K / 16) + kt * 8);
+    }
+}
+
+// per k tile, after the stage landed: weight scales -> float [group][row]; Q6: unpack to int8 tile
+template <int WT, int K>
+__device__ __forceinline__ void gemm_prepare_stage(GemmSmem<WT>& sm, int st, const GemmArgs& g, int n0, int kt) {
+    const int tid = threadIdx.x;
+    if constexpr (WT == W_Q8) {
+#pragma unroll
+        for (int i = 0; i < 2; i++) {
+            const int idx = tid + i * 256, r = idx & 127, grp = idx >> 7;
+            sm.ws[grp][r] = __half2float(sm.bd[st][r * 4 + grp]);
+        }
+    } else {
+#pragma unroll
+        for (int i = 0; i < 2; i++) {
+            const int idx = tid + i * 256, r = idx >> 2, j = idx & 3;
+            const uint4 l = *(const uint4*)(sm.lo[st] + r * 64 + j * 16);
+            const uint2 h = *(const uint2*)(sm.hi[st] + r * 32 + j * 8);
+            const uint32_t lw[4] = {l.x, l.y, l.z, l.w};
+            uint32_t q0[4], q1[4];
+#pragma unroll
+            for (int m = 0; m < 4; m++) {
+                q0[m] = __vsub4((lw[m] & 0x0F0F0F0F) | (((h.x >> (2 * m)) & 0x03030303) << 4), 0x20202020);
+                q1[m] = __vsub4(((lw[m] >> 4) & 0x0F0F0F0F) | (((h.y >> (2 * m)) & 0x03030303) << 4), 0x20202020);
+            }
+            const int c0 = 2 * j, c1 = 2 * j + 1;
+            *(uint4*)(sm.b + r * GB_K + ((c0 ^ (r & 7)) * 16)) = make_uint4(q0[0], q0[1], q0[2], q0[3]);
+            *(uint4*)(sm.b + r * GB_K + ((c1 ^ (r & 7)) * 16)) = make_uint4(q1[0], q1[1], q1[2], q1[3]);
+        }
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            const int idx = tid + i * 256, r = idx & 127, sub = idx >> 7;
+            const float d = __half2float(g.w.d[(size_t)(n0 + r) * (K / 256) + (kt >> 1)]);
+            sm.ws[sub][r] = (float)sm.sc[st][r * 8 + sub] * d;
+        }
     }
 }
 
@@ -479,7 +517,6 @@ __global__ void __launch_bounds__(256, 1) k_gemm(GemmArgs g) {
 #pragma unroll
         for (int j = 0; j < 8; j++) acc[i][j][0] = acc[i][j][1] = acc[i][j][2] = acc[i][j][3] = 0.f;
 
-    // Q6: super-block scale d is constant within a 128-wide k tile
     gemm_load_stage<WT, K>(sm, 0, g, m0, n0, 0);
     cp_commit();
     for (int kt = 0; kt < KT; kt++) {
@@ -488,14 +525,11 @@ __global__ void __launch_bounds__(256, 1) k_gemm(GemmArgs g) {
         cp_commit();
         cp_wait<1>();
         __syncthreads();
-        float dq6[8][2];
-        if constexpr (WT == W_Q6) {
-#pragma unroll
-            for (int ni = 0; ni < 8; ni++)
-#pragma unroll
-                for (int e = 0; e < 2; e++)
-                    dq6[ni][e] = __half2float(g.w.d[(size_t)(n0 + wn + ni * 8 + tig * 2 + e) * (K / 256) + (kt * GB_K) / 256]);
-        }
+        gemm_prepare_stage<WT, K>(sm, st, g, n0, kt);
+        __syncthreads();
+        const int8_t* Bt;
+        if constexpr (WT == W_Q8) Bt = sm.b[st];
+        else Bt = sm.b;
 #pragma unroll
         for (int grp = 0; grp < 4; grp++) {
             uint32_t af[2][4];
@@ -505,60 +539,58 @@ __global__ void __launch_bounds__(256, 1) k_gemm(GemmArgs g) {
                 const int c = grp * 2 + (q >> 1);
                 ldsm_x4(af[mi][0], af[mi][1], af[mi][2], af[mi][3], sm.a[st] + r * GB_K + ((c ^ (r & 7)) * 16));
             }
+            uint32_t bf[8][2];
+#pragma unroll
+            for (int np = 0; np < 4; np++) {
+                const int q = lane >> 3, r = wn + np * 16 + (lane & 7) + (q >> 1) * 8;
+                const int c = grp * 2 + (q & 1);
+                ldsm_x4(bf[2 * np][0], bf[2 * np][1], bf[2 * np + 1][0], bf[2 * np + 1][1], Bt + r * GB_K + ((c ^ (r & 7)) * 16));
+            }
             float xs[2][2];
 #pragma unroll
             for (int mi = 0; mi < 2; mi++) {
                 xs[mi][0] = sm.ad[st][(wm + mi * 16 + g8) * 4 + grp];
                 xs[mi][1] = sm.ad[st][(wm + mi * 16 + g8 + 8) * 4 + grp];
             }
+            if constexpr (WT == W_Q8) {
+                int c[2][8][4];
 #pragma unroll
-            for (int np = 0; np < 4; np++) {
-                if constexpr (WT == W_Q8) {
-                    uint32_t b0, b1, b2, b3;
-                    const int q = lane >> 3, r = wn + np * 16 + (lane & 7) + (q >> 1) * 8;
-                    const int c = grp * 2 + (q & 1);
-                    ldsm_x4(b0, b1, b2, b3, sm.b[st] + r * GB_K + ((c ^ (r & 7)) * 16));
-                    const uint32_t bb[2][2] = {{b0, b1}, {b2, b3}};
+                for (int ni = 0; ni < 8; ni++)
 #pragma unroll
-                    for (int h = 0; h < 2; h++) {
-                        const int ni = np * 2 + h;
-                        const int col = wn + ni * 8 + tig * 2;
-                        const float w0 = __half2float(sm.bd[st][col * 4 + grp]);
-                        const float w1 = __half2float(sm.bd[st][(col + 1) * 4 + grp]);
+                    for (int mi = 0; mi < 2; mi++) mma_s8_k32(c[mi][ni], af[mi], bf[ni][0], bf[ni][1]);
 #pragma unroll
-                        for (int mi = 0; mi < 2; mi++) {
-                            int c4[4];
-                            mma_s8_k32(c4, af[mi], bb[h][0], bb[h][1]);
-                            acc[mi][ni][0] += i2f_magic(c4[0]) * (xs[mi][0] * w0);
-                            acc[mi][ni][1] += i2f_magic(c4[1]) * (xs[mi][0] * w1);
-                            acc[mi][ni][2] += i2f_magic(c4[2]) * (xs[mi][1] * w0);
-                            acc[mi][ni][3] += i2f_magic(c4[3]) * (xs[mi][1] * w1);
-                        }
+                for (int ni = 0; ni < 8; ni++) {
+                    const float2 w = *(const float2*)&sm.ws[grp][wn + ni * 8 + tig * 2];
+#pragma unroll
+                    for (int mi = 0; mi < 2; mi++) {
+                        acc[mi][ni][0] += i2f_magic(c[mi][ni][0]) * (xs[mi][0] * w.x);
+                        acc[mi][ni][1] += i2f_magic(c[mi][ni][1]) * (xs[mi][0] * w.y);
+                        acc[mi][ni][2] += i2f_magic(c[mi][ni][2]) * (xs[mi][1] * w.x);
+                        acc[mi][ni][3] += i2f_magic(c[mi][ni][3]) * (xs[mi][1] * w.y);
                     }
-                } else {
+                }
+            } else {
 #pragma unroll
-                    for (int h = 0; h < 2; h++) {
-                        const int ni = np * 2 + h;
-                        const int nrow = wn + ni * 8 + g8;  // B fragment row for this thread
-                        const uint32_t lo = *(const uint32_t*)(sm.lo[st] + nrow * 80 + grp * 16 + tig * 4);
-                        const uint2 hh = *(const uint2*)(sm.hi[st] + nrow * 48 + grp * 8);
-                        const uint32_t q0 = (lo & 0x0F0F0F0F) | (((hh.x >> (2 * tig)) & 0x03030303) << 4);
-                        const uint32_t q1 = ((lo >> 4) & 0x0F0F0F0F) | (((hh.y >> (2 * tig)) & 0x03030303) << 4);
-                        const uint32_t b0 = __vsub4(q0, 0x20202020), b1 = __vsub4(q1, 0x20202020);
-                        const int col = wn + ni * 8 + tig * 2;
-                        const float s00 = sm.sc[st][col * 8 + grp * 2] * dq6[ni][0];
-                        const float s01 = sm.sc[st][col * 8 + grp * 2 + 1] * dq6[ni][0];
-                        const float s10 = sm.sc[st][(col + 1) * 8 + grp * 2] * dq6[ni][1];
-                        const float s11 = sm.sc[st][(col + 1) * 8 + grp * 2 + 1] * dq6[ni][1];
+                for (int np = 0; np < 4; np++) {
+                    int c0[2][2][4], c1[2][2][4];
+#pragma unroll
+                    for (int h = 0; h < 2; h++)
 #pragma unroll
                         for (int mi = 0; mi < 2; mi++) {
-                            int c0[4], c1[4];
-                            mma_s8_k16(c0, af[mi][0], af[mi][1], b0);
-                            mma_s8_k16(c1, af[mi][2], af[mi][3], b1);
-                            acc[mi][ni][0] += xs[mi][0] * (s00 * i2f_magic(c0[0]) + s01 * i2f_magic(c1[0]));
-                            acc[mi][ni][1] += xs[mi][0] * (s10 * i2f_magic(c0[1]) + s11 * i2f_magic(c1[1]));
-                            acc[mi][ni][2] += xs[mi][1] * (s00 * i2f_magic(c0[2]) + s01 * i2f_magic(c1[2]));
-                            acc[mi][ni][3] += xs[mi][1] * (s10 * i2f_magic(c0[3]) + s11 * i2f_magic(c1[3]));
+                            mma_s8_k16(c0[mi][h], af[mi][0], af[mi][1], bf[np * 2 + h][0]);
+                            mma_s8_k16(c1[mi][h], af[mi][2], af[mi][3], bf[np * 2 + h][1]);
+                        }
+#pragma unroll
+                    for (int h = 0; h < 2; h++) {
+                        const int ni = np * 2 + h, col = wn + ni * 8 + tig * 2;
+                        const float2 s0 = *(const float2*)&sm.ws[grp * 2][col];
+                        const float2 s1 = *(const float2*)&sm.ws[grp * 2 + 1][col];
+#pragma unroll
+                        for (int mi = 0; mi < 2; mi++) {
+                            acc[mi][ni][0] += xs[mi][0] * (s0.x * i2f_magic(c0[mi][h][0]) + s1.x * i2f_magic(c1[mi][h][0]));
+                            acc[mi][ni][1] += xs[mi][0] * (s0.y * i2f_magic(c0[mi][h][1]) + s1.y * i2f_magic(c1[mi][h][1]));
+                            acc[mi][ni][2] += xs[mi][1] * (s0.x * i2f_magic(c0[mi][h][2]) + s1.x * i2f_magic(c1[mi][h][2]));
+                            acc[mi][ni][3] += xs[mi][1] * (s0.y * i2f_magic(c0[mi][h][3]) + s1.y * i2f_magic(c1[mi][h][3]));
                         }
                     }
                 }
@@ -583,7 +615,7 @@ __global__ void __launch_bounds__(256, 1) k_gemm(GemmArgs g) {
             }
     } else {
         // stage the 128x128 f32 tile through shared memory, then SwiGLU + quantise per 32 outputs
-        float* tile = reinterpret_cast<float*>(smem_raw);  // 64 KB (pipeline buffers are free now)
+        float* tile = reinterpret_cast<float*>(smem_raw);
         constexpr int LD = GB_N + 4;
 #pragma unroll
         for (int mi = 0; mi < 2; mi++)
@@ -631,13 +663,14 @@ __global__ void __launch_bounds__(256, 1) k_gemm(GemmArgs g) {
 template <int K, int EPI>
 inline void launch_gemm(const GemmArgs& g, cudaStream_t s) {
     dim3 grid((g.T + GB_M - 1) / GB_M, (g.w.N + GB_N - 1) / GB_N);
+    constexpr size_t ep = 128 * 132 * 4;
     if (g.w.type == W_Q8) {
-        constexpr size_t sm = sizeof(GemmSmem<W_Q8>) > 128 * 132 * 4 ? sizeof(GemmSmem<W_Q8>) : 128 * 132 * 4;
+        constexpr size_t sm = sizeof(GemmSmem<W_Q8>) > ep ? sizeof(GemmSmem<W_Q8>) : ep;
         static bool init = false;
         if (!init) { cudaFuncSetAttribute(k_gemm<W_Q8, K, EPI>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm); init = true; }
         k_gemm<W_Q8, K, EPI><<<grid, 256, sm, s>>>(g);
     } else {
-        constexpr size_t sm = sizeof(GemmSmem<W_Q6>) > 128 * 132 * 4 ? sizeof(GemmSmem<W_Q6>) : 128 * 132 * 4;
+        constexpr size_t sm = sizeof(GemmSmem<W_Q6>) > ep ? sizeof(GemmSmem<W_Q6>) : ep;
         static bool init = false;
         if (!init) { cudaFuncSetAttribute(k_gemm<W_Q6, K, EPI>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm); init = true; }
         k_gemm<W_Q6, K, EPI><<<grid, 256, sm, s>>>(g);

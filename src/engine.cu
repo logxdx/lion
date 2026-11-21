@@ -1035,6 +1035,39 @@ void Engine::enqueue_step(bool with_head, cudaStream_t s) {
     prof_mark("advance", s);
 }
 
+void Engine::profile_prefill(int n) {
+    std::vector<int> toks(n);
+    for (int i = 0; i < n; i++) toks[i] = 1000 + (i * 7919) % 100000;
+    std::map<std::string, std::pair<double, double>> agg;
+    std::vector<std::string> order;
+    for (int it = 0; it < 3; it++) {
+        reset();
+        g_prof = Prof{};
+        g_prof.on = true;
+        prefill_batched(toks.data(), n);
+        g_prof.on = false;
+        CK(cudaDeviceSynchronize());
+        if (it == 0) continue;
+        for (size_t i = 1; i < g_prof.ev.size(); i++) {
+            if (g_prof.name[i] == "start") continue;
+            float ms;
+            cudaEventElapsedTime(&ms, g_prof.ev[i - 1], g_prof.ev[i]);
+            if (!agg.count(g_prof.name[i])) order.push_back(g_prof.name[i]);
+            agg[g_prof.name[i]].first += ms / 2;
+            agg[g_prof.name[i]].second += g_prof.bytes[i] / 2;
+        }
+    }
+    double tot = 0;
+    for (auto& kv : agg) tot += kv.second.first;
+    fprintf(stderr, "prefill %d tokens: %.2f ms (%.0f t/s)\n%-16s %10s %8s %9s\n", n, tot, n / (tot / 1e3), "kernel", "ms", "share", "TOPS");
+    for (auto& name : order) {
+        auto& a = agg[name];
+        fprintf(stderr, "%-16s %10.2f %7.1f%% %9.1f\n", name.c_str(), a.first, 100 * a.first / tot,
+                a.second > 0 ? a.second / (a.first * 1e-3) / 1e12 : 0.0);
+    }
+    reset();
+}
+
 void Engine::profile_decode(int steps) {
     // eager launches (no graph) with events between kernels; graph replay is faster than this
     auto& b = *B_;
@@ -1194,34 +1227,44 @@ void Engine::prefill_batched(const int* tokens, int n) {
         const int p0 = n_past_ + off;
         memcpy(p.h_toks, tokens + off, T * 4);
         CK(cudaMemcpyAsync(p.toks, p.h_toks, T * 4, cudaMemcpyHostToDevice, st_));
+        prof_mark("start", st_);
         k_embed_batch<<<T, 256, 0, st_>>>(emb_, p.toks, p0, b.hist, p.X);
+        prof_mark("embed", st_);
         const float* prevF = nullptr;
         const float* prev_post = nullptr;
         for (int il = 0; il < cfg_.n_layer; il++) {
             const Layer& l = L_[il];
             k_prep<<<T, 256, 0, st_>>>(p.X, prevF, prev_post, l.attn_norm, eps, p.xq, p.xd);
+            prof_mark("prep", st_);
             GemmArgs gi{};
             gi.A = p.xq; gi.Ad = p.xd; gi.T = T; gi.w = l.w_in; gi.out = p.big;
             launch_gemm<2048, GE_STORE>(gi, st_);
+            prof_mark(l.conv ? "gemm.in_proj" : "gemm.qkvg", st_, 2.0 * T * l.w_in.N * 2048);
             if (l.conv) {
-                k_conv_prefill<<<T, 256, 0, st_>>>(p.big, l.conv_w, l.conv_state, p.yq, p.yd);
+                k_conv_prefill<<<dim3((T + 31) / 32, 16), 256, 0, st_>>>(p.big, l.conv_w, l.conv_state, T, p.yq, p.yd);
                 k_conv_state_update<<<8, 256, 0, st_>>>(p.big, T, l.conv_state);
+                prof_mark("conv", st_);
             } else {
                 k_qk_rope_cache<<<T, 768, 0, st_>>>(p.big, p0, l.q_norm, l.k_norm, l.rope_ff,
                                                     l.swa ? cfg_.rope_base_swa : cfg_.rope_base, eps, p.qh, l.kc, l.vc, l.cap);
                 k_flash_prefill<<<dim3((T + FA_BQ - 1) / FA_BQ, 4), 256, 0, st_>>>(
                     p.qh, p.big, l.kc, l.vc, l.cap, l.swa ? cfg_.swa_window : 0, p0, T, p.yq, p.yd);
+                prof_mark(l.swa ? "attn(swa)" : "attn(global)", st_);
             }
             GemmArgs go{};
             go.A = p.yq; go.Ad = p.yd; go.T = T; go.w = l.w_out; go.out = p.O;
             launch_gemm<2048, GE_STORE>(go, st_);
+            prof_mark("gemm.out", st_, 2.0 * T * 2048 * 2048);
             k_prep<<<T, 256, 0, st_>>>(p.X, p.O, l.post_attn_norm, l.ffn_norm, eps, p.xq, p.xd);
+            prof_mark("prep", st_);
             GemmArgs gg{};
             gg.A = p.xq; gg.Ad = p.xd; gg.T = T; gg.w = l.w_gu; gg.yq = p.aq; gg.yd = p.ad;
             launch_gemm<2048, GE_SWIGLU>(gg, st_);
+            prof_mark("gemm.gate_up", st_, 2.0 * T * l.w_gu.N * 2048);
             GemmArgs gd{};
             gd.A = p.aq; gd.Ad = p.ad; gd.T = T; gd.w = l.w_down; gd.out = p.F;
             launch_gemm<7680, GE_STORE>(gd, st_);
+            prof_mark("gemm.down", st_, 2.0 * T * 2048 * 7680);
             prevF = p.F;
             prev_post = l.post_ffn_norm;
         }

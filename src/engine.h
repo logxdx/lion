@@ -79,6 +79,7 @@ public:
     std::vector<float> logits();
     // per-kernel timing of eager decode steps (stderr)
     void profile_decode(int steps);
+    void profile_prefill(int n_tokens);
     Timing timing;
     bool use_batched_prefill = true;
 

@@ -166,6 +166,7 @@ int main(int argc, char** argv) {
             Engine eng(model, std::max(ctx, pp + 64), !quiet);
             std::vector<int> toks(pp);
             for (int i = 0; i < pp; i++) toks[i] = 1000 + (i * 7919) % 100000;
+            eng.profile_prefill(std::min(pp, 4096));
             eng.prefill(toks);
             eng.profile_decode(21);
             return 0;
