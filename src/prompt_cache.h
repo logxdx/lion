@@ -28,7 +28,10 @@ public:
         size_t bytes() const { return kv_bytes + cp.bytes(); }
     };
 
-    PromptCache(le::Engine& e, size_t ram_budget, size_t disk_budget, const std::string& dir, const std::string& model_path);
+    // dirs: disk-tier directories in order of preference. The first one that takes a test write is used; when it dies
+    // later (removed drive, I/O errors) spills move on to the next one. All unusable: disk tier off.
+    PromptCache(le::Engine& e, size_t ram_budget, size_t disk_budget, const std::vector<std::string>& dirs,
+                const std::string& model_path);
     ~PromptCache();
 
     // Save a slot's state for tokens[0, n) (cp must be the checkpoint at n). Copies KV from the GPU.
@@ -42,7 +45,9 @@ public:
 
 private:
     size_t ram_budget_, disk_budget_;
-    std::string dir_;
+    std::string dir_;                 // current disk directory (written by the constructor / the writer thread only)
+    std::vector<std::string> dirs_;   // candidates, model-key subdirectory appended
+    size_t dir_idx_ = 0;
     uint64_t model_key_ = 0;
     size_t row_bytes_ = 0;
     std::mutex m_;
@@ -58,6 +63,8 @@ private:
     bool stop_ = false;
 
     void writer_loop();
+    bool use_next_dir();  // advance dir_ to the next candidate that accepts a test write (scans it); false: none left
+    static bool dir_usable(const std::string& d);
     bool write_file(const Entry& en, const std::string& path);
     bool read_kv(const Entry& en, std::vector<uint8_t>& kv, le::Engine::Checkpoint& cp);
     void enforce_budgets_locked();

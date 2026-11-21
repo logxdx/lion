@@ -115,16 +115,34 @@ nothing measurable: 106.3 vs 106.2 tok/s at 40k context, `bench/penalty_window.p
 ## OpenAI-compatible server (`build/liquid-server`)
 
 ```sh
+make webui webtools                          # once: llama.cpp web UI bundle + the tools' node/python deps
 ./serve.sh                                   # 4 slots x 100k context, q8 KV, RAM + disk prompt cache, port 8080
 build/liquid-server -m $M -np 4 -c 100000 --port 8080 --cache-ram-mib 4096 --cache-disk-mib 16384
 curl localhost:8080/v1/chat/completions -d '{"messages":[{"role":"user","content":"hi"}],"stream":true}'
 ```
 
+**Web UI with tools.** `http://127.0.0.1:8080/` serves llama.cpp's web UI (the prebuilt b12569 bundle that
+llama.cpp's build embeds; `make webui` downloads it to `build/webui` and checks its sha256; `--ui-dir`, `--no-ui`).
+Next to the UI's built-in browser tools (`get_datetime`, `get_info`, `run_javascript`, ...) the server provides
+three tools in llama-server's server-tool format (`GET /tools` lists them, `POST /tools {tool, params}` runs one,
+the same contract as llama-server's `get_info`/`read_file`), so the UI lists them under "Server Tools", enables
+them by default and asks permission per call:
+- `web_search` and `web_fetch`: the pi web-search / web-fetch extensions' code (TinyFish -> LangSearch -> Exa ->
+  keyless metasearch; TinyFish fetch -> Readability + Turndown -> Jina; keys from `secret-tool` or env), vendored in
+  `tools/webtools/` with the same names, parameters and output text.
+- `pdf`: the pi pdf-reader skill's `pdf` command (liteparse underneath): `map`, `ocr`, `outline`, `find`, `page`
+  on a local path (relative to the UI's working directory) or a URL, with per-file caching and bounded output.
+
+Each call runs `node tools/webtools/tools.ts call <name>` (`--tools-dir`, `--node`, `--tool-timeout`, `--no-tools`);
+a closed client connection kills it. In the UI, LFM3 chains them on its own: search -> fetch -> answer
+(`tests/agent_loop.py` replays the UI's loop: ~10 s for a "latest Rust release" question), and pdf map -> find ->
+page for questions about a paper. `tests/test_tools.py` checks the endpoints.
+
 Endpoints: `POST /v1/chat/completions` (stream + non-stream, `tools` -> `tool_calls`, `reasoning_content`,
 `chat_template_kwargs.enable_thinking/preserve_thinking`, `stop`, `seed`, `max_tokens`/`max_completion_tokens`,
 `temperature/top_p/top_k/min_p/repeat_penalty/repeat_last_n`, `stream_options.include_usage`, `ignore_eos`),
-`POST /v1/completions` (text or token ids), `GET /v1/models`, `GET /health`, `GET /slots` (slot + cache state),
-`POST /tokenize`. Responses carry `usage.prompt_tokens_details.cached_tokens` and llama.cpp-style `timings`
+`POST /v1/completions` (text or token ids), `GET /v1/models`, `GET /health`, `GET /props`, `GET /slots` (slot +
+cache state), `POST /tokenize`, `GET`/`POST /tools`, and the web UI at `/`. Responses carry `usage.prompt_tokens_details.cached_tokens` and llama.cpp-style `timings`
 (queue, prefill, restore, decode, cache tier). Point an agent at `http://127.0.0.1:8080/v1`, model `lfm3`.
 
 How it works:
@@ -144,7 +162,10 @@ How it works:
 - **RAM / disk tiers** (`--cache-ram-mib`, `--cache-disk-mib`, `--cache-dir`): a slot's conversation is moved down
   a tier before the slot is reused for something else (pinned RAM, LRU), RAM spills to disk on a background
   thread, files are written atomically, keyed by model + KV geometry, and reloaded at startup; on shutdown the
-  RAM tier is flushed to disk.
+  RAM tier is flushed to disk. Disk directory: `--cache-dir`, else `$LIQUID_CACHE_DIR` (`serve.sh` sets the SSD0
+  drive), else `~/.cache/liquid-engine`. When the chosen directory is missing or dies (drive unplugged, I/O errors;
+  probed with a test write at startup and after a failed spill) the tier moves to `~/.cache/liquid-engine` and
+  entries that were on the dead drive are dropped (their next request prefills).
 
 Measured (Q8_0, q8 KV, same GPU; llama.cpp = llama-server with the `[lfm3]` preset settings, same cache budgets):
 

@@ -8,7 +8,7 @@ NVFLAGS  := -O3 -std=c++17 -arch=$(ARCH) --use_fast_math -Xcompiler "-O3 -march=
 
 BUILD := build
 CORE  := $(BUILD)/engine.o $(BUILD)/tokenizer.o
-SERVER_OBJS := $(BUILD)/server.o $(BUILD)/chat.o $(BUILD)/prompt_cache.o $(BUILD)/httplib.o
+SERVER_OBJS := $(BUILD)/server.o $(BUILD)/chat.o $(BUILD)/prompt_cache.o $(BUILD)/web_tools.o $(BUILD)/httplib.o
 
 all: $(BUILD)/liquid $(BUILD)/liquid-server
 tests: $(BUILD)/test_engine_api $(BUILD)/test_chat
@@ -25,13 +25,16 @@ $(BUILD)/tokenizer.o: src/tokenizer.cpp src/tokenizer.h src/unicode_data.h src/g
 $(BUILD)/main.o: src/main.cpp src/engine.h src/tokenizer.h src/gguf.h | $(BUILD)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(BUILD)/server.o: src/server.cpp src/engine.h src/tokenizer.h src/chat.h src/prompt_cache.h | $(BUILD)
+$(BUILD)/server.o: src/server.cpp src/engine.h src/tokenizer.h src/chat.h src/prompt_cache.h src/web_tools.h | $(BUILD)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(BUILD)/chat.o: src/chat.cpp src/chat.h | $(BUILD)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(BUILD)/prompt_cache.o: src/prompt_cache.cpp src/prompt_cache.h src/engine.h | $(BUILD)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD)/web_tools.o: src/web_tools.cpp src/web_tools.h | $(BUILD)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(BUILD)/httplib.o: third_party/httplib.cpp third_party/httplib.h | $(BUILD)
@@ -50,7 +53,21 @@ $(BUILD)/test_engine_api: tests/test_engine_api.cpp $(CORE)
 $(BUILD)/test_chat: tests/test_chat.cpp $(BUILD)/chat.o
 	$(CXX) $(CXXFLAGS) $^ -o $@
 
+# Built-in tools for liquid-server (web_search, web_fetch, parse_document): node deps + the ddgs venv
+webtools:
+	cd tools/webtools && npm ci --no-audit --no-fund
+	cd tools/webtools && uv venv -q --allow-existing --python 3.12 .venv && uv pip install -q --python .venv/bin/python -r requirements.txt
+
+# llama.cpp web UI served by liquid-server at / (the prebuilt bundle llama.cpp's own build embeds), into $(BUILD)/webui
+UI_VERSION ?= b12569
+UI_URL     := https://huggingface.co/buckets/ggml-org/llama-ui/resolve/$(UI_VERSION)
+webui: | $(BUILD)
+	curl -fsSL -o $(BUILD)/webui-$(UI_VERSION).tar.gz $(UI_URL)/dist.tar.gz
+	curl -fsSL -o $(BUILD)/webui-$(UI_VERSION).tar.gz.sha256 $(UI_URL)/dist.tar.gz.sha256
+	cd $(BUILD) && echo "$$(cut -d' ' -f1 webui-$(UI_VERSION).tar.gz.sha256)  webui-$(UI_VERSION).tar.gz" | sha256sum -c -
+	rm -rf $(BUILD)/webui && mkdir -p $(BUILD)/webui && tar -xzf $(BUILD)/webui-$(UI_VERSION).tar.gz -C $(BUILD)/webui
+
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all tests clean
+.PHONY: all tests clean webtools webui

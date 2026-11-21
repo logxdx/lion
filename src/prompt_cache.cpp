@@ -34,9 +34,9 @@ void log(const char* fmt, ...) {
 }
 }  // namespace
 
-PromptCache::PromptCache(le::Engine& e, size_t ram_budget, size_t disk_budget, const std::string& dir,
+PromptCache::PromptCache(le::Engine& e, size_t ram_budget, size_t disk_budget, const std::vector<std::string>& dirs,
                          const std::string& model_path)
-    : ram_budget_(ram_budget), disk_budget_(disk_budget), dir_(dir), row_bytes_(e.kv_row_bytes()) {
+    : ram_budget_(ram_budget), disk_budget_(disk_budget), row_bytes_(e.kv_row_bytes()) {
     // entries are only valid for the same model file, KV type and context geometry
     struct stat st{};
     stat(model_path.c_str(), &st);
@@ -44,10 +44,13 @@ PromptCache::PromptCache(le::Engine& e, size_t ram_budget, size_t disk_budget, c
                            std::to_string(st.st_mtime) + "|" + std::to_string(row_bytes_) + "|" + (e.kv_q8() ? "q8" : "f16");
     model_key_ = fnv1a(id.data(), id.size());
     if (disk_budget_ > 0) {
-        dir_ += "/" + std::to_string(model_key_ % 1000000007ull);
-        fs::create_directories(dir_);
-        scan_dir();
-        writer_ = std::thread([this] { writer_loop(); });
+        for (const auto& d : dirs) dirs_.push_back(d + "/" + std::to_string(model_key_ % 1000000007ull));
+        dir_idx_ = (size_t)-1;
+        if (use_next_dir()) writer_ = std::thread([this] { writer_loop(); });
+        else {
+            log("no usable disk-tier directory: disk tier off");
+            disk_budget_ = 0;
+        }
     }
     log("RAM budget %zu MiB, disk budget %zu MiB (%s), %zu bytes/token, %zu entries on disk",
         ram_budget_ >> 20, disk_budget_ >> 20, disk_budget_ ? dir_.c_str() : "off", row_bytes_, entries_.size());
@@ -70,7 +73,40 @@ PromptCache::Entry* PromptCache::find_locked(uint64_t id) {
     return nullptr;
 }
 
+bool PromptCache::dir_usable(const std::string& d) {
+    std::error_code ec;
+    fs::create_directories(d, ec);
+    if (ec) return false;
+    const std::string probe = d + "/.probe";
+    FILE* fp = fopen(probe.c_str(), "wb");
+    if (!fp) return false;
+    const bool ok = fwrite("ok", 1, 2, fp) == 2 && fflush(fp) == 0;
+    fclose(fp);
+    fs::remove(probe, ec);
+    return ok;
+}
+
+bool PromptCache::use_next_dir() {
+    for (size_t i = dir_idx_ + 1; i < dirs_.size(); i++) {
+        if (!dir_usable(dirs_[i])) {
+            log("disk-tier directory unusable: %s", dirs_[i].c_str());
+            continue;
+        }
+        dir_idx_ = i;
+        dir_ = dirs_[i];
+        try {
+            scan_dir();
+        } catch (const std::exception& ex) {
+            log("scan of %s failed: %s", dir_.c_str(), ex.what());
+        }
+        if (i > 0) log("disk tier now in %s", dir_.c_str());
+        return true;
+    }
+    return false;
+}
+
 void PromptCache::scan_dir() {
+    std::error_code ec;
     for (auto& f : fs::directory_iterator(dir_)) {
         if (f.path().extension() != ".lqc") continue;
         FILE* fp = fopen(f.path().c_str(), "rb");
@@ -84,14 +120,15 @@ void PromptCache::scan_dir() {
             ok = fread(en.tokens.data(), 4, h.n, fp) == (size_t)h.n;
         }
         fclose(fp);
-        if (!ok) { fs::remove(f.path()); continue; }  // stale or corrupt
+        if (!ok) { fs::remove(f.path(), ec); continue; }  // stale or corrupt
         en.id = next_id_++;
         en.n = h.n;
         en.kv_bytes = h.kv_bytes;
         en.cp.n_past = h.n;
         en.path = f.path().string();
         en.last_use = 0;
-        disk_used_ += fs::file_size(f.path());
+        const auto sz = fs::file_size(f.path(), ec);
+        disk_used_ += ec ? 0 : sz;
         entries_.push_back(std::move(en));
     }
 }
@@ -183,8 +220,10 @@ bool PromptCache::write_file(const Entry& en, const std::string& path) {
               fwrite(en.kv, 1, en.kv_bytes, fp) == en.kv_bytes;
     ok = (fflush(fp) == 0) && ok;
     fclose(fp);
-    if (!ok) { fs::remove(tmp); return false; }
-    fs::rename(tmp, path);  // atomic: a crash never leaves a half-written .lqc
+    std::error_code ec;  // no throwing fs calls here: this runs on the writer thread
+    if (!ok) { fs::remove(tmp, ec); return false; }
+    fs::rename(tmp, path, ec);  // atomic: a crash never leaves a half-written .lqc
+    if (ec) { fs::remove(tmp, ec); return false; }
     return true;
 }
 
@@ -206,8 +245,26 @@ void PromptCache::writer_loop() {
             snapshot.kv = en->kv;  // stays valid: freed only by this thread while writing == true
             snapshot.kv_bytes = en->kv_bytes;
         }
-        const std::string path = dir_ + "/" + std::to_string(fnv1a(snapshot.tokens.data(), snapshot.tokens.size() * 4)) + ".lqc";
-        const bool ok = write_file(snapshot, path);
+        const std::string name = std::to_string(fnv1a(snapshot.tokens.data(), snapshot.tokens.size() * 4)) + ".lqc";
+        std::string path = dir_ + "/" + name;
+        bool ok = write_file(snapshot, path);
+        if (!ok && !dir_usable(dir_)) {  // the directory died (drive removed, I/O errors): fail over to the next one
+            log("disk-tier directory failed: %s", dir_.c_str());
+            bool switched;
+            {
+                std::lock_guard<std::mutex> l(m_);
+                // entries stored in the dead directory cannot be read back
+                entries_.remove_if([&](const Entry& x) { return !x.path.empty() && !x.writing; });
+                disk_used_ = 0;
+                switched = use_next_dir();
+            }
+            if (switched) {
+                path = dir_ + "/" + name;
+                ok = write_file(snapshot, path);
+            } else {
+                log("no usable disk-tier directory left: spills are dropped");
+            }
+        }
         std::lock_guard<std::mutex> l(m_);
         Entry* en = find_locked(id);
         if (!en) continue;
@@ -270,7 +327,15 @@ bool PromptCache::restore(le::Engine& e, int slot, uint64_t id, std::string& tie
     l.unlock();
     std::vector<uint8_t> kv;
     le::Engine::Checkpoint cp;
-    if (!read_kv(copy, kv, cp)) return false;
+    if (!read_kv(copy, kv, cp)) {  // unreadable (dead disk, deleted file): forget it, the caller prefills instead
+        l.lock();
+        std::error_code ec;
+        if (Entry* gone = find_locked(id)) {
+            disk_used_ -= std::min(disk_used_, (size_t)fs::file_size(gone->path, ec));
+            entries_.remove_if([&](const Entry& x) { return x.id == id; });
+        }
+        return false;
+    }
     e.load_kv(slot, 0, copy.n, kv.data());
     e.load_checkpoint(slot, cp);
     e.write_history(slot, 0, copy.tokens.data(), copy.n);

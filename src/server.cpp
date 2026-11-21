@@ -5,10 +5,12 @@
 #include <cstdarg>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <csignal>
 #include <cstdio>
 #include <deque>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -23,6 +25,7 @@
 #include "prompt_cache.h"
 #include "sampling_defaults.h"
 #include "tokenizer.h"
+#include "web_tools.h"
 
 using chat::json;
 using clk = std::chrono::steady_clock;
@@ -728,8 +731,16 @@ static void usage() {
             "  --max-queue N              queued requests before 503 (default 64)\n"
             "  --cache-ram-mib N          RAM prompt-cache tier (default 4096, 0 = off)\n"
             "  --cache-disk-mib N         disk prompt-cache tier (default 16384, 0 = off)\n"
-            "  --cache-dir DIR            disk tier directory (default ~/.cache/liquid-engine)\n"
-            "  --threads N                HTTP worker threads (default 2*slots+16)\n",
+            "  --cache-dir DIR            disk tier directory (default $LIQUID_CACHE_DIR, else ~/.cache/liquid-engine);\n"
+            "                             ~/.cache/liquid-engine is also the fallback when DIR is missing or dies\n"
+            "  --threads N                HTTP worker threads (default 2*slots+16)\n"
+            "  --tools-dir DIR            built-in tools web_search / web_fetch / parse_document, served at /tools like\n"
+            "                             llama-server's (default <binary>/../tools/webtools)\n"
+            "  --no-tools                 do not serve /tools\n"
+            "  --node PATH                node binary for the tools (default node)\n"
+            "  --tool-timeout S           per tool call (default 300)\n"
+            "  --ui-dir DIR               llama.cpp web UI served at / (default <binary dir>/webui; make webui)\n"
+            "  --no-ui                    API only\n",
             le::MAX_SLOTS);
 }
 
@@ -737,7 +748,10 @@ int main(int argc, char** argv) {
     std::string model, host = "127.0.0.1", cache_dir;
     int port = 8080, slots = 4, ctx = 65536, threads = 0;
     long cache_ram = 4096, cache_disk = 16384;
-    bool kv_q8 = true;
+    bool kv_q8 = true, tools_on = true;
+    std::string tools_dir, node_bin = "node", ui_dir;
+    bool ui_on = true;
+    int tool_timeout = 300;
     ServerConfig scfg;
     SchedConfig sch;
     SamplingOverrides ov;
@@ -769,26 +783,46 @@ int main(int argc, char** argv) {
         else if (a == "--cache-disk-mib") cache_disk = std::stol(next());
         else if (a == "--cache-dir") cache_dir = next();
         else if (a == "--threads") threads = std::stoi(next());
+        else if (a == "--tools-dir") tools_dir = next();
+        else if (a == "--no-tools") tools_on = false;
+        else if (a == "--node") node_bin = next();
+        else if (a == "--tool-timeout") tool_timeout = std::stoi(next());
+        else if (a == "--ui-dir") ui_dir = next();
+        else if (a == "--no-ui") ui_on = false;
         else if (a == "-h" || a == "--help") { usage(); return 0; }
         else { fprintf(stderr, "unknown option %s\n", a.c_str()); usage(); return 1; }
     }
     if (model.empty()) { usage(); return 1; }
-    if (cache_dir.empty()) {
+    if (tools_dir.empty()) {
+        std::error_code ec;
+        auto exe = std::filesystem::read_symlink("/proc/self/exe", ec);
+        tools_dir = (exe.parent_path().parent_path() / "tools" / "webtools").string();
+    }
+    // Disk-tier directories in order: --cache-dir, else $LIQUID_CACHE_DIR; then the default ~/.cache/liquid-engine,
+    // used whenever the first one is missing or dies (PromptCache probes each with a test write).
+    std::vector<std::string> cache_dirs;
+    {
         const char* home = getenv("HOME");
-        cache_dir = std::string(home ? home : ".") + "/.cache/liquid-engine";
+        const std::string fallback = std::string(home ? home : ".") + "/.cache/liquid-engine";
+        const char* env_dir = getenv("LIQUID_CACHE_DIR");
+        if (cache_dir.empty() && env_dir && *env_dir) cache_dir = env_dir;
+        if (!cache_dir.empty() && cache_dir != fallback) cache_dirs.push_back(cache_dir);
+        cache_dirs.push_back(fallback);
     }
     try {
         std::unique_ptr<Tokenizer> tk;
+        std::string chat_template;
         {
             gguf::File f(model);
             tk = std::make_unique<Tokenizer>(f);
             apply_gguf_sampling(f, scfg.sp);
+            if (f.has("tokenizer.chat_template")) chat_template = f.get("tokenizer.chat_template").str;
         }
         ov.apply(scfg.sp);
         le::Engine eng(model, ctx, true, false, kv_q8, slots);
         std::unique_ptr<PromptCache> cache;
         if (cache_ram > 0 || cache_disk > 0)
-            cache = std::make_unique<PromptCache>(eng, (size_t)cache_ram << 20, (size_t)cache_disk << 20, cache_dir, model);
+            cache = std::make_unique<PromptCache>(eng, (size_t)cache_ram << 20, (size_t)cache_disk << 20, cache_dirs, model);
         Scheduler sched(eng, *tk, sch, cache.get());
         ApiServer api{eng, *tk, sched, scfg};
 
@@ -821,20 +855,104 @@ int main(int argc, char** argv) {
         srv.Get("/health", [](const httplib::Request&, httplib::Response& r) { r.set_content("{\"status\":\"ok\"}", "application/json"); });
         srv.Get("/props", [&](const httplib::Request&, httplib::Response& r) {
             const auto& sp = scfg.sp;
+            auto r6 = [](float x) { return std::round((double)x * 1e6) / 1e6; };  // 0.1f -> 0.1, not 0.10000000149
+            json params = {{"temperature", r6(sp.temperature)}, {"top_k", sp.top_k}, {"top_p", r6(sp.top_p)},
+                           {"min_p", r6(sp.min_p)}, {"repeat_penalty", r6(sp.repeat_penalty)}, {"repeat_last_n", sp.repeat_last_n},
+                           {"max_tokens", scfg.max_tokens}};
+            json dgs = params;  // flat keys (liquid-server's own) plus llama-server's {n_ctx, params} read by the web UI
+            dgs["n_ctx"] = eng.max_ctx();
+            dgs["params"] = params;
             json p = {{"model", scfg.model_alias}, {"n_ctx", eng.max_ctx()}, {"n_slots", eng.n_slots()},
                       {"kv_cache", eng.kv_q8() ? "q8_0" : "f16"}, {"reasoning_preserve", scfg.reasoning_preserve},
-                      {"default_generation_settings",
-                       {{"temperature", sp.temperature}, {"top_k", sp.top_k}, {"top_p", sp.top_p}, {"min_p", sp.min_p},
-                        {"repeat_penalty", sp.repeat_penalty}, {"repeat_last_n", sp.repeat_last_n},
-                        {"max_tokens", scfg.max_tokens}}}};
+                      {"default_generation_settings", dgs},
+                      // llama-server /props fields used by the llama.cpp web UI
+                      {"model_alias", scfg.model_alias}, {"model_path", model}, {"total_slots", eng.n_slots()},
+                      {"modalities", {{"vision", false}, {"audio", false}, {"video", false}}},
+                      {"chat_template", chat_template}, {"build_info", "liquid-engine"},
+                      {"cors_proxy_enabled", false}, {"ui_settings", json::object()}};
             r.set_content(p.dump(), "application/json");
         });
         srv.Get("/slots", [&](const httplib::Request&, httplib::Response& r) { r.set_content(sched.stats().dump(), "application/json"); });
+        // Built-in tools, llama-server's /tools contract (see web_tools.h); the web UI lists and calls them like get_info
+        std::unique_ptr<WebTools> wtools;
+        if (tools_on) {
+            wtools = std::make_unique<WebTools>(tools_dir, node_bin, tool_timeout);
+            if (wtools->enabled()) {
+                std::string names;
+                for (const auto& t : wtools->list()) names += (names.empty() ? "" : ", ") + t.value("tool", std::string());
+                Scheduler::log("tools: %s (%s)", names.c_str(), tools_dir.c_str());
+            } else {
+                Scheduler::log("tools disabled: %s", wtools->error().c_str());
+            }
+        }
+        auto tools_off = [&](httplib::Response& r) {
+            if (wtools && wtools->enabled()) return false;
+            r.status = 403;  // what llama-server answers without --tools; the UI then hides server tools
+            r.set_content(ApiServer::err_json("server tools are disabled", "permission_error").dump(), "application/json");
+            return true;
+        };
+        srv.Get("/tools", [&](const httplib::Request&, httplib::Response& r) {
+            if (!tools_off(r)) r.set_content(wtools->list().dump(), "application/json");
+        });
+        srv.Post("/tools", [&](const httplib::Request& q, httplib::Response& r) {
+            if (tools_off(r)) return;
+            json b = json::parse(q.body, nullptr, false);
+            if (!b.is_object() || !b.contains("tool") || !b["tool"].is_string()) {
+                r.status = 400;
+                r.set_content(ApiServer::err_json("expected {\"tool\": name, \"params\": {...}}", "invalid_request_error").dump(),
+                              "application/json");
+                return;
+            }
+            std::string name = b["tool"].get<std::string>();
+            if (!wtools->has(name) || b.value("stream", false)) {
+                r.status = 404;
+                std::string msg = wtools->has(name) ? "tool \"" + name + "\" does not support stream = true"
+                                                    : "unknown tool \"" + name + "\"";
+                r.set_content(ApiServer::err_json(msg, "invalid_request_error").dump(), "application/json");
+                return;
+            }
+            json params = b.contains("params") && b["params"].is_object() ? b["params"] : json::object();
+            params.erase("cwd");  // like llama-server: the working directory comes only from the x-tool-cwd header
+            if (q.has_header("x-tool-cwd")) params["cwd"] = q.get_header_value("x-tool-cwd");
+            auto t0 = std::chrono::steady_clock::now();
+            json out = wtools->call(name, params, q.is_connection_closed);
+            Scheduler::log("tool %s: %s in %.0f ms", name.c_str(), out.contains("error") ? "error" : "ok",
+                           std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+            r.set_content(out.dump(), "application/json");
+        });
         srv.Post("/tokenize", [&](const httplib::Request& q, httplib::Response& r) {
             json b = json::parse(q.body, nullptr, false);
             json out = {{"tokens", b.is_object() && b.contains("content") ? json(tk->encode(b["content"].get<std::string>())) : json::array()}};
             r.set_content(out.dump(), "application/json");
         });
+
+        // llama.cpp web UI (prebuilt bundle, `make webui`). Hash routing + relative asset paths: serving the directory
+        // at / is all it needs. Cache headers as llama-server sends them.
+        if (ui_on) {
+            if (ui_dir.empty()) {
+                std::error_code ec;
+                ui_dir = (std::filesystem::read_symlink("/proc/self/exe", ec).parent_path() / "webui").string();
+            }
+            if (std::filesystem::exists(std::filesystem::path(ui_dir) / "index.html") && srv.set_mount_point("/", ui_dir)) {
+                srv.set_file_extension_and_mimetype_mapping("webmanifest", "application/manifest+json");
+                srv.set_file_extension_and_mimetype_mapping("mjs", "application/javascript");
+                srv.set_file_request_handler([](const httplib::Request& q, httplib::Response& r) {
+                    const std::string& p = q.path;
+                    const bool revalidate = p == "/" || p == "/index.html" || p == "/service-worker.js" || p == "/sw.js" ||
+                                            p == "/manifest.webmanifest" || p == "/build.json" || p == "/_app/version.json";
+                    r.set_header("Cache-Control", revalidate ? "no-cache" : "public, max-age=31536000, immutable");
+                    if (p == "/" || p == "/index.html") {
+                        r.set_header("Cross-Origin-Embedder-Policy", "require-corp");
+                        r.set_header("Cross-Origin-Opener-Policy", "same-origin");
+                    }
+                });
+                Scheduler::log("web UI: %s", ui_dir.c_str());
+            } else {
+                Scheduler::log("web UI not found in %s (run: make webui), serving the API only", ui_dir.c_str());
+            }
+        }
+        // llama-server endpoints the UI probes; answering them keeps its console clean
+        srv.Post("/v1/streams/lookup", [](const httplib::Request&, httplib::Response& r) { r.set_content("[]", "application/json"); });
 
         g_srv = &srv;
         std::signal(SIGINT, on_signal);
