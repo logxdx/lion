@@ -10,7 +10,7 @@
 #include <thread>
 #include <vector>
 
-#include "../third_party/json.hpp"
+#include "json.hpp"
 #include "engine.h"
 
 class PromptCache {

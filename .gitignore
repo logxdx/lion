@@ -1,5 +1,4 @@
 build/
 build-dev/
 tools/webtools/node_modules/
-tools/webtools/.venv/
 .claude/

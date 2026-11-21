@@ -1,5 +1,5 @@
 // web_search / web_fetch as liquid-server built-in tools, on the code vendored from the pi extensions
-// (providers.ts, fetch.ts, ddgs_search.py). Names, descriptions, parameters and result text match the pi tools.
+// (providers.ts, fetch.ts) and the pdf-reader skill (pdf). Names, descriptions, parameters and result text match the pi tools.
 // The wire format is llama-server's server tools (GET/POST /tools, the same as get_info):
 //
 //   node tools.ts list                      -> [{display_name, tool, type: "server", permissions, uses_cwd, definition}]
@@ -23,12 +23,19 @@ function normalizeDomain(value: string): string {
 	return domain.replace(/^www\./, "");
 }
 
+// Providers return ISO timestamps or text like "Nov 12, 2026"; show YYYY-MM-DD either way
+function isoDate(raw: string): string {
+	if (/^\d{4}-\d{2}-\d{2}/.test(raw)) return raw.slice(0, 10);
+	const d = new Date(`${raw} UTC`);
+	return Number.isNaN(d.getTime()) ? raw : d.toISOString().slice(0, 10);
+}
+
 function formatResults(provider: string, results: SearchResult[]): string {
 	const lines = [`Provider: ${provider} (${results.length} results)`];
 	results.forEach((r, i) => {
 		let snippet = r.snippet.replace(/\s+/g, " ").trim();
 		if (snippet.length > SNIPPET_CHARS) snippet = `${snippet.slice(0, SNIPPET_CHARS)}…`;
-		const date = r.date ? ` (${r.date.slice(0, 10)})` : "";
+		const date = r.date ? ` (${isoDate(r.date)})` : "";
 		lines.push(`\n${i + 1}. ${r.title}${date}\n   ${r.url}\n   ${snippet}`);
 	});
 	return lines.join("\n");
@@ -40,7 +47,7 @@ const TOOLS = [
 		display_name: "Web Search",
 		description:
 			"Search the web. Returns title, URL, date and snippet per result. " +
-			"Tries TinyFish, LangSearch, Exa, then a keyless metasearch, falling back automatically when a provider fails. " +
+			"Tries TinyFish, LangSearch, Exa, then Wikipedia (keyless), falling back automatically when a provider fails. " +
 			"Use one web_search call per search angle; rephrase rather than repeating the same query. " +
 			"Then use web_fetch on the one or two most relevant URLs for full content.",
 		parameters: {

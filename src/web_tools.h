@@ -7,11 +7,11 @@
 #include <functional>
 #include <string>
 
-#include "../third_party/json.hpp"
+#include "json.hpp"
 
 class WebTools {
 public:
-    // dir holds tools.ts (and node_modules, .venv). Loads the tool list once; on failure enabled() is false.
+    // dir holds tools.ts, pdf and node_modules. Loads the tool list once; on failure enabled() is false.
     WebTools(std::string dir, std::string node = "node", int timeout_s = 120);
 
     bool enabled() const { return enabled_; }

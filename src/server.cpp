@@ -18,7 +18,7 @@
 #include <thread>
 #include <vector>
 
-#include "../third_party/httplib.h"
+#include "httplib.h"
 #include "chat.h"
 #include "engine.h"
 #include "gguf.h"

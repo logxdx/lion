@@ -37,7 +37,7 @@ $(BUILD)/prompt_cache.o: src/prompt_cache.cpp src/prompt_cache.h src/engine.h | 
 $(BUILD)/web_tools.o: src/web_tools.cpp src/web_tools.h | $(BUILD)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(BUILD)/httplib.o: third_party/httplib.cpp third_party/httplib.h | $(BUILD)
+$(BUILD)/httplib.o: src/httplib.cpp src/httplib.h | $(BUILD)
 	$(CXX) -O2 -std=c++17 -c $< -o $@
 
 $(BUILD)/liquid: $(CORE) $(BUILD)/main.o
@@ -53,10 +53,9 @@ $(BUILD)/test_engine_api: tests/test_engine_api.cpp $(CORE)
 $(BUILD)/test_chat: tests/test_chat.cpp $(BUILD)/chat.o
 	$(CXX) $(CXXFLAGS) $^ -o $@
 
-# Built-in tools for liquid-server (web_search, web_fetch, parse_document): node deps + the ddgs venv
+# Built-in tools for liquid-server (web_search, web_fetch: TypeScript; pdf: bash): node deps
 webtools:
 	cd tools/webtools && npm ci --no-audit --no-fund
-	cd tools/webtools && uv venv -q --allow-existing --python 3.12 .venv && uv pip install -q --python .venv/bin/python -r requirements.txt
 
 # llama.cpp web UI served by liquid-server at / (the prebuilt bundle llama.cpp's own build embeds), into $(BUILD)/webui
 UI_VERSION ?= b12569

@@ -3,7 +3,7 @@
 #include <string>
 #include <vector>
 
-#include "../third_party/json.hpp"
+#include "json.hpp"
 
 namespace chat {
 

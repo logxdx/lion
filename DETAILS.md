@@ -115,7 +115,7 @@ nothing measurable: 106.3 vs 106.2 tok/s at 40k context, `bench/penalty_window.p
 ## OpenAI-compatible server (`build/liquid-server`)
 
 ```sh
-make webui webtools                          # once: llama.cpp web UI bundle + the tools' node/python deps
+make webui webtools                          # once: llama.cpp web UI bundle + the tools' node deps
 ./serve.sh                                   # 4 slots x 100k context, q8 KV, RAM + disk prompt cache, port 11434
 build/liquid-server -m $M -np 4 -c 100000 --port 8080 --cache-ram-mib 4096 --cache-disk-mib 16384
 curl localhost:8080/v1/chat/completions -d '{"messages":[{"role":"user","content":"hi"}],"stream":true}'
@@ -128,7 +128,7 @@ three tools in llama-server's server-tool format (`GET /tools` lists them, `POST
 the same contract as llama-server's `get_info`/`read_file`), so the UI lists them under "Server Tools", enables
 them by default and asks permission per call:
 - `web_search` and `web_fetch`: the pi web-search / web-fetch extensions' code (TinyFish -> LangSearch -> Exa ->
-  keyless metasearch; TinyFish fetch -> Readability + Turndown -> Jina; keys from `secret-tool` or env), vendored in
+  Wikipedia (keyless); TinyFish fetch -> Readability + Turndown -> Jina; keys from `secret-tool` or env), vendored in
   `tools/webtools/` with the same names, parameters and output text.
 - `pdf`: the pi pdf-reader skill's `pdf` command (liteparse underneath): `map`, `ocr`, `outline`, `find`, `page`
   on a local path (relative to the UI's working directory) or a URL, with per-file caching and bounded output.

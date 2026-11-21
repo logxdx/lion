@@ -1,8 +1,6 @@
-// Vendored verbatim from the pi web-search extension (~/.pi/agent/extensions/web-search/providers.ts).
+// From the pi web-search extension (~/.pi/agent/extensions/web-search/providers.ts); the keyless Python ddgs
+// fallback is replaced by the Wikipedia search API (see "Keyless fallback").
 import { execFile } from "node:child_process";
-import { existsSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 
 // ── Unified interface ────────────────────────────────────────────────
 //
@@ -40,7 +38,6 @@ export interface SearchProvider {
 export class ProviderError extends Error {}
 
 const TIMEOUT_MS = 20000;
-const EXT_DIR = dirname(fileURLToPath(import.meta.url));
 
 async function request(url: string, init: RequestInit, signal?: AbortSignal): Promise<any> {
 	let res: Response;
@@ -149,33 +146,44 @@ const exa: SearchProvider = {
 	},
 };
 
-/** Keyless metasearch (DuckDuckGo, Bing, Brave, …) via the ddgs package in ./.venv. */
-const ddgs: SearchProvider = {
-	name: "ddgs",
+// ── Keyless fallback ─────────────────────────────────────────────────
+//
+// The pi extension ends with a Python metasearch (ddgs). Here it is TypeScript and limited to an official API:
+// scraping DuckDuckGo / Bing / Brave HTML from this machine gets a bot challenge (DuckDuckGo), degraded results
+// that ignore site: filters (Bing) or redirect-only links (Brave). Wikipedia's search API is the keyless last resort.
+
+async function fetchText(url: string, signal?: AbortSignal): Promise<string> {
+	let res: Response;
+	try {
+		res = await fetch(url, {
+			headers: { "User-Agent": "liquine-web-search/1.0 (local tool)" },
+			signal: AbortSignal.any([AbortSignal.timeout(TIMEOUT_MS), ...(signal ? [signal] : [])]),
+		});
+	} catch (err) {
+		throw new ProviderError(err instanceof Error ? err.message : String(err));
+	}
+	if (!res.ok) throw new ProviderError(`HTTP ${res.status}`);
+	return res.text();
+}
+
+const clean = (s: string | null | undefined) => (s ?? "").replace(/\s+/g, " ").trim();
+
+/** Wikipedia's search API (keyless, official). Recency and excluded sites do not apply to it. */
+const wikipedia: SearchProvider = {
+	name: "wikipedia",
 	async search(req) {
-		const python = join(EXT_DIR, ".venv", "bin", "python");
-		if (!existsSync(python)) throw new ProviderError("ddgs not installed (see README.md)");
-		const query = [
-			req.query,
-			...(req.includeDomains ?? []).map((d) => `site:${d}`),
-			...(req.excludeDomains ?? []).map((d) => `-site:${d}`),
-		].join(" ");
-		const timelimit = req.recency ? req.recency[0] : "";
-		// Backends rotate per call, so an empty answer is often transient: retry once
-		for (let attempt = 0; attempt < 2; attempt++) {
-			const stdout = await new Promise<string>((resolve, reject) => {
-				execFile(
-					python,
-					[join(EXT_DIR, "ddgs_search.py"), query, String(req.count), timelimit],
-					{ signal: req.signal, timeout: TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024 },
-					(err, out, stderr) =>
-						err ? reject(new ProviderError(stderr.trim().split("\n").pop() || err.message)) : resolve(out),
-				);
-			});
-			const results = JSON.parse(stdout) as SearchResult[];
-			if (results.length) return results;
-		}
-		return [];
+		if (req.includeDomains?.length && !req.includeDomains.some((d) => d.endsWith("wikipedia.org"))) return [];
+		const url = new URL("https://en.wikipedia.org/w/api.php");
+		for (const [k, v] of Object.entries({
+			action: "query", list: "search", srsearch: req.query, srlimit: String(req.count), format: "json", origin: "*",
+		})) url.searchParams.set(k, v);
+		const data = JSON.parse(await fetchText(url.toString(), req.signal));
+		return ((data.query?.search ?? []) as any[]).map((r) => ({
+			title: r.title ?? "",
+			url: `https://en.wikipedia.org/wiki/${encodeURIComponent(String(r.title ?? "").replace(/ /g, "_"))}`,
+			snippet: clean(String(r.snippet ?? "").replace(/<[^>]+>/g, "")),
+			date: r.timestamp ? String(r.timestamp).slice(0, 10) : undefined,
+		}));
 	},
 };
 
@@ -210,8 +218,8 @@ async function resolveKey(name: string): Promise<string | undefined> {
 	return key;
 }
 
-/** Default order. Override with PI_WEB_SEARCH_PROVIDERS="exa,ddgs" (comma-separated names). */
-export const PROVIDERS: SearchProvider[] = [tinyfish, langsearch, exa, ddgs];
+/** Default order. Override with PI_WEB_SEARCH_PROVIDERS="exa,wikipedia" (comma-separated names). */
+export const PROVIDERS: SearchProvider[] = [tinyfish, langsearch, exa, wikipedia];
 
 export interface SearchOutcome {
 	provider: string;
