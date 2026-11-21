@@ -65,4 +65,25 @@ __device__ __forceinline__ int perm_idx_rt(int e, int K) {
     return c * 1024 + hf * Gc * 16 + gl * 16 + p;
 }
 
+// L2 prefetch of the next kernel's weights: first `bytes` of every row of up to 3 arrays
+struct Prefetch {
+    const uint8_t* p[3];
+    int stride[3], bytes[3];
+    int rows;
+};
+__device__ __forceinline__ void l2_prefetch(const Prefetch& f, int part, int nparts) {
+    if (!f.rows) return;
+    const int r0 = (int)((long)part * f.rows / nparts), r1 = (int)((long)(part + 1) * f.rows / nparts);
+#pragma unroll
+    for (int a = 0; a < 3; a++) {
+        if (!f.p[a] || f.bytes[a] <= 0) continue;
+        const int lpr = (f.bytes[a] + 127) >> 7;
+        const int L = (r1 - r0) * lpr;
+        for (int i = threadIdx.x; i < L; i += blockDim.x) {
+            const int row = r0 + i / lpr, off = (i % lpr) << 7;
+            asm volatile("prefetch.global.L2 [%0];" ::"l"(f.p[a] + (size_t)row * f.stride[a] + off));
+        }
+    }
+}
+
 }  // namespace le

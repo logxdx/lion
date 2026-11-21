@@ -133,8 +133,9 @@ __device__ __forceinline__ float deq(const QWeight& w, int row, int e) {
 // ================================================================================================
 // decode step kernels
 // ================================================================================================
-__global__ void k_embed(QWeight w, int* ctrl, int* hist, float* out) {
+__global__ void k_embed(QWeight w, int* ctrl, int* hist, float* out, Prefetch pf) {
     if (ctrl[CTRL_DONE]) return;
+    l2_prefetch(pf, blockIdx.x, gridDim.x);
     const int tok = ctrl[CTRL_TOK];
     if (threadIdx.x == 0) hist[ctrl[CTRL_POS]] = tok;
     for (int e = threadIdx.x; e < w.K; e += blockDim.x) out[e] = deq(w, tok, e);
@@ -162,6 +163,7 @@ struct GemvArgs {
     const float* conv_w; float* conv_state;
     // exact (debug) mode: f32 activations end to end
     const float* xf_in; float* yf;
+    Prefetch pf;  // next kernel's weights, issued by each CTA after its last tile
 };
 
 template <int K, int NT, bool EX>
@@ -389,6 +391,7 @@ __global__ void __launch_bounds__(256) k_gemv(GemvArgs a) {
             __syncthreads();
         }
     }
+    l2_prefetch(a.pf, blockIdx.x, gridDim.x);
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -408,6 +411,7 @@ struct AttnArgs {
     int8_t* oq;
     float* od;
     float* of;  // exact mode: f32 output
+    Prefetch pf;  // o_proj weights, prefetched while attention runs
 };
 
 __device__ __forceinline__ void rope_norm4(float* x, const float* nw, const float* ff, float base, float eps, int pos, int lane) {
@@ -454,6 +458,7 @@ __device__ __forceinline__ void attn_finalize(float* acc, float l, float gate_lo
 __global__ void __launch_bounds__(128) k_attn_decode(AttnArgs a) {
     if (a.ctrl[CTRL_DONE]) return;
     const int h = blockIdx.x, s = blockIdx.y;
+    l2_prefetch(a.pf, blockIdx.y * gridDim.x + blockIdx.x, gridDim.x * gridDim.y);  // before any early exit
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int t = a.ctrl[CTRL_POS];
     const int lo = a.window ? max(0, t - a.window + 1) : 0;
@@ -497,9 +502,12 @@ __global__ void __launch_bounds__(128) k_attn_decode(AttnArgs a) {
         if (p < p1) {
             const int4* kr = (const int4*)(kbase + (size_t)(p % a.cap) * 128);
             float d0 = 0, d1 = 0, d2 = 0, d3 = 0;
-#pragma unroll 4
+            int4 kvs[16];
+#pragma unroll
+            for (int i = 0; i < 16; i++) kvs[i] = kr[i];  // whole 256-byte row in flight at once
+#pragma unroll
             for (int i = 0; i < 16; i++) {
-                int4 kv = kr[i];
+                const int4 kv = kvs[i];
                 const half2* hp = (const half2*)&kv;
 #pragma unroll
                 for (int j = 0; j < 4; j++) {
@@ -535,11 +543,21 @@ __global__ void __launch_bounds__(128) k_attn_decode(AttnArgs a) {
         l += warp_sum(ls);
         m = mn;
         __syncwarp();
-        for (int j = 0; j < n; j++) {
-            const float pj = sc[warp][j];
-            const uint2 vv = *(const uint2*)(vbase + (size_t)((pb + j) % a.cap) * 128 + lane * 4);
-            const float2 v01 = __half22float2(*(const half2*)&vv.x), v23 = __half22float2(*(const half2*)&vv.y);
-            acc[0] += pj * v01.x; acc[1] += pj * v01.y; acc[2] += pj * v23.x; acc[3] += pj * v23.y;
+        const int slot0 = pb % a.cap;
+        for (int j0 = 0; j0 < n; j0 += 8) {
+            uint2 vv[8];
+#pragma unroll
+            for (int u = 0; u < 8; u++) {  // 8 rows in flight
+                int sl = slot0 + j0 + u;
+                sl -= sl >= a.cap ? a.cap : 0;
+                vv[u] = (j0 + u < n) ? *(const uint2*)(vbase + (size_t)sl * 128 + lane * 4) : make_uint2(0, 0);
+            }
+#pragma unroll
+            for (int u = 0; u < 8; u++) {
+                const float pj = (j0 + u < n) ? sc[warp][j0 + u] : 0.f;
+                const float2 v01 = __half22float2(*(const half2*)&vv[u].x), v23 = __half22float2(*(const half2*)&vv[u].y);
+                acc[0] += pj * v01.x; acc[1] += pj * v01.y; acc[2] += pj * v23.x; acc[3] += pj * v23.y;
+            }
         }
         __syncthreads();
     }
@@ -954,20 +972,58 @@ void Engine::reset() {
 
 template <int K, int PRO, int EPI, int TILE, int RB>
 static void launch_gemv(GemvArgs a, int max_grid, cudaStream_t s, bool ex = false) {
-    const int grid = std::min(a.ntiles, max_grid);
     if (ex) {
-        k_gemv<W_Q8, K, PRO, EPI, TILE, RB, true><<<grid, 256, 0, s>>>(a);  // WT unused in exact mode
+        k_gemv<W_Q8, K, PRO, EPI, TILE, RB, true><<<std::min(a.ntiles, 512), 256, 0, s>>>(a);  // WT unused
         return;
     }
-    if (a.w.type == W_Q8) k_gemv<W_Q8, K, PRO, EPI, TILE, RB><<<grid, 256, 0, s>>>(a);
-    else k_gemv<W_Q6, K, PRO, EPI, TILE, RB><<<grid, 256, 0, s>>>(a);
+    auto fn = a.w.type == W_Q8 ? k_gemv<W_Q8, K, PRO, EPI, TILE, RB> : k_gemv<W_Q6, K, PRO, EPI, TILE, RB>;
+    // persistent grid: every CTA resident in a single wave, tiles split as evenly as possible
+    static int cap[2] = {0, 0};
+    int& c = cap[a.w.type];
+    if (!c) {
+        int occ = 0, sms = 0;
+        CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, fn, 256, 0));
+        CK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0));
+        c = std::max(1, occ) * sms;
+        const char* e = getenv("LIQUID_GRID_FRAC");
+        c = std::max(1, (int)(c * (e ? atof(e) : 0.5)));
+    }
+    const int lim = std::min(c, max_grid > 0 ? max_grid : c);
+    const int rounds = (a.ntiles + lim - 1) / lim;
+    const int grid = (a.ntiles + rounds - 1) / rounds;
+    fn<<<grid, 256, 0, s>>>(a);
+}
+
+static int g_pf_kb = -1;  // total L2 prefetch per transition (KiB); env LIQUID_PF_KB
+static Prefetch make_pf(const QWeight& w, int kb) {
+    Prefetch f{};
+    if (kb <= 0 || !w.q) return f;
+    f.rows = w.N;
+    const size_t total = (size_t)kb * 1024;
+    if (w.type == W_Q8) {
+        const int per_row = std::min<int>(w.K, (int)(total / w.N) / 128 * 128);
+        f.p[0] = w.q; f.stride[0] = w.K; f.bytes[0] = std::max(per_row, 128);
+        f.p[1] = (const uint8_t*)w.d; f.stride[1] = w.K / 32 * 2; f.bytes[1] = w.K / 32 * 2;
+    } else {
+        // lo : hi : sc = 8 : 4 : 1
+        const int per_row = std::min<int>(w.K / 2, (int)(total * 8 / 13 / w.N) / 128 * 128);
+        f.p[0] = w.q; f.stride[0] = w.K / 2; f.bytes[0] = std::max(per_row, 128);
+        f.p[1] = w.h; f.stride[1] = w.K / 4; f.bytes[1] = std::max(per_row / 2, 128);
+        f.p[2] = (const uint8_t*)w.sc; f.stride[2] = w.K / 16; f.bytes[2] = w.K / 16;
+    }
+    return f;
 }
 
 void Engine::enqueue_step(bool with_head, cudaStream_t s) {
     auto& b = *B_;
     const int E = cfg_.n_embd;
+    if (g_pf_kb < 0) {
+        const char* e = getenv("LIQUID_PF_KB");
+        g_pf_kb = e ? atoi(e) : 1024;
+    }
+    const int PF = g_exact_mask ? 0 : g_pf_kb;
     prof_mark("start", s);
-    k_embed<<<1, 256, 0, s>>>(emb_, b.ctrl, b.hist, b.resA);
+    k_embed<<<1, 256, 0, s>>>(emb_, b.ctrl, b.hist, b.resA, make_pf(L_[0].w_in, PF));
     prof_mark("embed", s);
     float* cur = b.resA;                          // residual stream (ping-pong A/B, static per graph)
     auto other = [&](float* x) { return x == b.resA ? b.resB : b.resA; };
@@ -984,15 +1040,18 @@ void Engine::enqueue_step(bool with_head, cudaStream_t s) {
         if (l.conv) {
             a.ntiles = E / 32;
             a.conv_w = l.conv_w; a.conv_state = l.conv_state; a.yq = b.yq; a.yd = b.yd; a.yf = b.yf;
-            launch_gemv<2048, PRO_NORM, EPI_CONV, 96, 2>(a, 160, s, g_exact_mask & 1);
+            a.pf = make_pf(l.w_out, PF);
+            launch_gemv<2048, PRO_NORM, EPI_CONV, 96, 2>(a, 0, s, g_exact_mask & 1);
             prof_mark("conv.in_proj+conv", s, l.w_in.bytes());
             GemvArgs o{};
             o.ctrl = b.ctrl; o.w = l.w_out; o.ntiles = E / 16; o.xq_in = b.yq; o.xd_in = b.yd; o.xf_in = b.yf; o.out = b.o;
-            launch_gemv<2048, PRO_Q, EPI_STORE, 16, 2>(o, 128, s, g_exact_mask & 1);
+            o.pf = make_pf(l.w_gu, PF);
+            launch_gemv<2048, PRO_Q, EPI_STORE, 16, 2>(o, 0, s, g_exact_mask & 1);
             prof_mark("conv.out_proj", s, l.w_out.bytes());
         } else {
             a.ntiles = l.w_in.N / 16; a.out = b.qkvg;
-            launch_gemv<2048, PRO_NORM, EPI_STORE, 16, 2>(a, 193, s, g_exact_mask & 2);
+            a.pf = make_pf(l.w_out, PF / 2);
+            launch_gemv<2048, PRO_NORM, EPI_STORE, 16, 2>(a, 0, s, g_exact_mask & 2);
             prof_mark("attn.qkvg", s, l.w_in.bytes());
             AttnArgs at{};
             at.qkvg = b.qkvg; at.qn = l.q_norm; at.kn = l.k_norm; at.ff = l.rope_ff;
@@ -1000,11 +1059,13 @@ void Engine::enqueue_step(bool with_head, cudaStream_t s) {
             at.kc = l.kc; at.vc = l.vc; at.cap = l.cap; at.window = l.swa ? cfg_.swa_window : 0;
             at.ctrl = b.ctrl; at.part = b.part; at.counter = b.counter; at.oq = b.oq; at.od = b.od;
             at.of = (g_exact_mask & 2) ? b.of : nullptr;
+            at.pf = make_pf(l.w_out, PF ? 4096 : 0);  // attention barely touches DRAM: fetch all of o_proj
             k_attn_decode<<<dim3(4, ATT_SMAX), 128, 0, s>>>(at);
             prof_mark(l.swa ? "attn.core(swa)" : "attn.core(global)", s);
             GemvArgs o{};
             o.ctrl = b.ctrl; o.w = l.w_out; o.ntiles = E / 16; o.xq_in = b.oq; o.xd_in = b.od; o.xf_in = b.of; o.out = b.o;
-            launch_gemv<2048, PRO_Q, EPI_STORE, 16, 2>(o, 128, s, g_exact_mask & 2);
+            o.pf = make_pf(l.w_gu, PF);
+            launch_gemv<2048, PRO_Q, EPI_STORE, 16, 2>(o, 0, s, g_exact_mask & 2);
             prof_mark("attn.o_proj", s, l.w_out.bytes());
         }
         // ffn input: x = cur + postnorm(o) -> other(cur) ; h = ffn_norm(x)
@@ -1013,11 +1074,14 @@ void Engine::enqueue_step(bool with_head, cudaStream_t s) {
         g.resid_in = cur; g.o_in = b.o; g.w_post = l.post_attn_norm; g.w_pre = l.ffn_norm;
         g.resid_out = other(cur); cur = other(cur);
         g.yq = b.aq; g.yd = b.ad; g.yf = b.af;
-        launch_gemv<2048, PRO_NORM, EPI_SWIGLU, 64, 2>(g, 240, s, g_exact_mask & 4);
+        g.pf = make_pf(l.w_down, PF);
+        launch_gemv<2048, PRO_NORM, EPI_SWIGLU, 64, 2>(g, 0, s, g_exact_mask & 4);
         prof_mark("ffn.gate_up+swiglu", s, l.w_gu.bytes());
         GemvArgs d{};
         d.ctrl = b.ctrl; d.w = l.w_down; d.ntiles = E / 16; d.xq_in = b.aq; d.xd_in = b.ad; d.xf_in = b.af; d.out = b.f;
-        launch_gemv<7680, PRO_Q, EPI_STORE, 16, 1>(d, 128, s, g_exact_mask & 4);
+        if (il + 1 < cfg_.n_layer) d.pf = make_pf(L_[il + 1].w_in, PF);
+        else if (with_head) d.pf = make_pf(emb_, PF);
+        launch_gemv<7680, PRO_Q, EPI_STORE, 16, 1>(d, 0, s, g_exact_mask & 4);
         prof_mark("ffn.down", s, l.w_down.bytes());
         prev_f = b.f; prev_post = l.post_ffn_norm;
     }
@@ -1026,7 +1090,8 @@ void Engine::enqueue_step(bool with_head, cudaStream_t s) {
         h.ctrl = b.ctrl; h.eps = cfg_.eps; h.w = emb_; h.ntiles = cfg_.n_vocab / 64;
         h.resid_in = cur; h.o_in = b.f; h.w_post = prev_post; h.w_pre = out_norm_; h.resid_out = nullptr;
         h.out = b.logits;
-        launch_gemv<2048, PRO_NORM, EPI_STORE, 64, 2>(h, 400, s, g_exact_mask & 8);
+        h.pf = make_pf(L_[0].w_in, PF);  // next token's first layer
+        launch_gemv<2048, PRO_NORM, EPI_STORE, 64, 2>(h, 0, s, g_exact_mask & 8);
         prof_mark("lm_head", s, emb_.bytes());
         enqueue_sample(s);
         prof_mark("sampling", s);
