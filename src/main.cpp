@@ -166,7 +166,7 @@ int main(int argc, char** argv) {
             Engine eng(model, std::max(ctx, pp + 64), !quiet);
             std::vector<int> toks(pp);
             for (int i = 0; i < pp; i++) toks[i] = 1000 + (i * 7919) % 100000;
-            eng.profile_prefill(std::min(pp, 4096));
+            eng.profile_prefill(std::min(pp, 32768));
             eng.prefill(toks);
             eng.profile_decode(21);
             return 0;
@@ -198,7 +198,7 @@ int main(int argc, char** argv) {
         }
 
         Engine eng(model, ctx, !quiet, exact);
-        eng.use_batched_prefill = !seq_prefill;
+        eng.use_batched_prefill = !seq_prefill && !exact;  // exact reference: every token via the f32 path
 
         if (dump_logits) {
             std::string text = raw ? prompt : render_chat({{"user", prompt}}, system, think, true);
@@ -209,11 +209,11 @@ int main(int argc, char** argv) {
             auto lg = eng.logits();
             std::vector<int> idx(lg.size());
             for (size_t i = 0; i < idx.size(); i++) idx[i] = (int)i;
-            std::partial_sort(idx.begin(), idx.begin() + 10, idx.end(), [&](int a, int b) { return lg[a] > lg[b]; });
+            std::partial_sort(idx.begin(), idx.begin() + 20, idx.end(), [&](int a, int b) { return lg[a] > lg[b]; });
             double mx = lg[idx[0]], se = 0;
             for (float v : lg) se += std::exp((double)v - mx);
             printf("n_prompt=%zu next=%d\n", ids.size(), out.empty() ? -1 : out[0]);
-            for (int i = 0; i < 10; i++)
+            for (int i = 0; i < 20; i++)
                 printf("%d\t%.4f\t%.6f\t%s\n", idx[i], lg[idx[i]], std::exp(lg[idx[i]] - mx) / se, tk.decode(idx[i], true).c_str());
             return 0;
         }

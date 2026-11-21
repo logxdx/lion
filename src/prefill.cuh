@@ -68,6 +68,16 @@ __device__ __forceinline__ void mma_f16(float* c, const uint32_t* a, uint32_t b0
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
+// f16-accumulate variant (2x tensor rate on GeForce); used for the per-tile P.V partial sums only
+__device__ __forceinline__ void mma_f16_acc16(uint32_t* d, const uint32_t* a, uint32_t b0, uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};"
+                 : "+r"(d[0]), "+r"(d[1])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+#ifndef FA_PV_F16
+#define FA_PV_F16 1
+#endif
+
 // exact int32 -> float for |x| < 2^22 using the FP pipe instead of the quarter-rate I2F
 __device__ __forceinline__ float i2f_magic(int x) { return __int_as_float(x + 0x4B400000) - 12582912.0f; }
 __device__ __forceinline__ uint32_t pack_h2(float a, float b) {
@@ -328,7 +338,12 @@ __global__ void __launch_bounds__(256) k_flash_prefill(const half* qh, const flo
         lb = lb * cb + sb;
 #pragma unroll
         for (int i = 0; i < 16; i++) { o[i][0] *= ca; o[i][1] *= ca; o[i][2] *= cb; o[i][3] *= cb; }
-        // O += P V
+        // O += P V   (per 64-key tile: f16 partial sums, P in [0,1], then accumulated into f32 O)
+#if FA_PV_F16
+        uint32_t ot[16][2];
+#pragma unroll
+        for (int i = 0; i < 16; i++) ot[i][0] = ot[i][1] = 0u;
+#endif
 #pragma unroll
         for (int kk = 0; kk < 4; kk++) {  // 16 keys per step
             uint32_t pa[4];
@@ -344,10 +359,23 @@ __global__ void __launch_bounds__(256) k_flash_prefill(const half* qh, const flo
                 const int sc = (c & 8) | ((c ^ r) & 7);
                 uint32_t b0, b1, b2, b3;
                 ldsm_x4_t(b0, b1, b2, b3, Vs + r * 128 + sc * 8);
+#if FA_PV_F16
+                mma_f16_acc16(ot[dp * 2], pa, b0, b1);
+                mma_f16_acc16(ot[dp * 2 + 1], pa, b2, b3);
+#else
                 mma_f16(o[dp * 2], pa, b0, b1);
                 mma_f16(o[dp * 2 + 1], pa, b2, b3);
+#endif
             }
         }
+#if FA_PV_F16
+#pragma unroll
+        for (int i = 0; i < 16; i++) {
+            const float2 x = __half22float2(*(const half2*)&ot[i][0]);
+            const float2 y = __half22float2(*(const half2*)&ot[i][1]);
+            o[i][0] += x.x; o[i][1] += x.y; o[i][2] += y.x; o[i][3] += y.y;
+        }
+#endif
     }
     if (t0 >= T) return;
     la += __shfl_xor_sync(0xffffffff, la, 1);
