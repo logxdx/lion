@@ -1178,6 +1178,7 @@ void Engine::reset(int slot) {
         CK(cudaMemset(B_->ctrl + s * CTRL_N, 0, CTRL_N * 4));
         n_past_[s] = 0;
         pending_[s] = -1;
+        ctrl_dirty_[s] = true;
     }
 }
 
@@ -1191,6 +1192,7 @@ static int* stage_ints(int* ring, int& idx, const int* v, int n) {
 void Engine::set_slots(const int* slots, int nb) {
     int* h = stage_ints(B_->h_stage, B_->stage_i, slots, nb);
     CK(cudaMemcpyAsync(B_->slots, h, nb * 4, cudaMemcpyHostToDevice, st_));
+    cur_slots_.assign(slots, slots + nb);
 }
 
 // ---- launch helpers -------------------------------------------------------------------------
@@ -1463,6 +1465,7 @@ void Engine::prefill(const std::vector<int>& tokens, int slot) {
     if (pending_[slot] >= 0) all.push_back(pending_[slot]);
     all.insert(all.end(), tokens.begin(), tokens.end() - 1);
     pending_[slot] = tokens.back();
+    ctrl_dirty_[slot] = true;
     if (n_past_[slot] + (int)all.size() + 1 > max_ctx_) throw std::runtime_error("context overflow");
     auto t0 = std::chrono::steady_clock::now();
     if (!all.empty()) {
@@ -1517,6 +1520,7 @@ std::vector<std::vector<int>> Engine::generate_multi(const std::vector<int>& slo
         set_sampling(s, spi, stop);
         const int init[4] = {pending_[s], n_past_[s], 0, 0};  // tok, pos, done, ngen (stamp kept)
         CK(cudaMemcpyAsync(b.ctrl + s * CTRL_N, stage_ints(b.h_stage, b.stage_i, init, 4), 16, cudaMemcpyHostToDevice, st_));
+        ctrl_dirty_[s] = false;
     }
     n = std::min(n, max_ctx_ - max_past - 1);
     if (active.empty() || n <= 0) return out;
@@ -1662,6 +1666,165 @@ void Engine::prefill_batched(int slot, const int* tokens, int n) {
         CK(cudaGetLastError());
         CK(cudaStreamSynchronize(st_));
     }
+}
+
+// ================================================================================================
+// step-level API (server scheduler)
+// ================================================================================================
+void Engine::sync() { CK(cudaStreamSynchronize(st_)); }
+
+void Engine::feed(int slot, const int* tokens, int n) {
+    if (n <= 0) return;
+    if (slot < 0 || slot >= n_slots_) throw std::runtime_error("bad slot");
+    if (n_past_[slot] + n + 1 > max_ctx_) throw std::runtime_error("context overflow");
+    auto t0 = std::chrono::steady_clock::now();
+    prefill_batched(slot, tokens, n);
+    n_past_[slot] += n;
+    ctrl_dirty_[slot] = true;
+    timing.prefill_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    timing.prefill_tokens += n;
+}
+
+void Engine::decode_step(const std::vector<int>& slots, std::vector<int>& toks, std::vector<char>& done) {
+    auto& b = *B_;
+    const int nb = (int)slots.size();
+    toks.assign(nb, -1);
+    done.assign(nb, 0);
+    if (nb == 0) return;
+    for (int s : slots) {
+        if (pending_[s] < 0) throw std::runtime_error("decode_step: slot has no pending token");
+        if (n_past_[s] + 1 >= max_ctx_) throw std::runtime_error("context overflow");
+        if (ctrl_dirty_[s]) {
+            const int init[4] = {pending_[s], n_past_[s], 0, 0};  // tok, pos, done, ngen (stamp kept)
+            CK(cudaMemcpyAsync(b.ctrl + s * CTRL_N, stage_ints(b.h_stage, b.stage_i, init, 4), 16, cudaMemcpyHostToDevice, st_));
+            ctrl_dirty_[s] = false;
+        }
+    }
+    if (slots != cur_slots_) set_slots(slots.data(), nb);
+    auto t0 = std::chrono::steady_clock::now();
+    CK(cudaGraphLaunch(g_decode_[nb], st_));
+    CK(cudaMemcpyAsync(b.h_snap, b.ctrl, n_slots_ * CTRL_N * 4, cudaMemcpyDeviceToHost, st_));
+    CK(cudaStreamSynchronize(st_));
+    for (int i = 0; i < nb; i++) {
+        const int* c = b.h_snap + slots[i] * CTRL_N;
+        toks[i] = c[CTRL_TOK];
+        done[i] = c[CTRL_DONE] != 0;
+        n_past_[slots[i]] = c[CTRL_POS];
+        pending_[slots[i]] = c[CTRL_TOK];
+    }
+    timing.decode_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    timing.decode_tokens += nb;
+}
+
+// copy n rows (row_bytes each) of ring position p0.. (ring of `cap` rows starting at `base`) to/from host
+static void ring_copy(uint8_t* base, size_t row_bytes, int cap, int p0, int n, uint8_t* host, bool to_host, cudaStream_t s) {
+    int done = 0;
+    while (done < n) {
+        const int r = (p0 + done) % cap;
+        const int run = std::min(n - done, cap - r);
+        uint8_t* dev = base + (size_t)r * row_bytes;
+        if (to_host) CK(cudaMemcpyAsync(host + (size_t)done * row_bytes, dev, (size_t)run * row_bytes, cudaMemcpyDeviceToHost, s));
+        else CK(cudaMemcpyAsync(dev, host + (size_t)done * row_bytes, (size_t)run * row_bytes, cudaMemcpyHostToDevice, s));
+        done += run;
+    }
+}
+
+// visit every (K|V data, K|V scales) row block of one slot for the layers selected by `want`
+template <class F>
+static void for_kv_blocks(const std::vector<Layer>& L, int slot, bool kv_q8, bool want_swa, F&& f) {
+    const size_t eb = kv_q8 ? 1 : 2;
+    for (const auto& l : L) {
+        if (l.conv || l.swa != want_swa) continue;
+        for (int h = 0; h < 4; h++) {
+            const size_t rowb = 128 * eb;
+            uint8_t* kd = (uint8_t*)l.kc + slot * l.kv_slot_bytes + (size_t)h * l.cap * rowb;
+            uint8_t* vd = (uint8_t*)l.vc + slot * l.kv_slot_bytes + (size_t)h * l.cap * rowb;
+            f(kd, rowb, l.cap);
+            f(vd, rowb, l.cap);
+            if (kv_q8) {
+                f((uint8_t*)(l.ks + slot * l.kvs_slot_elems + (size_t)h * l.cap * 4), (size_t)8, l.cap);
+                f((uint8_t*)(l.vs + slot * l.kvs_slot_elems + (size_t)h * l.cap * 4), (size_t)8, l.cap);
+            }
+        }
+    }
+}
+
+void Engine::save_checkpoint(int slot, Checkpoint& c) {
+    const int np = n_past_[slot];
+    c.n_past = np;
+    const size_t cs = (size_t)cfg_.n_embd * 6 * 4;
+    int nconv = 0;
+    for (auto& l : L_) nconv += l.conv;
+    c.conv.resize(nconv * cs);
+    size_t off = 0;
+    for (auto& l : L_)
+        if (l.conv) {
+            CK(cudaMemcpyAsync(c.conv.data() + off, l.conv_state + (size_t)slot * cfg_.n_embd * 6, cs, cudaMemcpyDeviceToHost, st_));
+            off += cs;
+        }
+    const int w = std::min(np, cfg_.swa_window), p0 = np - w;
+    size_t need = 0;
+    for_kv_blocks(L_, slot, kv_q8_, true, [&](uint8_t*, size_t rowb, int) { need += rowb * w; });
+    c.swa.resize(need);
+    off = 0;
+    for_kv_blocks(L_, slot, kv_q8_, true, [&](uint8_t* base, size_t rowb, int cap) {
+        ring_copy(base, rowb, cap, p0, w, c.swa.data() + off, true, st_);
+        off += rowb * w;
+    });
+    CK(cudaStreamSynchronize(st_));
+}
+
+void Engine::load_checkpoint(int slot, const Checkpoint& c) {
+    const int np = c.n_past;
+    const size_t cs = (size_t)cfg_.n_embd * 6 * 4;
+    size_t off = 0;
+    for (auto& l : L_)
+        if (l.conv) {
+            CK(cudaMemcpyAsync(l.conv_state + (size_t)slot * cfg_.n_embd * 6, c.conv.data() + off, cs, cudaMemcpyHostToDevice, st_));
+            off += cs;
+        }
+    const int w = std::min(np, cfg_.swa_window), p0 = np - w;
+    off = 0;
+    for_kv_blocks(L_, slot, kv_q8_, true, [&](uint8_t* base, size_t rowb, int cap) {
+        ring_copy(base, rowb, cap, p0, w, const_cast<uint8_t*>(c.swa.data()) + off, false, st_);
+        off += rowb * w;
+    });
+    CK(cudaStreamSynchronize(st_));
+    n_past_[slot] = np;
+    ctrl_dirty_[slot] = true;
+}
+
+size_t Engine::kv_row_bytes() const {
+    size_t b = 0;
+    for_kv_blocks(L_, 0, kv_q8_, false, [&](uint8_t*, size_t rowb, int) { b += rowb; });
+    return b;
+}
+
+void Engine::save_kv(int slot, int p0, int p1, void* host) {
+    const int n = p1 - p0;
+    if (n <= 0) return;
+    size_t off = 0;
+    for_kv_blocks(L_, slot, kv_q8_, false, [&](uint8_t* base, size_t rowb, int cap) {
+        ring_copy(base, rowb, cap, p0, n, (uint8_t*)host + off, true, st_);
+        off += rowb * n;
+    });
+    CK(cudaStreamSynchronize(st_));
+}
+
+void Engine::load_kv(int slot, int p0, int p1, const void* host) {
+    const int n = p1 - p0;
+    if (n <= 0) return;
+    size_t off = 0;
+    for_kv_blocks(L_, slot, kv_q8_, false, [&](uint8_t* base, size_t rowb, int cap) {
+        ring_copy(base, rowb, cap, p0, n, (uint8_t*)host + off, false, st_);
+        off += rowb * n;
+    });
+    CK(cudaStreamSynchronize(st_));
+}
+
+void Engine::write_history(int slot, int p0, const int* tokens, int n) {
+    if (n <= 0) return;
+    CK(cudaMemcpy(B_->hist + (size_t)slot * max_ctx_ + p0, tokens, (size_t)n * 4, cudaMemcpyHostToDevice));
 }
 
 }  // namespace le

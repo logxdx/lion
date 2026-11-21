@@ -91,6 +91,32 @@ public:
                                                  bool (*on_token)(int, int, void*) = nullptr, void* ud = nullptr);
     // logits of the last processed token of batch row 0 (host copy), for testing
     std::vector<float> logits();
+
+    // ---- step-level API (server scheduler); all calls on one thread ----
+    // Consume prompt tokens into a slot (chunked internally); n_past += n. The pending token is untouched.
+    void feed(int slot, const int* tokens, int n);
+    void set_pending(int slot, int tok) { pending_[slot] = tok; ctrl_dirty_[slot] = true; }
+    int pending(int slot) const { return pending_[slot]; }
+    void set_sampling(int slot, const SamplingParams& sp, const std::vector<int>& stop);
+    // One batched decode step: every listed slot consumes its pending token and samples the next one
+    // (which becomes pending). done[i] = a stop token was sampled.
+    void decode_step(const std::vector<int>& slots, std::vector<int>& toks, std::vector<char>& done);
+    // Exact state of a slot after n_past consumed tokens, minus the global-attention KV: short-conv states and
+    // the sliding-window KV rows still in reach. Restoring it requires the global KV rows [0, n_past) to be valid.
+    struct Checkpoint {
+        int n_past = -1;
+        std::vector<uint8_t> conv, swa;
+        size_t bytes() const { return conv.size() + swa.size(); }
+    };
+    void save_checkpoint(int slot, Checkpoint& c);
+    void load_checkpoint(int slot, const Checkpoint& c);  // sets n_past; pending must be set separately
+    // Global-attention KV rows [p0, p1) of a slot to/from host memory (kv_row_bytes() per token).
+    size_t kv_row_bytes() const;
+    void save_kv(int slot, int p0, int p1, void* host);
+    void load_kv(int slot, int p0, int p1, const void* host);
+    // token history (repeat penalty window) for positions [p0, p0+n)
+    void write_history(int slot, int p0, const int* tokens, int n);
+    void sync();
     // per-kernel timing of eager decode steps (stderr)
     void profile_decode(int steps);
     void profile_prefill(int n_tokens);
@@ -101,6 +127,8 @@ private:
     Config cfg_;
     int max_ctx_ = 0, n_slots_ = 1;
     int n_past_[MAX_SLOTS] = {}, pending_[MAX_SLOTS];
+    bool ctrl_dirty_[MAX_SLOTS] = {};  // host n_past/pending changed: upload before the next decode step
+    std::vector<int> cur_slots_;       // slot table currently on the device
     bool kv_q8_ = false;
     std::vector<Layer> L_;
     QWeight emb_;                 // token_embd == output (tied)
@@ -122,7 +150,6 @@ private:
     void enqueue_step(bool with_head, int nb, cudaStream_t s);
     void enqueue_sample(int nb, cudaStream_t s);
     void prefill_batched(int slot, const int* tokens, int n);
-    void set_sampling(int slot, const SamplingParams& sp, const std::vector<int>& stop);
     void set_slots(const int* slots, int nb);
 };
 
