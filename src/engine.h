@@ -39,7 +39,7 @@ struct SamplingParams {
     float top_p = 1.0f;
     float min_p = 0.0f;
     float repeat_penalty = 1.1f;
-    int repeat_last_n = 64;     // -1: whole context
+    int repeat_last_n = -1;     // -1: whole context (transformers semantics; 64 = llama.cpp default)
     uint64_t seed = 0;
 };
 

@@ -103,8 +103,11 @@ build/liquid -m $M --bench --parallel 4 --pp 32769 -c 33024      # 4 concurrent 
 build/liquid -m $M --profile --pp 8192                           # per-kernel prefill + decode timing
 ```
 
-Sampling defaults follow the model card / GGUF (`temp 0.1, top-k 50, top-p 1.0, min-p 0, repeat-penalty 1.1`
-over the last 64 tokens; `--repeat-last-n -1` = whole context). Options: `--temp --top-k --top-p --min-p
+Sampling defaults are read from the GGUF's `general.sampling.*` keys (LFM3: `temp 0.1, top-k 50,
+repeat-penalty 1.1`; top-p / min-p unset = off). The repetition-penalty window defaults to the whole context
+(`-1`), as in transformers' `generate()` that the model card's settings come from (llama.cpp's default is the
+last 64 tokens; with 64 the pi agent looped in the earlier preset tests, and the whole-context window costs
+nothing measurable: 106.3 vs 106.2 tok/s at 40k context, `bench/penalty_window.py`). Options: `--temp --top-k --top-p --min-p
 --repeat-penalty --repeat-last-n --seed --greedy`, `-c` context per sequence (default 32768), `-f FILE`,
 `--kv q8|f16`. The library API (`src/engine.h`) exposes per-slot `prefill(tokens, slot)` and
 `generate_multi(slots, ...)` for concurrent sequences.
@@ -211,8 +214,9 @@ attention phase), `bench/attn_sweep.sh`, `bench/kv_ab.sh`, `LIQUID_OCC=1` (atten
 
 - Specialised: LFM3-1.7B dimensions are checked at load and hard-wired (2048/7680/16 heads/128 dims, conv 7);
   only `Q8_0` and `Q6_K` weights. Other LFM3 sizes or quant types are rejected.
-- Server: up to 8 slots (compile-time `MAX_SLOTS`); one model per process; `n > 1`, logprobs and
-  presence/frequency penalties are not implemented; tool-call arguments are streamed as one delta per call.
+- Server: up to 8 slots (compile-time `MAX_SLOTS`); one model per process; `n > 1`, logprobs and the OpenAI
+  presence/frequency penalties are not implemented (LFM3's recommended sampling does not use them; the server
+  reports its effective defaults at `GET /props`); tool-call arguments are streamed as one delta per call.
   Prompt chunks are interleaved with decode steps rather than fused into one batch (the running streams slow
   to ~8 tok/s each during a long prefill instead of stopping).
 - A disk-tier restore runs on the GPU thread (~0.1-0.3 s for a 48k-token conversation); other streams pause

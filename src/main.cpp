@@ -11,6 +11,7 @@
 
 #include "engine.h"
 #include "gguf.h"
+#include "sampling_defaults.h"
 #include "tokenizer.h"
 
 using namespace le;
@@ -27,7 +28,8 @@ static void usage() {
             "  -n N               max new tokens (default 2048)\n"
             "  -c N               context size (default 32768)\n"
             "  --temp F --top-k N --top-p F --min-p F --repeat-penalty F --repeat-last-n N --seed N\n"
-            "                     sampling (defaults from the model card: 0.1 / 50 / 1.0 / 0 / 1.1 / 64)\n"
+            "                     sampling; defaults come from the GGUF (LFM3: temp 0.1, top-k 50, repeat-penalty\n"
+            "                     1.1; top-p/min-p off; penalty window = whole context, -1)\n"
             "  --greedy           temperature 0, no penalty\n"
             "  --bench            benchmark: --pp N prompt tokens, --tg N generated tokens, --reps N\n"
             "  --parallel N       with --bench: N concurrent sequences (batched decode), aggregate t/s\n"
@@ -102,7 +104,8 @@ int main(int argc, char** argv) {
     bool seq_prefill = false, show_special = false, do_tokenize = false, exact = false, profile = false;
     bool kv_q8 = true;  // default q8_0 KV: faster decode at every context, half the memory (see README)
     int n_predict = 2048, ctx = 32768, pp = 512, tg = 128, reps = 3, parallel = 1, test_multi = 0;
-    SamplingParams sp;
+    SamplingParams sp;      // filled from the GGUF's general.sampling.* keys, then the flags below
+    SamplingOverrides ov;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -124,14 +127,14 @@ int main(int argc, char** argv) {
         else if (a == "--no-think") think = false;
         else if (a == "-n") n_predict = std::stoi(next());
         else if (a == "-c") ctx = std::stoi(next());
-        else if (a == "--temp") sp.temperature = std::stof(next());
-        else if (a == "--top-k") sp.top_k = std::stoi(next());
-        else if (a == "--top-p") sp.top_p = std::stof(next());
-        else if (a == "--min-p") sp.min_p = std::stof(next());
-        else if (a == "--repeat-penalty") sp.repeat_penalty = std::stof(next());
-        else if (a == "--repeat-last-n") sp.repeat_last_n = std::stoi(next());
+        else if (a == "--temp") ov.temp = std::stof(next());
+        else if (a == "--top-k") ov.top_k = std::stoi(next());
+        else if (a == "--top-p") ov.top_p = std::stof(next());
+        else if (a == "--min-p") ov.min_p = std::stof(next());
+        else if (a == "--repeat-penalty") ov.penalty = std::stof(next());
+        else if (a == "--repeat-last-n") ov.last_n = std::stoi(next());
         else if (a == "--seed") sp.seed = std::stoull(next());
-        else if (a == "--greedy") { sp.temperature = 0; sp.repeat_penalty = 1.0f; }
+        else if (a == "--greedy") { ov.temp = 0; ov.penalty = 1.0f; }
         else if (a == "--bench") bench = true;
         else if (a == "--pp") pp = std::stoi(next());
         else if (a == "--tg") tg = std::stoi(next());
@@ -163,7 +166,9 @@ int main(int argc, char** argv) {
         {
             gguf::File f(model);
             tokp = std::make_unique<Tokenizer>(f);
+            apply_gguf_sampling(f, sp);
         }
+        ov.apply(sp);
         const Tokenizer& tk = *tokp;
         if (do_tokenize) {
             auto ids = tk.encode(tok_text);

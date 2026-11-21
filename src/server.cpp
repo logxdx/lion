@@ -21,6 +21,7 @@
 #include "engine.h"
 #include "gguf.h"
 #include "prompt_cache.h"
+#include "sampling_defaults.h"
 #include "tokenizer.h"
 
 using chat::json;
@@ -428,6 +429,7 @@ struct ApiServer {
         num("top_p", sp.top_p);
         num("top_k", sp.top_k);
         num("min_p", sp.min_p);
+        num("repetition_penalty", sp.repeat_penalty);  // transformers / vLLM name
         num("repeat_penalty", sp.repeat_penalty);
         num("repeat_last_n", sp.repeat_last_n);
         if (b.contains("seed") && b["seed"].is_number_integer()) sp.seed = b["seed"].get<uint64_t>();
@@ -717,7 +719,9 @@ static void usage() {
             "  --kv q8|f16                KV cache type (default q8)\n"
             "  --alias NAME               model id reported by the API (default lfm3)\n"
             "  --max-tokens N             default max_tokens (default 4096)\n"
-            "  --temp F --top-k N --top-p F --min-p F --repeat-penalty F --repeat-last-n N   default sampling\n"
+            "  --temp F --top-k N --top-p F --min-p F --repeat-penalty F --repeat-last-n N\n"
+            "                             override the GGUF's sampling defaults (LFM3: 0.1 / 50 / off / off / 1.1 /\n"
+            "                             whole context); per request: same names, plus repetition_penalty\n"
             "  --reasoning-preserve       keep reasoning of earlier assistant turns in the prompt\n"
             "  --busy-chunk N             prompt tokens per step while others decode (default 1024; 512 = smoother streams, slower new prompts)\n"
             "  --idle-chunk N             prompt tokens per step otherwise (default 4096)\n"
@@ -736,6 +740,7 @@ int main(int argc, char** argv) {
     bool kv_q8 = true;
     ServerConfig scfg;
     SchedConfig sch;
+    SamplingOverrides ov;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -750,12 +755,12 @@ int main(int argc, char** argv) {
         else if (a == "--kv") kv_q8 = next() != "f16";
         else if (a == "--alias") scfg.model_alias = next();
         else if (a == "--max-tokens") scfg.max_tokens = std::stoi(next());
-        else if (a == "--temp") scfg.sp.temperature = std::stof(next());
-        else if (a == "--top-k") scfg.sp.top_k = std::stoi(next());
-        else if (a == "--top-p") scfg.sp.top_p = std::stof(next());
-        else if (a == "--min-p") scfg.sp.min_p = std::stof(next());
-        else if (a == "--repeat-penalty") scfg.sp.repeat_penalty = std::stof(next());
-        else if (a == "--repeat-last-n") scfg.sp.repeat_last_n = std::stoi(next());
+        else if (a == "--temp") ov.temp = std::stof(next());
+        else if (a == "--top-k") ov.top_k = std::stoi(next());
+        else if (a == "--top-p") ov.top_p = std::stof(next());
+        else if (a == "--min-p") ov.min_p = std::stof(next());
+        else if (a == "--repeat-penalty") ov.penalty = std::stof(next());
+        else if (a == "--repeat-last-n") ov.last_n = std::stoi(next());
         else if (a == "--reasoning-preserve") scfg.reasoning_preserve = true;
         else if (a == "--busy-chunk") sch.busy_chunk = std::stoi(next());
         else if (a == "--idle-chunk") sch.idle_chunk = std::stoi(next());
@@ -777,7 +782,9 @@ int main(int argc, char** argv) {
         {
             gguf::File f(model);
             tk = std::make_unique<Tokenizer>(f);
+            apply_gguf_sampling(f, scfg.sp);
         }
+        ov.apply(scfg.sp);
         le::Engine eng(model, ctx, true, false, kv_q8, slots);
         std::unique_ptr<PromptCache> cache;
         if (cache_ram > 0 || cache_disk > 0)
@@ -812,6 +819,16 @@ int main(int argc, char** argv) {
         srv.Get("/v1/models", models);
         srv.Get("/models", models);
         srv.Get("/health", [](const httplib::Request&, httplib::Response& r) { r.set_content("{\"status\":\"ok\"}", "application/json"); });
+        srv.Get("/props", [&](const httplib::Request&, httplib::Response& r) {
+            const auto& sp = scfg.sp;
+            json p = {{"model", scfg.model_alias}, {"n_ctx", eng.max_ctx()}, {"n_slots", eng.n_slots()},
+                      {"kv_cache", eng.kv_q8() ? "q8_0" : "f16"}, {"reasoning_preserve", scfg.reasoning_preserve},
+                      {"default_generation_settings",
+                       {{"temperature", sp.temperature}, {"top_k", sp.top_k}, {"top_p", sp.top_p}, {"min_p", sp.min_p},
+                        {"repeat_penalty", sp.repeat_penalty}, {"repeat_last_n", sp.repeat_last_n},
+                        {"max_tokens", scfg.max_tokens}}}};
+            r.set_content(p.dump(), "application/json");
+        });
         srv.Get("/slots", [&](const httplib::Request&, httplib::Response& r) { r.set_content(sched.stats().dump(), "application/json"); });
         srv.Post("/tokenize", [&](const httplib::Request& q, httplib::Response& r) {
             json b = json::parse(q.body, nullptr, false);
