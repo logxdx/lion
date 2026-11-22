@@ -1107,35 +1107,68 @@ int main(int argc, char** argv) {
         srv.Post("/chat/completions", [&](const httplib::Request& q, httplib::Response& r) { api.handle(q, r, true); });
         srv.Post("/v1/completions", [&](const httplib::Request& q, httplib::Response& r) { api.handle(q, r, false); });
         srv.Post("/completions", [&](const httplib::Request& q, httplib::Response& r) { api.handle(q, r, false); });
+        // With several models the web UI runs in llama-server's router mode (/props role "router"): it shows a model
+        // picker and sends "model" with each request. Every model reports "loaded": the scheduler swaps on demand, so
+        // the UI never has to load or unload anything.
+        const bool router = models.size() > 1;
+        auto model_ctx = [&](const ModelSpec& M) { return M.ctx > 0 ? std::min(M.ctx, sched.max_ctx()) : sched.max_ctx(); };
         auto list_models = [&](const httplib::Request&, httplib::Response& r) {
             json data = json::array();
             for (auto& M : models)
                 data.push_back({{"id", M.id}, {"object", "model"}, {"created", 0}, {"owned_by", "liquid-engine"},
-                                {"meta", {{"n_ctx", M.ctx > 0 ? M.ctx : sched.max_ctx()}, {"n_slots", slots},
-                                          {"vision", M.vision != nullptr}}}});
+                                {"status", {{"value", "loaded"}}},
+                                {"meta", {{"n_ctx", model_ctx(M)}, {"n_slots", slots}, {"vision", M.vision != nullptr}}}});
             r.set_content(json({{"object", "list"}, {"data", data}}).dump(), "application/json");
         };
+        // router-mode endpoints the web UI calls: loading is automatic, the status feed only keeps the stream open
+        auto ok_json = [](const httplib::Request&, httplib::Response& r) { r.set_content("{\"success\":true}", "application/json"); };
+        srv.Post("/models/load", ok_json);
+        srv.Post("/models/unload", ok_json);
+        srv.Get("/models/sse", [](const httplib::Request&, httplib::Response& r) {
+            r.set_header("Cache-Control", "no-cache");
+            r.set_chunked_content_provider("text/event-stream", [](size_t, httplib::DataSink& sink) {
+                for (int i = 0; i < 6; i++) {  // ~60 s of keep-alives, then the UI reconnects
+                    if (!sink.write(":\n\n", 3)) return false;
+                    std::this_thread::sleep_for(std::chrono::seconds(10));
+                }
+                sink.done();
+                return true;
+            });
+        });
         srv.Get("/v1/models", list_models);
         srv.Get("/models", list_models);
         srv.Get("/health", [](const httplib::Request&, httplib::Response& r) { r.set_content("{\"status\":\"ok\"}", "application/json"); });
-        srv.Get("/props", [&](const httplib::Request&, httplib::Response& r) {
-            const auto& sp = scfg.sp;
+        srv.Get("/props", [&](const httplib::Request& q, httplib::Response& r) {
+            // ?model=<id>: that model's props (router mode); without it: the default model, or the router itself
+            const std::string want = q.has_param("model") ? q.get_param_value("model") : "";
+            int mi = 0;
+            bool found = false;
+            for (size_t i = 0; i < models.size(); i++)
+                if (models[i].id == want) { mi = (int)i; found = true; }
+            if (!want.empty() && !found) {
+                r.status = 404;
+                r.set_content(ApiServer::err_json("unknown model " + want).dump(), "application/json");
+                return;
+            }
+            const ModelSpec& M = models[mi];
+            const auto& sp = M.sp;
             auto r6 = [](float x) { return std::round((double)x * 1e6) / 1e6; };  // 0.1f -> 0.1, not 0.10000000149
             json params = {{"temperature", r6(sp.temperature)}, {"top_k", sp.top_k}, {"top_p", r6(sp.top_p)},
                            {"min_p", r6(sp.min_p)}, {"repeat_penalty", r6(sp.repeat_penalty)}, {"repeat_last_n", sp.repeat_last_n},
                            {"max_tokens", scfg.max_tokens}};
             json dgs = params;  // flat keys (liquid-server's own) plus llama-server's {n_ctx, params} read by the web UI
-            dgs["n_ctx"] = sched.max_ctx();
+            dgs["n_ctx"] = model_ctx(M);
             dgs["params"] = params;
-            json p = {{"model", scfg.model_alias}, {"n_ctx", sched.max_ctx()}, {"n_slots", slots},
+            json p = {{"model", M.id}, {"n_ctx", model_ctx(M)}, {"n_slots", slots},
                       {"kv_cache", kv_q8 ? "q8_0" : "f16"}, {"reasoning_preserve", scfg.reasoning_preserve},
                       {"default_generation_settings", dgs},
                       // llama-server /props fields used by the llama.cpp web UI
-                      {"model_alias", scfg.model_alias}, {"model_path", model}, {"total_slots", slots},
-                      // vision: image requests are routed to the VL model (swapped in on demand)
-                      {"modalities", {{"vision", any_vision}, {"audio", false}, {"video", false}}},
-                      {"chat_template", chat_template}, {"build_info", "liquid-engine"},
+                      {"model_alias", M.id}, {"model_path", M.path}, {"total_slots", slots},
+                      // single-model mode: images are routed to the VL model, so the default model "has" vision
+                      {"modalities", {{"vision", found ? M.vision != nullptr : any_vision}, {"audio", false}, {"video", false}}},
+                      {"chat_template", M.chat_template}, {"build_info", "liquid-engine"},
                       {"cors_proxy_enabled", false}, {"ui_settings", json::object()}};
+            if (router && !found) p["role"] = "router";
             r.set_content(p.dump(), "application/json");
         });
         srv.Get("/slots", [&](const httplib::Request&, httplib::Response& r) { r.set_content(sched.stats().dump(), "application/json"); });

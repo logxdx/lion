@@ -49,6 +49,14 @@ check("/v1/models lists the text and the VL model", len(ids) >= 2, str(ids))
 vl = next((x["id"] for x in m["data"] if x["meta"].get("vision")), None)
 st, p = req("/props")
 check("/props reports vision (web UI enables image attachments)", p.get("modalities", {}).get("vision") is True)
+# web UI model picker: llama-server router mode
+check("/props role router (web UI shows a model picker)", p.get("role") == "router")
+check("every model reports status loaded", all(x.get("status", {}).get("value") == "loaded" for x in m["data"]))
+st, pv = req(f"/props?model={vl}&autoload=false")
+st2, pt = req(f"/props?model={ids[0]}&autoload=false")
+check("per-model /props: vision only on the VL model",
+      pv.get("modalities", {}).get("vision") is True and pt.get("modalities", {}).get("vision") is False,
+      f"{vl} n_ctx {pv.get('default_generation_settings', {}).get('n_ctx')}, {ids[0]} n_ctx {pt.get('default_generation_settings', {}).get('n_ctx')}")
 
 st, out, dt = chat([{"role": "user", "content": "What is 2+2? Answer with the number only."}])
 check("text request -> default model", st == 200 and out.get("model") == ids[0] and "4" in out["choices"][0]["message"]["content"],

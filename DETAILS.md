@@ -189,7 +189,9 @@ default 64k; Q8_0 decoder + Q8_0 mmproj). One is on the GPU at a time. A request
 messages contain images (OpenAI `image_url` parts with base64 `data:` URLs, what the web UI sends) or when it names
 `lfm3-vl`; everything else goes to the default. When the queue head needs the other model, the scheduler lets running
 requests finish, moves every slot to the prompt cache, frees the GPU and loads the other model (requests keep arrival
-order). `/props` reports `modalities.vision`, so the web UI offers image attachments.
+order). With two models the web UI runs in llama-server's router mode (`/props` `role: "router"`, every model
+`status: loaded` in `/v1/models`, per-model `/props?model=`, no-op `/models/load|unload`, a keep-alive `/models/sse`):
+it shows a model picker, sends `model` with each request, and offers image attachments on `lfm3-vl`.
 
 | measured (RTX 4050, serve.sh config) | |
 |---|---|
