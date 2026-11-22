@@ -6,7 +6,7 @@
 # Clients: base URL http://127.0.0.1:$PORT/v1, model "lfm3" (text, default) or "lfm3-vl" (images).
 # Requests with images go to LFM3-VL: the server swaps it onto the GPU and back when needed (one model loaded at a time).
 # Measured on the RTX 4050 6 GB: 4 x 100k with Q8_0 weights uses ~4.4 GB of VRAM; pinned RAM tier 4 GiB.
-HERE=$(cd "$(dirname "$0")" && pwd)
+HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)   # resolves symlinks (e.g. ~/.local/bin/liquid-serve)
 M=$HOME/llama.cpp/models
 MODEL=${MODEL:-$M/lfm3-1.7b/LFM3-1.7B-Q8_0.gguf}
 VL_MODEL=${VL_MODEL:-$M/lfm3-vl-2b/LFM3-VL-2B-Q8_0.gguf}
