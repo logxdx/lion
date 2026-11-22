@@ -1,4 +1,7 @@
-<p align="center"><img src="brand/liquine-logo.svg" alt="liquine" height="72"></p>
+<p align="center"><picture>
+  <source media="(prefers-color-scheme: dark)" srcset="brand/liquine-logo-dark.svg">
+  <img src="brand/liquine-logo.svg" alt="liquine" height="72">
+</picture></p>
 
 Made for my gpu poor self :)
 lfm3 with tool support in the webui

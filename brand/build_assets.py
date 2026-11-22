@@ -15,8 +15,9 @@ OUT = os.path.join(HERE, "webui")
 SRC = sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, "..", "build", "webui")
 mark = open(os.path.join(HERE, "liquine-mark.svg")).read()
 paths = re.findall(r"<path[^>]*/>", mark)  # the mark's shapes, viewBox 0 0 600 600 (content centre ~ (300, 309))
-GRAD = ('<linearGradient id="g" x1="0" y1="0" x2="1" y2="1">'
-        '<stop offset="0" stop-color="#14b8a6"/><stop offset="1" stop-color="#2563eb"/></linearGradient>')
+INK, PAPER = "#111111", "#fafafa"  # monochrome brand
+# favicon.svg follows the system theme (dark ink on light tabs, light ink on dark ones)
+ADAPT = f"<style>path{{fill:{INK}}}@media (prefers-color-scheme: dark){{path{{fill:{PAPER}}}}}</style>"
 
 
 def svg(body, size=600, defs=""):
@@ -33,9 +34,10 @@ def placed(fill, box, scale):  # mark centred in a box x box canvas at the given
     return f'<g transform="translate({tx:.2f} {ty:.2f}) scale({scale})">{shapes(fill)}</g>'
 
 
-icon = svg(shapes("url(#g)"), defs=GRAD)                                   # favicon: gradient mark
-app = svg(f'<rect width="512" height="512" rx="112" fill="url(#g)"/>' + placed("#ffffff", 512, 0.62), 512, GRAD)
-maskable = svg(f'<rect width="512" height="512" fill="url(#g)"/>' + placed("#ffffff", 512, 0.5), 512, GRAD)
+icon = svg(shapes(INK), defs=ADAPT)                                          # favicon: mark, theme-aware
+icon_dark = svg(shapes(PAPER))                                               # favicon-dark: light mark
+app = svg(f'<rect width="512" height="512" rx="112" fill="{INK}"/>' + placed(PAPER, 512, 0.62), 512)
+maskable = svg(f'<rect width="512" height="512" fill="{INK}"/>' + placed(PAPER, 512, 0.5), 512)
 
 os.makedirs(OUT, exist_ok=True)
 tmp = tempfile.mkdtemp()
@@ -57,13 +59,17 @@ def raster(src, out, w, h=None, bg=None):
 open(os.path.join(HERE, "liquine-icon.svg"), "w").write(icon)
 open(os.path.join(HERE, "liquine-app-icon.svg"), "w").write(app)
 open(os.path.join(OUT, "favicon.svg"), "w").write(icon)
-open(os.path.join(OUT, "favicon-dark.svg"), "w").write(icon)
+open(os.path.join(OUT, "favicon-dark.svg"), "w").write(icon_dark)
 icon_p, app_p, mask_p = write("icon.svg", icon), write("app.svg", app), write("mask.svg", maskable)
 for n in (16, 32, 48):
     raster(icon_p, os.path.join(tmp, f"ico{n}.png"), n)
 ico_in = [os.path.join(tmp, f"ico{n}.png") for n in (16, 32, 48)]
 subprocess.run(["magick", *ico_in, os.path.join(OUT, "favicon.ico")], check=True)
-subprocess.run(["magick", *ico_in, os.path.join(OUT, "favicon-dark.ico")], check=True)
+icon_dark_p = write("icon_dark.svg", icon_dark)
+for n in (16, 32, 48):
+    raster(icon_dark_p, os.path.join(tmp, f"icod{n}.png"), n)
+subprocess.run(["magick", *[os.path.join(tmp, f"icod{n}.png") for n in (16, 32, 48)],
+                os.path.join(OUT, "favicon-dark.ico")], check=True)
 for n in (64, 192, 512):
     raster(app_p, os.path.join(OUT, f"pwa-{n}x{n}.png"), n)
 raster(mask_p, os.path.join(OUT, "maskable-icon-512x512.png"), 512)
