@@ -95,6 +95,9 @@ public:
     // ---- step-level API (server scheduler); all calls on one thread ----
     // Consume prompt tokens into a slot (chunked internally); n_past += n. The pending token is untouched.
     void feed(int slot, const int* tokens, int n);
+    // Same, for n positions whose input embeddings are given instead of token ids (device pointer, [n][n_embd]
+    // f32; e.g. the vision encoder's image tokens). hist_tok is what the repeat-penalty history records for them.
+    void feed_embd(int slot, const float* emb, int n, int hist_tok, bool emb_on_host = false);
     void set_pending(int slot, int tok) { pending_[slot] = tok; ctrl_dirty_[slot] = true; }
     int pending(int slot) const { return pending_[slot]; }
     void set_sampling(int slot, const SamplingParams& sp, const std::vector<int>& stop);
@@ -115,7 +118,9 @@ public:
     void save_kv(int slot, int p0, int p1, void* host);
     void load_kv(int slot, int p0, int p1, const void* host);
     // token history (repeat penalty window) for positions [p0, p0+n)
+    // (negative ids, used by the server for image positions, are recorded as image_hist_token)
     void write_history(int slot, int p0, const int* tokens, int n);
+    int image_hist_token = 0;
     void sync();
     // per-kernel timing of eager decode steps (stderr)
     void profile_decode(int steps);
@@ -134,6 +139,7 @@ private:
     QWeight emb_;                 // token_embd == output (tied)
     float* out_norm_ = nullptr;
     size_t arena_size_ = 0;
+    std::vector<void*> allocs_;  // every device allocation, freed by ~Engine (model swapping)
 
     struct Bufs;
     std::unique_ptr<Bufs> B_;
@@ -149,7 +155,7 @@ private:
     void build_graphs();
     void enqueue_step(bool with_head, int nb, cudaStream_t s);
     void enqueue_sample(int nb, cudaStream_t s);
-    void prefill_batched(int slot, const int* tokens, int n);
+    void prefill_batched(int slot, const int* tokens, int n, const float* emb = nullptr, bool emb_host = false);
     void set_slots(const int* slots, int nb);
 };
 

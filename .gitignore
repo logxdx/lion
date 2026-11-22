@@ -2,3 +2,4 @@ build/
 build-dev/
 tools/webtools/node_modules/
 .claude/
+__pycache__/

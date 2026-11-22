@@ -25,6 +25,7 @@
 #include "prompt_cache.h"
 #include "sampling_defaults.h"
 #include "tokenizer.h"
+#include "vision.h"
 #include "web_tools.h"
 
 using chat::json;
@@ -34,12 +35,40 @@ static double ms_since(clk::time_point t) { return std::chrono::duration<double,
 // ================================================================================================
 // request / events
 // ================================================================================================
+// A model the server can serve. One is on the GPU at a time; the scheduler swaps on demand.
+struct ModelSpec {
+    std::string id, path, mmproj;
+    std::unique_ptr<Tokenizer> tk;
+    le::SamplingParams sp;                     // GGUF defaults + command-line overrides
+    std::string chat_template;
+    std::unique_ptr<le::VisionLimits> vision;  // set: the model takes images (mmproj)
+    int image_tok = -1;                        // <|image|>
+    int ctx = 0;                               // context per sequence (0: the server's -c)
+};
+struct EngineParams {
+    int ctx = 65536, slots = 4;
+    bool kv_q8 = true;
+    size_t cache_ram = 0, cache_disk = 0;
+    std::vector<std::string> cache_dirs;
+};
+
 struct Request {
     uint64_t id = 0;
     std::vector<int> prompt;
     le::SamplingParams sp;
     std::vector<int> stop_tokens;
     int max_tokens = 0;
+    int model = 0;                 // index into the model list
+    std::string model_id;
+    const Tokenizer* tk = nullptr;
+    struct ImageIn {
+        le::Image img;
+        uint64_t key = 0;          // hash of the image bytes
+        int pos = 0, n = 0;        // prompt positions [pos, pos+n) are this image's tokens (negative ids)
+        std::vector<float> emb;    // [n][2048], filled by the scheduler (vision encoder)
+    };
+    std::vector<ImageIn> images;
+    int image_tok = -1;
     // results (scheduler -> HTTP thread)
     std::mutex m;
     std::condition_variable cv;
@@ -69,11 +98,14 @@ struct SchedConfig {
 
 class Scheduler {
 public:
-    Scheduler(le::Engine& e, const Tokenizer& tk, SchedConfig cfg, PromptCache* cache)
-        : e_(e), tk_(tk), cfg_(cfg), cache_(cache), slots_(e.n_slots()) {
+    Scheduler(std::vector<ModelSpec>& models, EngineParams ep, SchedConfig cfg)
+        : models_(models), ep_(std::move(ep)), cfg_(cfg), slots_(ep_.slots) {
         for (int i = 0; i < (int)slots_.size(); i++) slots_[i].id = i;
+        load_model(0);  // the default model; the others are swapped in when a request needs them
+        max_ctx_ = eng_->max_ctx();
         th_ = std::thread([this] { loop(); });
     }
+    int max_ctx() const { return max_ctx_; }
     ~Scheduler() { stop(); }
     void stop() {
         {
@@ -111,11 +143,15 @@ private:
         uint64_t last_use = 0;
         clk::time_point t_prefill_start;
     };
-    le::Engine& e_;
-    const Tokenizer& tk_;
+    std::vector<ModelSpec>& models_;
+    EngineParams ep_;
     SchedConfig cfg_;
-    PromptCache* cache_;
     std::vector<Slot> slots_;
+    std::unique_ptr<le::Engine> eng_;
+    std::unique_ptr<le::Vision> vis_;
+    std::unique_ptr<PromptCache> cache_;
+    std::atomic<int> active_{-1};
+    int max_ctx_ = 0, swaps_ = 0;
     std::thread th_;
     std::mutex qm_;
     std::condition_variable qcv_;
@@ -158,7 +194,7 @@ private:
         for (auto& c : s.cps)
             if (c.first == pos) return;
         le::Engine::Checkpoint cp;
-        e_.save_checkpoint(s.id, cp);
+        eng_->save_checkpoint(s.id, cp);
         s.cps.emplace_back(pos, std::move(cp));
         if ((int)s.cps.size() > cfg_.max_checkpoints) s.cps.erase(s.cps.begin());
     }
@@ -166,11 +202,67 @@ private:
     void evict(Slot& s) {
         if (cache_ && !s.cps.empty()) {
             auto& last = s.cps.back();  // the most useful resume point (usually end of the last prompt)
-            cache_->store(e_, s.id, std::vector<int>(s.tokens.begin(), s.tokens.begin() + last.first), last.second);
+            cache_->store(*eng_, s.id, std::vector<int>(s.tokens.begin(), s.tokens.begin() + last.first), last.second);
         }
         s.tokens.clear();
         s.cps.clear();
         s.pending = -1;
+    }
+
+    // free the GPU of the current model (slots go to the prompt cache first) and load model m
+    void load_model(int m) {
+        const auto t0 = clk::now();
+        const bool swap = eng_ != nullptr;
+        if (swap) {
+            for (auto& s : slots_) evict(s);
+            if (cache_) cache_->flush();
+        }
+        for (auto& s : slots_) { s.tokens.clear(); s.cps.clear(); s.pending = -1; s.last_use = 0; }
+        active_ = -1;
+        cache_.reset();
+        vis_.reset();
+        eng_.reset();
+        auto& M = models_[m];
+        eng_ = std::make_unique<le::Engine>(M.path, M.ctx > 0 ? M.ctx : ep_.ctx, true, false, ep_.kv_q8, ep_.slots);
+        eng_->image_hist_token = M.image_tok >= 0 ? M.image_tok : 0;
+        if (!M.mmproj.empty()) vis_ = std::make_unique<le::Vision>(M.mmproj, true);
+        if (ep_.cache_ram > 0 || ep_.cache_disk > 0)
+            cache_ = std::make_unique<PromptCache>(*eng_, ep_.cache_ram, ep_.cache_disk, ep_.cache_dirs, M.path);
+        active_ = m;
+        if (swap) {
+            swaps_++;
+            log("model %s loaded in %.0f ms (swap #%d)", M.id.c_str(), ms_since(t0), swaps_);
+        }
+    }
+
+    // feed prompt positions [fed, fed+n): text runs as tokens, image runs as the image's embeddings
+    void feed_range(Slot& s, Request& r, int fed, int n) {
+        const int end = fed + n;
+        int i = fed;
+        while (i < end) {
+            if (r.prompt[i] >= 0) {
+                int j = i;
+                while (j < end && r.prompt[j] >= 0) j++;
+                eng_->feed(s.id, r.prompt.data() + i, j - i);
+                i = j;
+                continue;
+            }
+            Request::ImageIn* im = nullptr;
+            for (auto& x : r.images)
+                if (i >= x.pos && i < x.pos + x.n) { im = &x; break; }
+            if (!im) throw std::runtime_error("internal error: image position without an image");
+            if (!vis_) throw std::runtime_error("model " + models_[active_].id + " has no vision encoder");
+            if (im->emb.empty()) {
+                int nt = 0;
+                im->emb = vis_->encode_host(im->img, nt);
+                if (nt != im->n) throw std::runtime_error("image token count mismatch");
+                log("req %llu: image %dx%d -> %d tokens, encoded in %.1f ms", (unsigned long long)r.id, im->img.w,
+                    im->img.h, nt, vis_->last_ms());
+            }
+            const int j = std::min(end, im->pos + im->n);
+            eng_->feed_embd(s.id, im->emb.data() + (size_t)(i - im->pos) * vis_->n_embd(), j - i, r.image_tok, true);
+            i = j;
+        }
     }
 
     void admit() {
@@ -186,9 +278,29 @@ private:
                 queue_.pop_front();
             }
             if (r->cancelled) { finish_unslotted(r, "stop"); continue; }
+            if (r->model != active_) {
+                bool busy = false;
+                for (auto& s : slots_) busy |= s.st != FREE;
+                if (busy) {  // let the running requests finish, then swap (the queue keeps arrival order)
+                    std::lock_guard<std::mutex> l(qm_);
+                    queue_.push_front(r);
+                    return;
+                }
+                const int prev = active_;
+                try {
+                    load_model(r->model);
+                } catch (const std::exception& ex) {
+                    log("loading model %s failed: %s", models_[r->model].id.c_str(), ex.what());
+                    finish_unslotted(r, "error", std::string("cannot load model: ") + ex.what());
+                    if (prev >= 0) {
+                        try { load_model(prev); } catch (const std::exception& ex2) { log("reloading failed: %s", ex2.what()); }
+                    }
+                    continue;
+                }
+            }
             r->t_admit = clk::now();
             const auto& p = r->prompt;
-            if ((int)p.size() + 1 >= e_.max_ctx()) { finish_unslotted(r, "error", "prompt exceeds the context size"); continue; }
+            if ((int)p.size() + 1 >= eng_->max_ctx()) { finish_unslotted(r, "error", "prompt exceeds the context size"); continue; }
             // pick a slot: longest reusable prefix among free slots, else the least recently used one
             int best = -1, best_pos = 0;
             for (auto& s : slots_) {
@@ -204,29 +316,29 @@ private:
             const uint64_t cid = cache_ ? cache_->lookup(p, start, cache_n) : 0;
             if (cid) {
                 evict(s);  // the slot's own contents go down a tier before being overwritten
-                e_.reset(s.id);
+                eng_->reset(s.id);
                 const auto t0 = clk::now();
-                if (cache_->restore(e_, s.id, cid, tier)) {
+                if (cache_->restore(*eng_, s.id, cid, tier)) {
                     s.tokens.assign(p.begin(), p.begin() + cache_n);
                     le::Engine::Checkpoint cp;
-                    e_.save_checkpoint(s.id, cp);  // the restored state is this slot's first checkpoint
+                    eng_->save_checkpoint(s.id, cp);  // the restored state is this slot's first checkpoint
                     s.cps.emplace_back(cache_n, std::move(cp));
                     start = cache_n;
                     r->restore_ms = ms_since(t0);
                     log("req %llu: restored %d prompt tokens from the %s tier in %.1f ms", (unsigned long long)r->id, cache_n,
                         tier.c_str(), ms_since(t0));
                 } else {
-                    e_.reset(s.id);
+                    eng_->reset(s.id);
                     start = 0;
                     tier.clear();
                 }
             } else if (start == 0) {
                 evict(s);
-                e_.reset(s.id);
+                eng_->reset(s.id);
             } else if (start != (int)s.tokens.size()) {
                 // rewind to a checkpoint inside the shared prefix
                 for (auto& c : s.cps)
-                    if (c.first == start) { e_.load_checkpoint(s.id, c.second); break; }
+                    if (c.first == start) { eng_->load_checkpoint(s.id, c.second); break; }
                 s.tokens.resize(start);
                 s.cps.erase(std::remove_if(s.cps.begin(), s.cps.end(), [&](auto& c) { return c.first > start; }), s.cps.end());
             }
@@ -235,7 +347,7 @@ private:
             s.req = r;
             s.st = PREFILL;
             s.t_prefill_start = clk::now();
-            e_.set_sampling(s.id, r->sp, r->stop_tokens);
+            eng_->set_sampling(s.id, r->sp, r->stop_tokens);
         }
     }
     void finish_unslotted(const std::shared_ptr<Request>& r, const char* reason, const std::string& err = "") {
@@ -261,20 +373,28 @@ private:
         // stop at the next periodic checkpoint boundary
         const int next_cp = (fed / cfg_.checkpoint_every + 1) * cfg_.checkpoint_every;
         if (fed + n > next_cp && next_cp < target) n = next_cp - fed;
+        // ... and at the end of each image: a checkpoint there lets the next question about the same image (or a
+        // regeneration) resume after it instead of encoding and prefilling the image again
+        int img_end = -1;
+        for (auto& im : r.images)
+            if (im.pos + im.n > fed && im.pos + im.n < target && (img_end < 0 || im.pos + im.n < img_end)) img_end = im.pos + im.n;
+        if (img_end > 0 && fed + n > img_end) n = img_end - fed;
         if (n > 0) {
             try {
-                e_.feed(s->id, r.prompt.data() + fed, n);
+                feed_range(*s, r, fed, n);
             } catch (const std::exception& ex) {
                 finish(*s, "error", ex.what());
                 return;
             }
             s->tokens.insert(s->tokens.end(), r.prompt.begin() + fed, r.prompt.begin() + fed + n);
-            if ((int)s->tokens.size() % cfg_.checkpoint_every == 0 && (int)s->tokens.size() < target) add_checkpoint(*s);
+            if (((int)s->tokens.size() % cfg_.checkpoint_every == 0 || (int)s->tokens.size() == img_end) &&
+                (int)s->tokens.size() < target)
+                add_checkpoint(*s);
         }
         if ((int)s->tokens.size() == target) {
             add_checkpoint(*s);  // end-of-prompt state: reused by the next turn of the conversation
             s->pending = r.prompt.back();
-            e_.set_pending(s->id, s->pending);
+            eng_->set_pending(s->id, s->pending);
             r.prefill_ms = ms_since(s->t_prefill_start);
             s->st = DECODE;
         }
@@ -292,7 +412,7 @@ private:
         std::vector<char> done;
         const auto t0 = clk::now();
         try {
-            e_.decode_step(ids, toks, done);
+            eng_->decode_step(ids, toks, done);
         } catch (const std::exception& ex) {
             for (int id : ids) finish(slots_[id], "error", ex.what());
             return;
@@ -313,7 +433,7 @@ private:
             r.cv.notify_all();
             if (stop) finish(s, "stop");
             else if ((int)r.tokens.size() >= r.max_tokens) finish(s, "length");
-            else if ((int)s.tokens.size() + 2 >= e_.max_ctx()) finish(s, "length");
+            else if ((int)s.tokens.size() + 2 >= eng_->max_ctx()) finish(s, "length");
         }
     }
 
@@ -335,7 +455,10 @@ private:
         }
         for (auto& s : slots_)
             if (s.req) finish(s, "error", "server shutting down");
-        if (cache_) for (auto& s : slots_) evict(s);
+        if (cache_ && eng_) {
+            for (auto& s : slots_) evict(s);
+            cache_->flush();  // RAM tier to disk: survives the restart
+        }
         std::lock_guard<std::mutex> l(qm_);
         for (auto& r : queue_) finish_unslotted(r, "error", "server shutting down");
         queue_.clear();
@@ -358,6 +481,9 @@ private:
         j["busy_slots"] = busy;
         j["queued"] = qn;
         if (cache_) j["cache"] = cache_->stats();
+        const int am = active_;
+        j["model"] = am >= 0 ? models_[am].id : "";
+        j["model_swaps"] = swaps_;
         std::lock_guard<std::mutex> l(stat_m_);
         stats_ = j;
     }
@@ -413,8 +539,7 @@ struct Detok {
 };
 
 struct ApiServer {
-    le::Engine& eng;
-    const Tokenizer& tk;
+    std::vector<ModelSpec>& models;
     Scheduler& sched;
     ServerConfig cfg;
     std::atomic<uint64_t> next_id{1};
@@ -423,8 +548,8 @@ struct ApiServer {
         return {{"error", {{"message", msg}, {"type", type}}}};
     }
 
-    void parse_sampling(const json& b, le::SamplingParams& sp, int& max_tokens) {
-        sp = cfg.sp;
+    void parse_sampling(const json& b, const le::SamplingParams& def, le::SamplingParams& sp, int& max_tokens) {
+        sp = def;
         auto num = [&](const char* k, auto& dst) {
             if (b.contains(k) && b[k].is_number()) dst = b[k].get<std::decay_t<decltype(dst)>>();
         };
@@ -479,7 +604,7 @@ struct ApiServer {
     template <class Emit>
     void drive(const std::shared_ptr<Request>& r, bool chat_mode, bool in_reasoning, const json& tools,
                const std::vector<std::string>& stops, Emit&& emit) {
-        Detok dt{&tk, ""};
+        Detok dt{r->tk, ""};
         chat::OutputParser parser(in_reasoning, tools);
         std::string text_all;   // completions mode / stop-string scan
         size_t seen = 0, sent_upto = 0;
@@ -548,6 +673,90 @@ struct ApiServer {
         return arr;
     }
 
+    static bool is_image_part(const json& x) {
+        return x.is_object() && x.contains("type") && (x["type"] == "image_url" || x["type"] == "input_image");
+    }
+    static bool messages_have_images(const json& msgs) {
+        if (!msgs.is_array()) return false;
+        for (auto& m : msgs)
+            if (m.is_object() && m.contains("content") && m["content"].is_array())
+                for (auto& x : m["content"])
+                    if (is_image_part(x)) return true;
+        return false;
+    }
+    static std::string b64decode(const std::string& in) {
+        static int8_t T[256];
+        static bool init = false;
+        if (!init) {
+            for (int i = 0; i < 256; i++) T[i] = -1;
+            const char* a = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            for (int i = 0; i < 64; i++) T[(unsigned char)a[i]] = (int8_t)i;
+            T[(unsigned char)'-'] = 62;  // url-safe alphabet too
+            T[(unsigned char)'_'] = 63;
+            init = true;
+        }
+        std::string out;
+        out.reserve(in.size() * 3 / 4);
+        uint32_t acc = 0;
+        int bits = 0;
+        for (unsigned char c : in) {
+            if (c == '=') break;
+            const int v = T[c];
+            if (v < 0) continue;  // whitespace / newlines
+            acc = (acc << 6) | (uint32_t)v;
+            bits += 6;
+            if (bits >= 8) {
+                bits -= 8;
+                out.push_back((char)((acc >> bits) & 0xFF));
+            }
+        }
+        return out;
+    }
+    // OpenAI image parts -> {"type": "image"} (what the chat template renders as <|vision_start|><|image|>...) and
+    // the decoded images, in prompt order. Only base64 data: URLs (what the web UI and most clients send).
+    static void extract_images(json& msgs, std::vector<Request::ImageIn>& out) {
+        for (auto& m : msgs) {
+            if (!m.is_object() || !m.contains("content") || !m["content"].is_array()) continue;
+            for (auto& x : m["content"]) {
+                if (!is_image_part(x)) continue;
+                const json& iu = x.contains("image_url") ? x["image_url"] : x.contains("image") ? x["image"] : json();
+                std::string url;
+                if (iu.is_string()) url = iu.get<std::string>();
+                else if (iu.is_object() && iu.contains("url") && iu["url"].is_string()) url = iu["url"].get<std::string>();
+                const size_t comma = url.find(',');
+                if (url.rfind("data:", 0) != 0 || comma == std::string::npos ||
+                    url.substr(0, comma).find(";base64") == std::string::npos)
+                    throw std::runtime_error("images must be base64 data: URLs");
+                const std::string bytes = b64decode(url.substr(comma + 1));
+                Request::ImageIn im;
+                std::string err;
+                if (!le::decode_image((const uint8_t*)bytes.data(), bytes.size(), im.img, err)) throw std::runtime_error(err);
+                uint64_t h = 1469598103934665603ull;  // FNV-1a of the image bytes
+                for (unsigned char c : bytes) h = (h ^ c) * 1099511628211ull;
+                im.key = h;
+                out.push_back(std::move(im));
+                x = json{{"type", "image"}};
+            }
+        }
+    }
+    // each <|image|> token becomes the image's n positions, marked with a negative id derived from the image bytes:
+    // identical images give identical ids, so prefix reuse and the prompt cache work across turns
+    static std::vector<int> layout_images(const std::vector<int>& toks, Request& r, const ModelSpec& M) {
+        if (r.images.empty()) return toks;
+        std::vector<int> out;
+        size_t k = 0;
+        for (int t : toks) {
+            if (t != M.image_tok) { out.push_back(t); continue; }
+            if (k >= r.images.size()) throw std::runtime_error("more <|image|> markers than images");
+            auto& im = r.images[k++];
+            im.pos = (int)out.size();
+            im.n = M.vision->n_tokens(im.img.w, im.img.h);
+            out.insert(out.end(), im.n, -1 - (int)(im.key % 1000000007ull));
+        }
+        if (k != r.images.size()) throw std::runtime_error("image markers do not match the images");
+        return out;
+    }
+
     void handle(const httplib::Request& hreq, httplib::Response& res, bool chat_mode) {
         json b;
         try {
@@ -560,7 +769,23 @@ struct ApiServer {
         auto r = std::make_shared<Request>();
         r->id = next_id++;
         r->t_arrive = clk::now();
-        parse_sampling(b, r->sp, r->max_tokens);
+        // route: a known model id, else the vision model for requests with images, else the default model
+        const bool has_images = chat_mode && b.contains("messages") && messages_have_images(b["messages"]);
+        int mi = 0;
+        bool named = false;
+        if (b.contains("model") && b["model"].is_string())
+            for (size_t i = 0; i < models.size(); i++)
+                if (models[i].id == b["model"].get<std::string>()) { mi = (int)i; named = true; }
+        if (!named && has_images)
+            for (size_t i = 0; i < models.size(); i++)
+                if (models[i].vision) { mi = (int)i; break; }
+        const ModelSpec& M = models[mi];
+        const Tokenizer& tk = *M.tk;
+        r->model = mi;
+        r->model_id = M.id;
+        r->tk = M.tk.get();
+        r->image_tok = M.image_tok;
+        parse_sampling(b, M.sp, r->sp, r->max_tokens);
         const auto stops = parse_stop(b);
         json tools = json::array();
         bool in_reasoning = false;
@@ -577,7 +802,12 @@ struct ApiServer {
                 }
                 if (b.contains("reasoning_effort") && b["reasoning_effort"] == "none") o.enable_thinking = false;
                 in_reasoning = o.enable_thinking;
-                r->prompt = tk.encode(chat::render(b["messages"], tools, o));
+                json msgs = b["messages"];
+                if (has_images) {
+                    if (!M.vision) throw std::runtime_error("model '" + M.id + "' does not take images");
+                    extract_images(msgs, r->images);
+                }
+                r->prompt = layout_images(tk.encode(chat::render(msgs, tools, o)), *r, M);
             } else {
                 const json& p = b.value("prompt", json(""));
                 if (p.is_string()) r->prompt = tk.encode(p.get<std::string>());
@@ -591,7 +821,8 @@ struct ApiServer {
             return;
         }
         if (r->prompt.empty()) { res.status = 400; res.set_content(err_json("empty prompt").dump(), "application/json"); return; }
-        r->max_tokens = std::min(r->max_tokens, eng.max_ctx() - (int)r->prompt.size() - 2);
+        const int mctx = M.ctx > 0 ? std::min(M.ctx, sched.max_ctx()) : sched.max_ctx();
+        r->max_tokens = std::min(r->max_tokens, mctx - (int)r->prompt.size() - 2);
         if (r->max_tokens <= 0) {
             res.status = 400;
             res.set_content(err_json("prompt (" + std::to_string(r->prompt.size()) + " tokens) does not fit the context").dump(), "application/json");
@@ -634,10 +865,10 @@ struct ApiServer {
                 json msg = {{"role", "assistant"}, {"content", content}};
                 if (!reasoning.empty()) msg["reasoning_content"] = reasoning;
                 if (!calls.empty()) msg["tool_calls"] = tool_calls_json(calls, 0, false);
-                out = {{"id", id}, {"object", "chat.completion"}, {"created", created}, {"model", cfg.model_alias},
+                out = {{"id", id}, {"object", "chat.completion"}, {"created", created}, {"model", r->model_id},
                        {"choices", json::array({{{"index", 0}, {"message", msg}, {"finish_reason", reason}}})}};
             } else {
-                out = {{"id", id}, {"object", "text_completion"}, {"created", created}, {"model", cfg.model_alias},
+                out = {{"id", id}, {"object", "text_completion"}, {"created", created}, {"model", r->model_id},
                        {"choices", json::array({{{"index", 0}, {"text", content}, {"finish_reason", reason}}})}};
             }
             out["usage"] = usage_json(*r, ntok);
@@ -656,7 +887,7 @@ struct ApiServer {
             };
             auto chunk = [&](const json& delta, const json& finish) {
                 json c = {{"id", id}, {"object", chat_mode ? "chat.completion.chunk" : "text_completion"}, {"created", created},
-                          {"model", cfg.model_alias}};
+                          {"model", r->model_id}};
                 if (chat_mode) c["choices"] = json::array({{{"index", 0}, {"delta", delta}, {"finish_reason", finish}}});
                 else c["choices"] = json::array({{{"index", 0}, {"text", delta.value("content", "")}, {"finish_reason", finish}}});
                 return send(c);
@@ -678,7 +909,7 @@ struct ApiServer {
                               if (why == "error") ok = send(err_json(r->error, "server_error"));
                               else {
                                   json last = {{"id", id}, {"object", chat_mode ? "chat.completion.chunk" : "text_completion"},
-                                               {"created", created}, {"model", cfg.model_alias}};
+                                               {"created", created}, {"model", r->model_id}};
                                   json ch = {{"index", 0}, {"finish_reason", why}};
                                   if (chat_mode) ch["delta"] = json::object();
                                   else ch["text"] = "";
@@ -687,7 +918,7 @@ struct ApiServer {
                                   ok = send(last);
                                   if (ok && include_usage) {
                                       json u = {{"id", id}, {"object", chat_mode ? "chat.completion.chunk" : "text_completion"},
-                                                {"created", created}, {"model", cfg.model_alias}, {"choices", json::array()},
+                                                {"created", created}, {"model", r->model_id}, {"choices", json::array()},
                                                 {"usage", usage_json(*r, (int)r->tokens.size())}};
                                       ok = send(u);
                                   }
@@ -740,12 +971,17 @@ static void usage() {
             "  --node PATH                node binary for the tools (default node)\n"
             "  --tool-timeout S           per tool call (default 300)\n"
             "  --ui-dir DIR               llama.cpp web UI served at / (default <binary dir>/webui; make webui)\n"
-            "  --no-ui                    API only\n",
+            "  --no-ui                    API only\n"
+            "  --mmproj F                 vision projector for -m (LFM3-VL)\n"
+            "  --vl-model F --vl-mmproj F second model (LFM3-VL decoder + mmproj), swapped onto the GPU for requests\n"
+            "                             with images (or model = --vl-alias, default lfm3-vl); -m stays the default\n"
+            "  --vl-ctx N                 context per sequence of the VL model (default 65536)\n",
             le::MAX_SLOTS);
 }
 
 int main(int argc, char** argv) {
-    std::string model, host = "127.0.0.1", cache_dir;
+    std::string model, host = "127.0.0.1", cache_dir, mmproj, vl_model, vl_mmproj, vl_alias = "lfm3-vl";
+    int vl_ctx = 65536;
     int port = 8080, slots = 4, ctx = 65536, threads = 0;
     long cache_ram = 4096, cache_disk = 16384;
     bool kv_q8 = true, tools_on = true;
@@ -768,6 +1004,11 @@ int main(int argc, char** argv) {
         else if (a == "-c") ctx = std::stoi(next());
         else if (a == "--kv") kv_q8 = next() != "f16";
         else if (a == "--alias") scfg.model_alias = next();
+        else if (a == "--mmproj") mmproj = next();
+        else if (a == "--vl-model") vl_model = next();
+        else if (a == "--vl-mmproj") vl_mmproj = next();
+        else if (a == "--vl-alias") vl_alias = next();
+        else if (a == "--vl-ctx") vl_ctx = std::stoi(next());
         else if (a == "--max-tokens") scfg.max_tokens = std::stoi(next());
         else if (a == "--temp") ov.temp = std::stof(next());
         else if (a == "--top-k") ov.top_k = std::stoi(next());
@@ -810,21 +1051,43 @@ int main(int argc, char** argv) {
         cache_dirs.push_back(fallback);
     }
     try {
-        std::unique_ptr<Tokenizer> tk;
-        std::string chat_template;
-        {
-            gguf::File f(model);
-            tk = std::make_unique<Tokenizer>(f);
-            apply_gguf_sampling(f, scfg.sp);
-            if (f.has("tokenizer.chat_template")) chat_template = f.get("tokenizer.chat_template").str;
+        std::vector<ModelSpec> models;
+        auto add_model = [&](const std::string& id, const std::string& path, const std::string& mm, int mctx) {
+            ModelSpec M;
+            M.ctx = mctx;
+            M.id = id;
+            M.path = path;
+            M.mmproj = mm;
+            gguf::File f(path);
+            M.tk = std::make_unique<Tokenizer>(f);
+            apply_gguf_sampling(f, M.sp);
+            ov.apply(M.sp);
+            if (f.has("tokenizer.chat_template")) M.chat_template = f.get("tokenizer.chat_template").str;
+            M.image_tok = M.tk->id("<|image|>");
+            if (!mm.empty()) {
+                M.vision = std::make_unique<le::VisionLimits>(le::VisionLimits::load(mm));
+                if (M.image_tok < 0) throw std::runtime_error(path + ": no <|image|> token in the vocabulary");
+            }
+            models.push_back(std::move(M));
+        };
+        add_model(scfg.model_alias, model, mmproj, 0);
+        if (!vl_model.empty()) {
+            if (vl_mmproj.empty()) throw std::runtime_error("--vl-model needs --vl-mmproj");
+            add_model(vl_alias, vl_model, vl_mmproj, std::min(vl_ctx, ctx));
         }
-        ov.apply(scfg.sp);
-        le::Engine eng(model, ctx, true, false, kv_q8, slots);
-        std::unique_ptr<PromptCache> cache;
-        if (cache_ram > 0 || cache_disk > 0)
-            cache = std::make_unique<PromptCache>(eng, (size_t)cache_ram << 20, (size_t)cache_disk << 20, cache_dirs, model);
-        Scheduler sched(eng, *tk, sch, cache.get());
-        ApiServer api{eng, *tk, sched, scfg};
+        bool any_vision = false;
+        for (auto& M : models) any_vision |= M.vision != nullptr;
+        scfg.sp = models[0].sp;
+        const std::string chat_template = models[0].chat_template;
+        EngineParams ep;
+        ep.ctx = ctx;
+        ep.slots = slots;
+        ep.kv_q8 = kv_q8;
+        ep.cache_ram = (size_t)std::max(0L, cache_ram) << 20;
+        ep.cache_disk = (size_t)std::max(0L, cache_disk) << 20;
+        ep.cache_dirs = cache_dirs;
+        Scheduler sched(models, ep, sch);
+        ApiServer api{models, sched, scfg};
 
         httplib::Server srv;
         const int nthreads = threads > 0 ? threads : 2 * slots + 16;
@@ -844,14 +1107,16 @@ int main(int argc, char** argv) {
         srv.Post("/chat/completions", [&](const httplib::Request& q, httplib::Response& r) { api.handle(q, r, true); });
         srv.Post("/v1/completions", [&](const httplib::Request& q, httplib::Response& r) { api.handle(q, r, false); });
         srv.Post("/completions", [&](const httplib::Request& q, httplib::Response& r) { api.handle(q, r, false); });
-        auto models = [&](const httplib::Request&, httplib::Response& r) {
-            json m = {{"object", "list"}, {"data", json::array({{{"id", scfg.model_alias}, {"object", "model"}, {"created", 0},
-                                                                  {"owned_by", "liquid-engine"},
-                                                                  {"meta", {{"n_ctx", eng.max_ctx()}, {"n_slots", eng.n_slots()}}}}})}};
-            r.set_content(m.dump(), "application/json");
+        auto list_models = [&](const httplib::Request&, httplib::Response& r) {
+            json data = json::array();
+            for (auto& M : models)
+                data.push_back({{"id", M.id}, {"object", "model"}, {"created", 0}, {"owned_by", "liquid-engine"},
+                                {"meta", {{"n_ctx", M.ctx > 0 ? M.ctx : sched.max_ctx()}, {"n_slots", slots},
+                                          {"vision", M.vision != nullptr}}}});
+            r.set_content(json({{"object", "list"}, {"data", data}}).dump(), "application/json");
         };
-        srv.Get("/v1/models", models);
-        srv.Get("/models", models);
+        srv.Get("/v1/models", list_models);
+        srv.Get("/models", list_models);
         srv.Get("/health", [](const httplib::Request&, httplib::Response& r) { r.set_content("{\"status\":\"ok\"}", "application/json"); });
         srv.Get("/props", [&](const httplib::Request&, httplib::Response& r) {
             const auto& sp = scfg.sp;
@@ -860,14 +1125,15 @@ int main(int argc, char** argv) {
                            {"min_p", r6(sp.min_p)}, {"repeat_penalty", r6(sp.repeat_penalty)}, {"repeat_last_n", sp.repeat_last_n},
                            {"max_tokens", scfg.max_tokens}};
             json dgs = params;  // flat keys (liquid-server's own) plus llama-server's {n_ctx, params} read by the web UI
-            dgs["n_ctx"] = eng.max_ctx();
+            dgs["n_ctx"] = sched.max_ctx();
             dgs["params"] = params;
-            json p = {{"model", scfg.model_alias}, {"n_ctx", eng.max_ctx()}, {"n_slots", eng.n_slots()},
-                      {"kv_cache", eng.kv_q8() ? "q8_0" : "f16"}, {"reasoning_preserve", scfg.reasoning_preserve},
+            json p = {{"model", scfg.model_alias}, {"n_ctx", sched.max_ctx()}, {"n_slots", slots},
+                      {"kv_cache", kv_q8 ? "q8_0" : "f16"}, {"reasoning_preserve", scfg.reasoning_preserve},
                       {"default_generation_settings", dgs},
                       // llama-server /props fields used by the llama.cpp web UI
-                      {"model_alias", scfg.model_alias}, {"model_path", model}, {"total_slots", eng.n_slots()},
-                      {"modalities", {{"vision", false}, {"audio", false}, {"video", false}}},
+                      {"model_alias", scfg.model_alias}, {"model_path", model}, {"total_slots", slots},
+                      // vision: image requests are routed to the VL model (swapped in on demand)
+                      {"modalities", {{"vision", any_vision}, {"audio", false}, {"video", false}}},
                       {"chat_template", chat_template}, {"build_info", "liquid-engine"},
                       {"cors_proxy_enabled", false}, {"ui_settings", json::object()}};
             r.set_content(p.dump(), "application/json");
@@ -922,7 +1188,7 @@ int main(int argc, char** argv) {
         });
         srv.Post("/tokenize", [&](const httplib::Request& q, httplib::Response& r) {
             json b = json::parse(q.body, nullptr, false);
-            json out = {{"tokens", b.is_object() && b.contains("content") ? json(tk->encode(b["content"].get<std::string>())) : json::array()}};
+            json out = {{"tokens", b.is_object() && b.contains("content") ? json(models[0].tk->encode(b["content"].get<std::string>())) : json::array()}};
             r.set_content(out.dump(), "application/json");
         });
 
@@ -958,7 +1224,7 @@ int main(int argc, char** argv) {
         std::signal(SIGINT, on_signal);
         std::signal(SIGTERM, on_signal);
         Scheduler::log("listening on http://%s:%d (%d slots x %d ctx, %s KV, %d HTTP threads)", host.c_str(), port, slots,
-                       eng.max_ctx(), kv_q8 ? "q8" : "f16", nthreads);
+                       sched.max_ctx(), kv_q8 ? "q8" : "f16", nthreads);
         if (!srv.listen(host, port)) {
             fprintf(stderr, "cannot listen on %s:%d\n", host.c_str(), port);
             return 1;
@@ -966,7 +1232,6 @@ int main(int argc, char** argv) {
         g_srv = nullptr;
         Scheduler::log("shutting down");
         sched.stop();
-        if (cache) cache->flush();
     } catch (const std::exception& e) {
         fprintf(stderr, "error: %s\n", e.what());
         return 1;

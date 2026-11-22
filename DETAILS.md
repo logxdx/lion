@@ -182,6 +182,46 @@ Cache tiers for a 48k-token conversation (`bench/cache_tiers.py`): cold prefill 
 slot 27 ms; after eviction to RAM 26 ms restore; after a server restart 82 ms restore from disk (warm page cache;
 a cold read of the 318 MB entry at the NVMe's measured 1.4 GB/s adds ~220 ms).
 
+## Images: LFM3-VL-2B and model swapping
+
+`serve.sh` runs two models: LFM3-1.7B (default, 4 x 100k) and LFM3-VL-2B (`--vl-model`, `--vl-mmproj`, `--vl-ctx`,
+default 64k; Q8_0 decoder + Q8_0 mmproj). One is on the GPU at a time. A request goes to the VL model when its
+messages contain images (OpenAI `image_url` parts with base64 `data:` URLs, what the web UI sends) or when it names
+`lfm3-vl`; everything else goes to the default. When the queue head needs the other model, the scheduler lets running
+requests finish, moves every slot to the prompt cache, frees the GPU and loads the other model (requests keep arrival
+order). `/props` reports `modalities.vision`, so the web UI offers image attachments.
+
+| measured (RTX 4050, serve.sh config) | |
+|---|---|
+| swap, model load included (35 swaps each way) | median 383 ms to LFM3, 425 ms to LFM3-VL (incl. encoder) |
+| VRAM | LFM3 4 x 100k: 4550 MiB; LFM3-VL 4 x 64k + encoder + buffers for a 4096-token image: 3946 MiB |
+| 56 swaps in a row (`tests/swap_stress.py`) | every answer right, VRAM back to the same value each time, RSS flat |
+| image encode, 640x480 / 320x512 / 2816x1472 (300 / 160 / 4048 tokens) | 23 / 13 / 528 ms (llama.cpp: 95 / 13 / 786 ms) |
+| a second question about the same image | 0.27 s instead of 1.71 s (4048-token image: no re-encode, 14 ms prefill) |
+
+**Vision encoder** (`src/vision.cu`, `src/image.cpp`): image -> Qwen2-VL smart_resize to multiples of 32 (64..4096
+tokens) -> Pillow/torchvision antialiased bicubic (a port of llama.cpp's, same int16 weights, same pixels) ->
+16x16 patches (the two temporal kernels pre-summed for still images) -> 14 blocks: 8 with a 3x3 depthwise conv over
+the patch grid (`out_proj(C * dwconv(B * X))`), 6 with GQA attention (16/8 heads, d 64, QK RMSNorm, 2D RoPE base 1e6
+on pairs (k, k+32): y for k < 16, x above), RMSNorm, SwiGLU -> LayerNorm, 2x2 merge, Linear-GELU(erf)-Linear -> one
+2048-dim embedding per 32x32 pixels. Linear layers reuse the decoder's int8 tensor-core GEMM over repacked Q8_0
+(`src/gemm.cuh`, `src/repack.cuh`, W8A8 like llama.cpp's MMQ); attention is a non-causal f16 flash kernel.
+The embeddings replace `<|image|>` between `<|vision_start|>` and `<|vision_end|>` (`Engine::feed_embd`); in the
+server's token arrays image positions are negative ids derived from the image bytes, so prefix reuse and the
+prompt cache work for images too, and a checkpoint at the end of every image lets the next question about it resume
+there.
+
+**Accuracy** (`tests/vl_ref_embed.cpp` dumps llama.cpp's embeddings and every intermediate tensor through libmtmd;
+`tests/test_vision.cpp` compares): on `test-1.jpeg` our embeddings vs llama.cpp CUDA: cosine 0.99851 mean, rel L2
+5.25%; llama.cpp's own CPU backend vs its CUDA backend: 0.99852, 5.28%. The error grows evenly through the 14 blocks
+(no stage jumps), the same way between llama.cpp's two backends: W8A8 rounding noise. End to end (same Q8_0 decoder,
+greedy): 5 of 7 answers on 3 images are word-for-word identical to llama-server's, the other 2 drift after the same
+content (`What is the main headline?` -> "MEN WALK ON MOON ... Monday, July 21, 1969" from both).
+
+CLI: `build/liquid -m LFM3-VL-2B-Q8_0.gguf --mmproj mmproj-LFM3-VL-2B-Q8_0.gguf --image photo.jpg -p "Describe it."`.
+Tests: `tests/test_vl_server.py` (routing, images, cache reuse, swap back, 400 for images to a text model),
+`tests/swap_stress.py` (repeated swaps, leak check), `tests/test_vision.cpp`.
+
 ## Design
 
 **Weights** are repacked on the GPU at load time (lossless, bit-identical values):

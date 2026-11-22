@@ -29,6 +29,19 @@ void smart_resize(int w, int h, int factor, int64_t min_px, int64_t max_px, int&
 Image resize_bicubic(const Image& src, int tw, int th);
 }  // namespace img
 
+// Image token budget of an lfm3vl mmproj, from its metadata only (no GPU): the prompt layout is known before
+// the encoder runs. As llama.cpp: min from the GGUF, max capped at 4096 tokens.
+struct VisionLimits {
+    int64_t min_px = 64 * 1024, max_px = 4096 * 1024;
+    static VisionLimits load(const std::string& mmproj_path);
+    void target_size(int w, int h, int& tw, int& th) const { img::smart_resize(w, h, 32, min_px, max_px, tw, th); }
+    int n_tokens(int w, int h) const {
+        int tw, th;
+        target_size(w, h, tw, th);
+        return (tw / 32) * (th / 32);
+    }
+};
+
 class Vision {
 public:
     explicit Vision(const std::string& mmproj_path, bool verbose = true);

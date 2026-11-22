@@ -6,6 +6,7 @@
 #include <cstring>
 #include <stdexcept>
 
+#include "gguf.h"
 #include "vision.h"
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -166,4 +167,17 @@ Image resize_bicubic(const Image& src, int tw, int th) {
 }
 
 }  // namespace img
+
+VisionLimits VisionLimits::load(const std::string& path) {
+    gguf::File f(path);
+    if (!f.has("clip.vision.projector_type") || f.get("clip.vision.projector_type").str != "lfm3vl")
+        throw std::runtime_error(path + ": not an lfm3vl mmproj");
+    const int64_t patch = (int64_t)f.u("clip.vision.patch_size"), merge = (int64_t)f.u("clip.vision.spatial_merge_size");
+    const int64_t area = patch * patch * merge * merge;
+    VisionLimits l;
+    l.min_px = (int64_t)f.u("clip.vision.image_min_pixels") / area * area;
+    l.max_px = std::min<int64_t>(4096, (int64_t)f.u("clip.vision.image_max_pixels") / area) * area;
+    return l;
+}
+
 }  // namespace le

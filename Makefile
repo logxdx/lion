@@ -22,16 +22,16 @@ $(BUILD)/engine.o: src/engine.cu src/engine.h src/kernels.cuh src/prefill.cuh sr
 $(BUILD)/vision.o: src/vision.cu src/vision.h src/engine.h src/kernels.cuh src/gemm.cuh src/repack.cuh src/gguf.h | $(BUILD)
 	$(NVCC) $(NVFLAGS) -c $< -o $@
 
-$(BUILD)/image.o: src/image.cpp src/vision.h src/stb_image.h | $(BUILD)
+$(BUILD)/image.o: src/image.cpp src/vision.h src/stb_image.h src/gguf.h | $(BUILD)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(BUILD)/tokenizer.o: src/tokenizer.cpp src/tokenizer.h src/unicode_data.h src/gguf.h | $(BUILD)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(BUILD)/main.o: src/main.cpp src/engine.h src/tokenizer.h src/gguf.h | $(BUILD)
+$(BUILD)/main.o: src/main.cpp src/engine.h src/tokenizer.h src/gguf.h src/vision.h | $(BUILD)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(BUILD)/server.o: src/server.cpp src/engine.h src/tokenizer.h src/chat.h src/prompt_cache.h src/web_tools.h | $(BUILD)
+$(BUILD)/server.o: src/server.cpp src/engine.h src/tokenizer.h src/chat.h src/prompt_cache.h src/web_tools.h src/vision.h | $(BUILD)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(BUILD)/chat.o: src/chat.cpp src/chat.h | $(BUILD)

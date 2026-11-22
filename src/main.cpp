@@ -13,6 +13,7 @@
 #include "gguf.h"
 #include "sampling_defaults.h"
 #include "tokenizer.h"
+#include "vision.h"
 
 using namespace le;
 
@@ -25,6 +26,7 @@ static void usage() {
             "  -i                 interactive chat\n"
             "  --raw              feed the prompt verbatim (no chat template)\n"
             "  --no-think         disable thinking (<think></think> prefix)\n"
+            "  --mmproj F --image F   vision (LFM3-VL): attach images (repeatable) to the first user message\n"
             "  -n N               max new tokens (default 2048)\n"
             "  -c N               context size (default 32768)\n"
             "  --temp F --top-k N --top-p F --min-p F --repeat-penalty F --repeat-last-n N --seed N\n"
@@ -99,7 +101,8 @@ static bool on_tok(int id, void* ud) {
 }
 
 int main(int argc, char** argv) {
-    std::string model, prompt, system, tok_text;
+    std::string model, prompt, system, tok_text, mmproj;
+    std::vector<std::string> image_paths;
     bool interactive = false, raw = false, think = true, bench = false, dump_logits = false, quiet = false;
     bool seq_prefill = false, show_special = false, do_tokenize = false, exact = false, profile = false;
     bool kv_q8 = true;  // default q8_0 KV: faster decode at every context, half the memory (see README)
@@ -114,6 +117,8 @@ int main(int argc, char** argv) {
         };
         if (a == "-m") model = next();
         else if (a == "-p") prompt = next();
+        else if (a == "--mmproj") mmproj = next();
+        else if (a == "--image") image_paths.push_back(next());
         else if (a == "-f") {
             FILE* fp = fopen(next().c_str(), "rb");
             if (!fp) { perror("prompt file"); return 1; }
@@ -280,6 +285,52 @@ int main(int argc, char** argv) {
         }
 
         Engine eng(model, ctx, !quiet, exact, kv_q8);
+        // vision: images go into the first user message as <|vision_start|><|image|><|vision_end|> each
+        std::unique_ptr<le::Vision> vis;
+        std::vector<le::Image> images;
+        size_t next_image = 0;
+        const int image_tok = tk.id("<|image|>");
+        if (!image_paths.empty()) {
+            if (mmproj.empty()) { fprintf(stderr, "--image needs --mmproj\n"); return 1; }
+            vis = std::make_unique<le::Vision>(mmproj, !quiet);
+            for (const auto& ip : image_paths) {
+                FILE* fp = fopen(ip.c_str(), "rb");
+                if (!fp) { fprintf(stderr, "cannot open %s\n", ip.c_str()); return 1; }
+                std::vector<uint8_t> bytes;
+                uint8_t buf[65536];
+                size_t r;
+                while ((r = fread(buf, 1, sizeof buf, fp)) > 0) bytes.insert(bytes.end(), buf, buf + r);
+                fclose(fp);
+                le::Image im;
+                std::string err;
+                if (!le::decode_image(bytes.data(), bytes.size(), im, err)) { fprintf(stderr, "%s: %s\n", ip.c_str(), err.c_str()); return 1; }
+                images.push_back(std::move(im));
+            }
+            std::string marks;
+            for (size_t i = 0; i < images.size(); i++) marks += "<|vision_start|><|image|><|vision_end|>";
+            prompt = marks + prompt;
+        }
+        // prefill that replaces each <|image|> token by the image's embeddings (same pending-token rule as prefill)
+        auto prefill_mm = [&](const std::vector<int>& toks) {
+            if (!vis || std::find(toks.begin(), toks.end(), image_tok) == toks.end()) { eng.prefill(toks); return; }
+            std::vector<int> all;
+            if (eng.pending(0) >= 0) all.push_back(eng.pending(0));
+            all.insert(all.end(), toks.begin(), toks.end() - 1);
+            std::vector<int> run;
+            auto flush = [&]() { if (!run.empty()) { eng.feed(0, run.data(), (int)run.size()); run.clear(); } };
+            for (int t : all) {
+                if (t != image_tok) { run.push_back(t); continue; }
+                flush();
+                if (next_image >= images.size()) throw std::runtime_error("more <|image|> tokens than images");
+                int n = 0;
+                const float* e = vis->encode(images[next_image++], n);
+                if (!quiet) fprintf(stderr, "[vision] image %zu: %d tokens, %.1f ms\n", next_image, n, vis->last_ms());
+                eng.feed_embd(0, e, n, image_tok);
+            }
+            flush();
+            eng.set_pending(0, toks.back());
+            eng.sync();
+        };
         eng.use_batched_prefill = !seq_prefill && !exact;  // exact reference: every token via the f32 path
 
         if (dump_logits) {
@@ -316,7 +367,7 @@ int main(int argc, char** argv) {
             if (is_prefix && !ctx_tokens.empty()) feed.assign(ids.begin() + ctx_tokens.size(), ids.end());
             else { eng.reset(); ctx_tokens.clear(); feed = ids; }
             eng.timing = Timing{};
-            eng.prefill(feed);
+            prefill_mm(feed);
             ctx_tokens.insert(ctx_tokens.end(), feed.begin(), feed.end());
             StreamCtx sc{&tk, show_special, "", ""};
             if (!raw && think) { printf("<think>"); fflush(stdout); }

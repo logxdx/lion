@@ -17,7 +17,7 @@
         cudaError_t e_ = (x);                                                                      \
         if (e_ != cudaSuccess) {                                                                   \
             fprintf(stderr, "CUDA error %s at %s:%d: %s\n", cudaGetErrorString(e_), __FILE__, __LINE__, #x); \
-            exit(1);                                                                               \
+            throw std::runtime_error(std::string("CUDA error: ") + cudaGetErrorString(e_));        \
         }                                                                                          \
     } while (0)
 
@@ -895,6 +895,7 @@ constexpr int SNAP_RING = 32, STAGE_RING = 256;
 void* Engine::alloc(size_t bytes) {
     void* p = nullptr;
     CK(cudaMalloc(&p, std::max<size_t>(bytes, 16)));
+    allocs_.push_back(p);
     arena_size_ += bytes;
     return p;
 }
@@ -1036,10 +1037,19 @@ Engine::Engine(const std::string& path, int max_ctx, bool verbose, bool exact, b
 }
 
 Engine::~Engine() {
+    if (st_) cudaStreamSynchronize(st_);
     for (auto& g : g_decode_)
         if (g) cudaGraphExecDestroy(g);
     if (g_step_nohead_) cudaGraphExecDestroy(g_step_nohead_);
-    // device memory is released at process exit
+    // release everything, so another model can be loaded in the same process (the server swaps models)
+    for (void* p : allocs_) cudaFree(p);
+    allocs_.clear();
+    if (B_) {
+        if (B_->h_snap) cudaFreeHost(B_->h_snap);
+        if (B_->h_stage) cudaFreeHost(B_->h_stage);
+        if (B_->pf.h_toks) cudaFreeHost(B_->pf.h_toks);
+    }
+    if (st_) cudaStreamDestroy(st_);
 }
 
 void Engine::load(const gguf::File& f) {
@@ -1530,7 +1540,7 @@ std::vector<float> Engine::logits() {
     return v;
 }
 
-void Engine::prefill_batched(int slot, const int* tokens, int n) {
+void Engine::prefill_batched(int slot, const int* tokens, int n, const float* emb, bool emb_host) {
     auto& b = *B_;
     auto& p = b.pf;
     const float eps = cfg_.eps;
@@ -1541,7 +1551,13 @@ void Engine::prefill_batched(int slot, const int* tokens, int n) {
         memcpy(p.h_toks, tokens + off, T * 4);
         CK(cudaMemcpyAsync(p.toks, p.h_toks, T * 4, cudaMemcpyHostToDevice, st_));
         prof_mark("start", st_);
-        k_embed_batch<<<T, 256, 0, st_>>>(emb_, p.toks, p0, hist, p.X);
+        if (emb) {  // given input embeddings (image tokens): copy the rows, record the history token
+            CK(cudaMemcpyAsync(p.X, emb + (size_t)off * cfg_.n_embd, (size_t)T * cfg_.n_embd * 4,
+                               emb_host ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToDevice, st_));
+            k_hist_batch<<<(T + 255) / 256, 256, 0, st_>>>(p.toks, T, p0, hist);
+        } else {
+            k_embed_batch<<<T, 256, 0, st_>>>(emb_, p.toks, p0, hist, p.X);
+        }
         prof_mark("embed", st_);
         const float* prevF = nullptr;
         const float* prev_post = nullptr;
@@ -1620,6 +1636,19 @@ void Engine::feed(int slot, const int* tokens, int n) {
     if (n_past_[slot] + n + 1 > max_ctx_) throw std::runtime_error("context overflow");
     auto t0 = std::chrono::steady_clock::now();
     prefill_batched(slot, tokens, n);
+    n_past_[slot] += n;
+    ctrl_dirty_[slot] = true;
+    timing.prefill_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    timing.prefill_tokens += n;
+}
+
+void Engine::feed_embd(int slot, const float* emb, int n, int hist_tok, bool emb_on_host) {
+    if (n <= 0) return;
+    if (slot < 0 || slot >= n_slots_) throw std::runtime_error("bad slot");
+    if (n_past_[slot] + n + 1 > max_ctx_) throw std::runtime_error("context overflow");
+    auto t0 = std::chrono::steady_clock::now();
+    std::vector<int> toks(n, hist_tok);
+    prefill_batched(slot, toks.data(), n, emb, emb_on_host);
     n_past_[slot] += n;
     ctrl_dirty_[slot] = true;
     timing.prefill_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
@@ -1765,7 +1794,10 @@ void Engine::load_kv(int slot, int p0, int p1, const void* host) {
 
 void Engine::write_history(int slot, int p0, const int* tokens, int n) {
     if (n <= 0) return;
-    CK(cudaMemcpy(B_->hist + (size_t)slot * max_ctx_ + p0, tokens, (size_t)n * 4, cudaMemcpyHostToDevice));
+    std::vector<int> h(tokens, tokens + n);
+    for (int& t : h)
+        if (t < 0) t = image_hist_token;
+    CK(cudaMemcpy(B_->hist + (size_t)slot * max_ctx_ + p0, h.data(), (size_t)n * 4, cudaMemcpyHostToDevice));
 }
 
 }  // namespace le

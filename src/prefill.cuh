@@ -36,6 +36,10 @@ inline void prefill_alloc(PrefillBufs& p, const Config& c, int, Alloc alloc) {
 // ------------------------------------------------------------------------------------------------
 // elementwise kernels
 // ------------------------------------------------------------------------------------------------
+__global__ void k_hist_batch(const int* toks, int T, int p0, int* hist) {
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t < T) hist[p0 + t] = toks[t];
+}
 __global__ void k_embed_batch(QWeight w, const int* toks, int p0, int* hist, float* X) {
     const int t = blockIdx.x, tok = toks[t];
     if (threadIdx.x == 0) hist[p0 + t] = tok;

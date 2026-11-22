@@ -530,11 +530,10 @@ Vision::Vision(const std::string& path, bool verbose) : p_(new Impl) {
     chk("clip.vision.projection_dim", VOUT);
     const int n_layer = (int)f.u("clip.vision.block_count");
     if (f.has("clip.vision.attention.layer_norm_epsilon")) P.eps = (float)f.u("clip.vision.attention.layer_norm_epsilon");
-    // llama.cpp: max tokens capped at 4096 (OOM guard), min from the GGUF
     const int64_t patch_area = VPATCH * VPATCH * VMERGE * VMERGE;
-    const int64_t gmin = (int64_t)f.u("clip.vision.image_min_pixels"), gmax = (int64_t)f.u("clip.vision.image_max_pixels");
-    P.min_px = gmin / patch_area * patch_area;
-    P.max_px = std::min<int64_t>(4096, gmax / patch_area) * patch_area;
+    const VisionLimits lim = VisionLimits::load(path);  // max capped at 4096 tokens, as llama.cpp
+    P.min_px = lim.min_px;
+    P.max_px = lim.max_px;
     if (f.has("clip.vision.image_mean")) {
         const auto& m = f.get("clip.vision.image_mean").arr_num;
         const auto& d = f.get("clip.vision.image_std").arr_num;
