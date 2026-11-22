@@ -45,6 +45,12 @@ REPLACEMENTS = [
     ("*", "Llama Sans", "Liquine Sans", None),                    # font-family names (the files keep their names)
     ("*", "Llama Mono", "Liquine Mono", None),
     ("service-worker.js", "`llama-ui-${a}`", "`liquine-${a}`", 1),  # cache name
+    # a new service worker takes over at once (upstream waits for the "Update available -> Reload" click, and until
+    # then serves the old cached index.html, headers included): one plain reload picks up a new UI version
+    ("service-worker.js", "e.addAll(u.map(e=>new Request(e,{cache:`reload`})))))})",
+     "e.addAll(u.map(e=>new Request(e,{cache:`reload`})))).then(()=>c.skipWaiting()))})", 1),
+    ("service-worker.js", "e.filter(e=>e!==l).map(e=>caches.delete(e)))))})",
+     "e.filter(e=>e!==l).map(e=>caches.delete(e)))).then(()=>c.clients.claim()))})", 1),
 ]
 LOGO_OLD = re.compile(r'`<svg width="600" height="600" viewBox="0 0 600 600" fill="none" '
                       r'xmlns="http://www\.w3\.org/2000/svg">\n<path d="M600 392L504\.249 558.*?</svg>\n`', re.S)
