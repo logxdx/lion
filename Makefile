@@ -7,17 +7,23 @@ CXXFLAGS := -O3 -march=native -std=c++17 -Wall -I$(CUDA_INC)
 NVFLAGS  := -O3 -std=c++17 -arch=$(ARCH) --use_fast_math -Xcompiler "-O3 -march=native" -lineinfo
 
 BUILD := build
-CORE  := $(BUILD)/engine.o $(BUILD)/tokenizer.o
+CORE  := $(BUILD)/engine.o $(BUILD)/tokenizer.o $(BUILD)/vision.o $(BUILD)/image.o
 SERVER_OBJS := $(BUILD)/server.o $(BUILD)/chat.o $(BUILD)/prompt_cache.o $(BUILD)/web_tools.o $(BUILD)/httplib.o
 
 all: $(BUILD)/liquid $(BUILD)/liquid-server
-tests: $(BUILD)/test_engine_api $(BUILD)/test_chat
+tests: $(BUILD)/test_engine_api $(BUILD)/test_chat $(BUILD)/test_vision
 
 $(BUILD):
 	mkdir -p $(BUILD)
 
-$(BUILD)/engine.o: src/engine.cu src/engine.h src/kernels.cuh src/prefill.cuh src/gguf.h | $(BUILD)
+$(BUILD)/engine.o: src/engine.cu src/engine.h src/kernels.cuh src/prefill.cuh src/gemm.cuh src/repack.cuh src/gguf.h | $(BUILD)
 	$(NVCC) $(NVFLAGS) -c $< -o $@
+
+$(BUILD)/vision.o: src/vision.cu src/vision.h src/engine.h src/kernels.cuh src/gemm.cuh src/repack.cuh src/gguf.h | $(BUILD)
+	$(NVCC) $(NVFLAGS) -c $< -o $@
+
+$(BUILD)/image.o: src/image.cpp src/vision.h src/stb_image.h | $(BUILD)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(BUILD)/tokenizer.o: src/tokenizer.cpp src/tokenizer.h src/unicode_data.h src/gguf.h | $(BUILD)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
@@ -49,6 +55,10 @@ $(BUILD)/liquid-server: $(CORE) $(SERVER_OBJS)
 $(BUILD)/test_engine_api: tests/test_engine_api.cpp $(CORE)
 	$(CXX) $(CXXFLAGS) -c $< -o $(BUILD)/test_engine_api.o
 	$(NVCC) -arch=$(ARCH) $(BUILD)/test_engine_api.o $(CORE) -o $@ -lcudart
+
+$(BUILD)/test_vision: tests/test_vision.cpp $(CORE)
+	$(CXX) $(CXXFLAGS) -c $< -o $(BUILD)/test_vision.o
+	$(NVCC) -arch=$(ARCH) $(BUILD)/test_vision.o $(CORE) -o $@ -lcudart
 
 $(BUILD)/test_chat: tests/test_chat.cpp $(BUILD)/chat.o
 	$(CXX) $(CXXFLAGS) $^ -o $@
