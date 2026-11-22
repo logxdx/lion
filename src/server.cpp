@@ -1122,6 +1122,8 @@ int main(int argc, char** argv) {
         };
         // router-mode endpoints the web UI calls: loading is automatic, the status feed only keeps the stream open
         auto ok_json = [](const httplib::Request&, httplib::Response& r) { r.set_content("{\"success\":true}", "application/json"); };
+        // the UI's Hugging Face model catalog (rebranded to this path instead of llama.app): no downloads here
+        srv.Get("/v1/catalog.json", [](const httplib::Request&, httplib::Response& r) { r.set_content("[]", "application/json"); });
         srv.Post("/models/load", ok_json);
         srv.Post("/models/unload", ok_json);
         srv.Get("/models/sse", [](const httplib::Request&, httplib::Response& r) {
@@ -1235,15 +1237,12 @@ int main(int argc, char** argv) {
             if (std::filesystem::exists(std::filesystem::path(ui_dir) / "index.html") && srv.set_mount_point("/", ui_dir)) {
                 srv.set_file_extension_and_mimetype_mapping("webmanifest", "application/manifest+json");
                 srv.set_file_extension_and_mimetype_mapping("mjs", "application/javascript");
+                // Content-named bundle files are cached for good; everything else (index, icons, manifest, service
+                // worker) revalidates via ETag. No cross-origin isolation headers: the UI does not need them, and
+                // with COEP require-corp the browser blocks images from most sites in model replies.
                 srv.set_file_request_handler([](const httplib::Request& q, httplib::Response& r) {
-                    const std::string& p = q.path;
-                    const bool revalidate = p == "/" || p == "/index.html" || p == "/service-worker.js" || p == "/sw.js" ||
-                                            p == "/manifest.webmanifest" || p == "/build.json" || p == "/_app/version.json";
-                    r.set_header("Cache-Control", revalidate ? "no-cache" : "public, max-age=31536000, immutable");
-                    if (p == "/" || p == "/index.html") {
-                        r.set_header("Cross-Origin-Embedder-Policy", "require-corp");
-                        r.set_header("Cross-Origin-Opener-Policy", "same-origin");
-                    }
+                    const bool immutable = q.path.rfind("/_app/immutable/", 0) == 0;
+                    r.set_header("Cache-Control", immutable ? "public, max-age=31536000, immutable" : "no-cache");
                 });
                 Scheduler::log("web UI: %s", ui_dir.c_str());
             } else {

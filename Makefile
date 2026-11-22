@@ -67,7 +67,7 @@ $(BUILD)/test_chat: tests/test_chat.cpp $(BUILD)/chat.o
 webtools:
 	cd tools/webtools && npm ci --no-audit --no-fund
 
-# llama.cpp web UI served by liquid-server at / (the prebuilt bundle llama.cpp's own build embeds), into $(BUILD)/webui
+# Web UI served by liquid-server at /: llama.cpp's prebuilt bundle (MIT), rebranded as liquine by brand/rebrand.py
 UI_VERSION ?= b12569
 UI_URL     := https://huggingface.co/buckets/ggml-org/llama-ui/resolve/$(UI_VERSION)
 webui: | $(BUILD)
@@ -75,6 +75,7 @@ webui: | $(BUILD)
 	curl -fsSL -o $(BUILD)/webui-$(UI_VERSION).tar.gz.sha256 $(UI_URL)/dist.tar.gz.sha256
 	cd $(BUILD) && echo "$$(cut -d' ' -f1 webui-$(UI_VERSION).tar.gz.sha256)  webui-$(UI_VERSION).tar.gz" | sha256sum -c -
 	rm -rf $(BUILD)/webui && mkdir -p $(BUILD)/webui && tar -xzf $(BUILD)/webui-$(UI_VERSION).tar.gz -C $(BUILD)/webui
+	python3 brand/rebrand.py $(BUILD)/webui
 
 clean:
 	rm -rf $(BUILD)

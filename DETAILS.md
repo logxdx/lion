@@ -122,7 +122,14 @@ curl localhost:8080/v1/chat/completions -d '{"messages":[{"role":"user","content
 ```
 
 **Web UI with tools.** `http://127.0.0.1:11434/` (serve.sh; the binary defaults to 8080) serves llama.cpp's web UI (the prebuilt b12569 bundle that
-llama.cpp's build embeds; `make webui` downloads it to `build/webui` and checks its sha256; `--ui-dir`, `--no-ui`).
+llama.cpp's build embeds; `make webui` downloads it to `build/webui`, checks its sha256 and rebrands it; `--ui-dir`,
+`--no-ui`). **Branding**: `brand/rebrand.py` renames it liquine (titles, manifest, logo, favicons, PWA icons, splash
+screens from `brand/webui/`, help texts that pointed at llama-server, the model catalog URL now served empty by
+liquid-server), asserting every replacement so a different bundle fails loudly; changed bundle files get new names
+because `_app/immutable/` is cached for a year (everything else revalidates). The logo is `brand/liquine-mark.svg`;
+`brand/build_assets.py` renders the icons from it. The UI is sent without cross-origin isolation headers
+(llama-server's COEP `require-corp` blocked images from most sites in replies; the UI does not need isolation), so
+markdown images and links in model replies render.
 Next to the UI's built-in browser tools (`get_datetime`, `get_info`, `run_javascript`, ...) the server provides
 three tools in llama-server's server-tool format (`GET /tools` lists them, `POST /tools {tool, params}` runs one,
 the same contract as llama-server's `get_info`/`read_file`), so the UI lists them under "Server Tools", enables
