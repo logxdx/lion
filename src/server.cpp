@@ -25,6 +25,7 @@
 #include "prompt_cache.h"
 #include "sampling_defaults.h"
 #include "tokenizer.h"
+#include "video.h"
 #include "vision.h"
 #include "web_tools.h"
 
@@ -43,6 +44,8 @@ struct ModelSpec {
     std::string chat_template;
     std::unique_ptr<le::VisionLimits> vision;  // set: the model takes images (mmproj)
     int image_tok = -1;                        // <|image|>
+    int video_tok = -1, vstart_tok = -1, vend_tok = -1;  // <|video|>, <|vision_start|>, <|vision_end|>
+    bool video = false;                        // takes video (vision + ffmpeg/ffprobe on PATH)
     int ctx = 0;                               // context per sequence (0: the server's -c)
 };
 struct EngineParams {
@@ -61,13 +64,17 @@ struct Request {
     int model = 0;                 // index into the model list
     std::string model_id;
     const Tokenizer* tk = nullptr;
-    struct ImageIn {
+    struct ImageIn {               // an image, or one frame pair of a video
         le::Image img;
-        uint64_t key = 0;          // hash of the image bytes
+        le::Image img2;            // video pair: the second frame (empty: a lone last frame)
+        bool pair = false;         // a video frame pair (the two temporal patch kernels)
+        bool media_end = true;     // last entry of its image / video: a checkpoint goes after it
+        uint64_t key = 0;          // hash of the image bytes (video: of the video bytes and the pair index)
         int pos = 0, n = 0;        // prompt positions [pos, pos+n) are this image's tokens (negative ids)
         std::vector<float> emb;    // [n][2048], filled by the scheduler (vision encoder)
     };
-    std::vector<ImageIn> images;
+    std::vector<ImageIn> images;   // images and video frame pairs, in prompt order
+    std::vector<std::vector<std::string>> video_stamps;  // per video: "<t seconds>" for each pair
     int image_tok = -1;
     // results (scheduler -> HTTP thread)
     std::mutex m;
@@ -254,10 +261,13 @@ private:
             if (!vis_) throw std::runtime_error("model " + models_[active_].id + " has no vision encoder");
             if (im->emb.empty()) {
                 int nt = 0;
-                im->emb = vis_->encode_host(im->img, nt);
+                im->emb = im->pair ? vis_->encode_pair_host(im->img, im->img2.rgb.empty() ? nullptr : &im->img2, nt)
+                                   : vis_->encode_host(im->img, nt);
                 if (nt != im->n) throw std::runtime_error("image token count mismatch");
-                log("req %llu: image %dx%d -> %d tokens, encoded in %.1f ms", (unsigned long long)r.id, im->img.w,
-                    im->img.h, nt, vis_->last_ms());
+                log("req %llu: %s %dx%d -> %d tokens, encoded in %.1f ms", (unsigned long long)r.id,
+                    im->pair ? "video frames" : "image", im->img.w, im->img.h, nt, vis_->last_ms());
+                im->img = le::Image{};  // the pixels are no longer needed
+                im->img2 = le::Image{};
             }
             const int j = std::min(end, im->pos + im->n);
             eng_->feed_embd(s.id, im->emb.data() + (size_t)(i - im->pos) * vis_->n_embd(), j - i, r.image_tok, true);
@@ -373,11 +383,11 @@ private:
         // stop at the next periodic checkpoint boundary
         const int next_cp = (fed / cfg_.checkpoint_every + 1) * cfg_.checkpoint_every;
         if (fed + n > next_cp && next_cp < target) n = next_cp - fed;
-        // ... and at the end of each image: a checkpoint there lets the next question about the same image (or a
-        // regeneration) resume after it instead of encoding and prefilling the image again
+        // ... and at the end of each image / video: a checkpoint there lets the next question about the same media
+        // (or a regeneration) resume after it instead of encoding and prefilling it again
         int img_end = -1;
         for (auto& im : r.images)
-            if (im.pos + im.n > fed && im.pos + im.n < target && (img_end < 0 || im.pos + im.n < img_end)) img_end = im.pos + im.n;
+            if (im.media_end && im.pos + im.n > fed && im.pos + im.n < target && (img_end < 0 || im.pos + im.n < img_end)) img_end = im.pos + im.n;
         if (img_end > 0 && fed + n > img_end) n = img_end - fed;
         if (n > 0) {
             try {
@@ -676,12 +686,15 @@ struct ApiServer {
     static bool is_image_part(const json& x) {
         return x.is_object() && x.contains("type") && (x["type"] == "image_url" || x["type"] == "input_image");
     }
-    static bool messages_have_images(const json& msgs) {
+    static bool is_video_part(const json& x) {
+        return x.is_object() && x.contains("type") && (x["type"] == "input_video" || x["type"] == "video_url");
+    }
+    template <class Pred> static bool messages_have(const json& msgs, Pred pred) {
         if (!msgs.is_array()) return false;
         for (auto& m : msgs)
             if (m.is_object() && m.contains("content") && m["content"].is_array())
                 for (auto& x : m["content"])
-                    if (is_image_part(x)) return true;
+                    if (pred(x)) return true;
         return false;
     }
     static std::string b64decode(const std::string& in) {
@@ -712,48 +725,112 @@ struct ApiServer {
         }
         return out;
     }
-    // OpenAI image parts -> {"type": "image"} (what the chat template renders as <|vision_start|><|image|>...) and
-    // the decoded images, in prompt order. Only base64 data: URLs (what the web UI and most clients send).
-    static void extract_images(json& msgs, std::vector<Request::ImageIn>& out) {
+    static uint64_t fnv1a(const std::string& bytes) {
+        uint64_t h = 1469598103934665603ull;
+        for (unsigned char c : bytes) h = (h ^ c) * 1099511628211ull;
+        return h;
+    }
+    // "data:<mime>;base64,<payload>" -> bytes; false if url is not such a URL
+    static bool data_url(const std::string& url, std::string& bytes) {
+        const size_t comma = url.find(',');
+        if (url.rfind("data:", 0) != 0 || comma == std::string::npos ||
+            url.substr(0, comma).find(";base64") == std::string::npos)
+            return false;
+        bytes = b64decode(url.substr(comma + 1));
+        return true;
+    }
+    static std::string url_of(const json& u) {  // "url" or {"url": "..."}
+        if (u.is_string()) return u.get<std::string>();
+        if (u.is_object() && u.contains("url") && u["url"].is_string()) return u["url"].get<std::string>();
+        return "";
+    }
+    // OpenAI image / video parts -> {"type": "image"} / {"type": "video"} (what the chat template renders as
+    // <|vision_start|><|image|><|vision_end|> / ...<|video|>...) and the decoded media in prompt order: an image is
+    // one entry, a video one entry per frame pair. Images: base64 data: URLs. Videos: input_video {data: base64,
+    // format} (the web UI) or video_url with a data: URL.
+    static void extract_media(json& msgs, Request& r) {
         for (auto& m : msgs) {
             if (!m.is_object() || !m.contains("content") || !m["content"].is_array()) continue;
             for (auto& x : m["content"]) {
-                if (!is_image_part(x)) continue;
-                const json& iu = x.contains("image_url") ? x["image_url"] : x.contains("image") ? x["image"] : json();
-                std::string url;
-                if (iu.is_string()) url = iu.get<std::string>();
-                else if (iu.is_object() && iu.contains("url") && iu["url"].is_string()) url = iu["url"].get<std::string>();
-                const size_t comma = url.find(',');
-                if (url.rfind("data:", 0) != 0 || comma == std::string::npos ||
-                    url.substr(0, comma).find(";base64") == std::string::npos)
-                    throw std::runtime_error("images must be base64 data: URLs");
-                const std::string bytes = b64decode(url.substr(comma + 1));
-                Request::ImageIn im;
-                std::string err;
-                if (!le::decode_image((const uint8_t*)bytes.data(), bytes.size(), im.img, err)) throw std::runtime_error(err);
-                uint64_t h = 1469598103934665603ull;  // FNV-1a of the image bytes
-                for (unsigned char c : bytes) h = (h ^ c) * 1099511628211ull;
-                im.key = h;
-                out.push_back(std::move(im));
-                x = json{{"type", "image"}};
+                if (is_image_part(x)) {
+                    const std::string url =
+                        url_of(x.contains("image_url") ? x["image_url"] : x.contains("image") ? x["image"] : json());
+                    std::string bytes;
+                    if (!data_url(url, bytes)) throw std::runtime_error("images must be base64 data: URLs");
+                    Request::ImageIn im;
+                    std::string err;
+                    if (!le::decode_image((const uint8_t*)bytes.data(), bytes.size(), im.img, err)) throw std::runtime_error(err);
+                    im.key = fnv1a(bytes);
+                    r.images.push_back(std::move(im));
+                    x = json{{"type", "image"}};
+                } else if (is_video_part(x)) {
+                    std::string bytes;
+                    if (x["type"] == "input_video") {
+                        const json& iv = x.contains("input_video") ? x["input_video"] : json();
+                        const std::string d = iv.is_object() && iv.contains("data") && iv["data"].is_string()
+                                                  ? iv["data"].get<std::string>() : url_of(iv);
+                        if (d.empty()) throw std::runtime_error("input_video needs base64 data");
+                        if (!data_url(d, bytes)) bytes = b64decode(d);  // raw base64, as the web UI sends
+                    } else if (!data_url(url_of(x.contains("video_url") ? x["video_url"] : json()), bytes)) {
+                        throw std::runtime_error("videos must be base64 data: URLs");
+                    }
+                    if (bytes.empty()) throw std::runtime_error("empty video");
+                    le::Video v;
+                    std::string err;
+                    if (!le::decode_video((const uint8_t*)bytes.data(), bytes.size(), v, err))
+                        throw std::runtime_error("video: " + err);
+                    const uint64_t h = fnv1a(bytes);
+                    const int np = v.n_pairs();
+                    for (int g = 0; g < np; g++) {
+                        Request::ImageIn im;
+                        im.pair = true;
+                        im.img = std::move(v.frames[2 * g]);
+                        if (2 * g + 1 < (int)v.frames.size()) im.img2 = std::move(v.frames[2 * g + 1]);
+                        im.media_end = g == np - 1;
+                        im.key = (h ^ ((uint64_t)(g + 1) * 0x9E3779B97F4A7C15ull)) * 1099511628211ull;
+                        r.images.push_back(std::move(im));
+                    }
+                    r.video_stamps.push_back(std::move(v.stamps));
+                    x = json{{"type", "video"}};
+                }
             }
         }
     }
     // each <|image|> token becomes the image's n positions, marked with a negative id derived from the image bytes:
-    // identical images give identical ids, so prefix reuse and the prompt cache work across turns
-    static std::vector<int> layout_images(const std::vector<int>& toks, Request& r, const ModelSpec& M) {
+    // identical images give identical ids, so prefix reuse and the prompt cache work across turns. Each <|video|>
+    // token becomes, per frame pair, "<t seconds>" <|vision_start|> (pair positions) <|vision_end|> (llama.cpp's
+    // LFM3 video layout; the template's own <|vision_start|> ... <|vision_end|> stays around it).
+    static std::vector<int> layout_media(const std::vector<int>& toks, Request& r, const ModelSpec& M) {
         if (r.images.empty()) return toks;
         std::vector<int> out;
-        size_t k = 0;
-        for (int t : toks) {
-            if (t != M.image_tok) { out.push_back(t); continue; }
-            if (k >= r.images.size()) throw std::runtime_error("more <|image|> markers than images");
-            auto& im = r.images[k++];
+        size_t k = 0, kv = 0;
+        auto place = [&](Request::ImageIn& im, int n) {
             im.pos = (int)out.size();
-            im.n = M.vision->n_tokens(im.img.w, im.img.h);
-            out.insert(out.end(), im.n, -1 - (int)(im.key % 1000000007ull));
+            im.n = n;
+            out.insert(out.end(), n, -1 - (int)(im.key % 1000000007ull));
+        };
+        for (int t : toks) {
+            if (t == M.image_tok) {
+                if (k >= r.images.size() || r.images[k].pair) throw std::runtime_error("image markers do not match the images");
+                auto& im = r.images[k++];
+                place(im, M.vision->n_tokens(im.img.w, im.img.h));
+            } else if (t == M.video_tok && M.video_tok >= 0) {
+                if (kv >= r.video_stamps.size()) throw std::runtime_error("video markers do not match the videos");
+                for (const auto& stamp : r.video_stamps[kv++]) {
+                    if (k >= r.images.size() || !r.images[k].pair) throw std::runtime_error("video markers do not match the videos");
+                    const auto st = M.tk->encode(stamp);
+                    out.insert(out.end(), st.begin(), st.end());
+                    out.push_back(M.vstart_tok);
+                    auto& im = r.images[k++];
+                    place(im, le::img::pair_tokens(im.img.w, im.img.h));
+                    out.push_back(M.vend_tok);
+                }
+            } else {
+                out.push_back(t);
+            }
         }
-        if (k != r.images.size()) throw std::runtime_error("image markers do not match the images");
+        if (k != r.images.size() || kv != r.video_stamps.size())
+            throw std::runtime_error("media markers do not match the images and videos");
         return out;
     }
 
@@ -769,16 +846,18 @@ struct ApiServer {
         auto r = std::make_shared<Request>();
         r->id = next_id++;
         r->t_arrive = clk::now();
-        // route: a known model id, else the vision model for requests with images, else the default model
-        const bool has_images = chat_mode && b.contains("messages") && messages_have_images(b["messages"]);
+        // route: a known model id, else the vision model for requests with images / video, else the default model
+        const bool has_images = chat_mode && b.contains("messages") && messages_have(b["messages"], is_image_part);
+        const bool has_video = chat_mode && b.contains("messages") && messages_have(b["messages"], is_video_part);
+        const bool has_media = has_images || has_video;
         int mi = 0;
         bool named = false;
         if (b.contains("model") && b["model"].is_string())
             for (size_t i = 0; i < models.size(); i++)
                 if (models[i].id == b["model"].get<std::string>()) { mi = (int)i; named = true; }
-        if (!named && has_images)
+        if (!named && has_media)
             for (size_t i = 0; i < models.size(); i++)
-                if (models[i].vision) { mi = (int)i; break; }
+                if (models[i].vision && (models[i].video || !has_video)) { mi = (int)i; break; }
         const ModelSpec& M = models[mi];
         const Tokenizer& tk = *M.tk;
         r->model = mi;
@@ -803,11 +882,14 @@ struct ApiServer {
                 if (b.contains("reasoning_effort") && b["reasoning_effort"] == "none") o.enable_thinking = false;
                 in_reasoning = o.enable_thinking;
                 json msgs = b["messages"];
-                if (has_images) {
+                if (has_media) {
                     if (!M.vision) throw std::runtime_error("model '" + M.id + "' does not take images");
-                    extract_images(msgs, r->images);
+                    if (has_video && !M.video)
+                        throw std::runtime_error("model '" + M.id + "' does not take video" +
+                                                 std::string(M.video_tok >= 0 ? " (needs ffmpeg and ffprobe on the server's PATH)" : ""));
+                    extract_media(msgs, *r);
                 }
-                r->prompt = layout_images(tk.encode(chat::render(msgs, tools, o)), *r, M);
+                r->prompt = layout_media(tk.encode(chat::render(msgs, tools, o)), *r, M);
             } else {
                 const json& p = b.value("prompt", json(""));
                 if (p.is_string()) r->prompt = tk.encode(p.get<std::string>());
@@ -1052,6 +1134,7 @@ int main(int argc, char** argv) {
     }
     try {
         std::vector<ModelSpec> models;
+        const bool video_tools = le::video_tools_available();
         auto add_model = [&](const std::string& id, const std::string& path, const std::string& mm, int mctx) {
             ModelSpec M;
             M.ctx = mctx;
@@ -1064,9 +1147,14 @@ int main(int argc, char** argv) {
             ov.apply(M.sp);
             if (f.has("tokenizer.chat_template")) M.chat_template = f.get("tokenizer.chat_template").str;
             M.image_tok = M.tk->id("<|image|>");
+            M.video_tok = M.tk->id("<|video|>");
+            M.vstart_tok = M.tk->id("<|vision_start|>");
+            M.vend_tok = M.tk->id("<|vision_end|>");
             if (!mm.empty()) {
                 M.vision = std::make_unique<le::VisionLimits>(le::VisionLimits::load(mm));
                 if (M.image_tok < 0) throw std::runtime_error(path + ": no <|image|> token in the vocabulary");
+                M.video = video_tools && M.video_tok >= 0 && M.vstart_tok >= 0 && M.vend_tok >= 0;
+                if (!video_tools) Scheduler::log("%s: no ffmpeg/ffprobe on PATH, video input off", id.c_str());
             }
             models.push_back(std::move(M));
         };
@@ -1075,8 +1163,11 @@ int main(int argc, char** argv) {
             if (vl_mmproj.empty()) throw std::runtime_error("--vl-model needs --vl-mmproj");
             add_model(vl_alias, vl_model, vl_mmproj, std::min(vl_ctx, ctx));
         }
-        bool any_vision = false;
-        for (auto& M : models) any_vision |= M.vision != nullptr;
+        bool any_vision = false, any_video = false;
+        for (auto& M : models) {
+            any_vision |= M.vision != nullptr;
+            any_video |= M.video;
+        }
         scfg.sp = models[0].sp;
         const std::string chat_template = models[0].chat_template;
         EngineParams ep;
@@ -1117,7 +1208,7 @@ int main(int argc, char** argv) {
             for (auto& M : models)
                 data.push_back({{"id", M.id}, {"object", "model"}, {"created", 0}, {"owned_by", "liquid-engine"},
                                 {"status", {{"value", "loaded"}}},
-                                {"meta", {{"n_ctx", model_ctx(M)}, {"n_slots", slots}, {"vision", M.vision != nullptr}}}});
+                                {"meta", {{"n_ctx", model_ctx(M)}, {"n_slots", slots}, {"vision", M.vision != nullptr}, {"video", M.video}}}});
             r.set_content(json({{"object", "list"}, {"data", data}}).dump(), "application/json");
         };
         // router-mode endpoints the web UI calls: loading is automatic, the status feed only keeps the stream open
@@ -1166,8 +1257,9 @@ int main(int argc, char** argv) {
                       {"default_generation_settings", dgs},
                       // llama-server /props fields used by the llama.cpp web UI
                       {"model_alias", M.id}, {"model_path", M.path}, {"total_slots", slots},
-                      // single-model mode: images are routed to the VL model, so the default model "has" vision
-                      {"modalities", {{"vision", found ? M.vision != nullptr : any_vision}, {"audio", false}, {"video", false}}},
+                      // single-model mode: images / video are routed to the VL model, so the default model "has" them
+                      {"modalities", {{"vision", found ? M.vision != nullptr : any_vision}, {"audio", false},
+                                      {"video", found ? M.video : any_video}}},
                       {"chat_template", M.chat_template}, {"build_info", "liquid-engine"},
                       {"cors_proxy_enabled", false}, {"ui_settings", json::object()}};
             if (router && !found) p["role"] = "router";

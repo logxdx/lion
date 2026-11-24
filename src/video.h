@@ -26,6 +26,9 @@ struct Video {
 bool decode_video_file(const std::string& path, Video& out, std::string& err, const std::string& ffmpeg_dir = "");
 bool decode_video(const uint8_t* data, size_t n, Video& out, std::string& err, const std::string& ffmpeg_dir = "");
 
+// ffmpeg and ffprobe found (in ffmpeg_dir, else on PATH): video input works
+bool video_tools_available(const std::string& ffmpeg_dir = "");
+
 namespace img {
 // smart_resize, video variant (Qwen3-VL / LFM3-VL video processor): edges up to factor first, area budget over
 // n_frames rounded to pairs

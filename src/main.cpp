@@ -13,6 +13,7 @@
 #include "gguf.h"
 #include "sampling_defaults.h"
 #include "tokenizer.h"
+#include "video.h"
 #include "vision.h"
 
 using namespace le;
@@ -27,6 +28,8 @@ static void usage() {
             "  --raw              feed the prompt verbatim (no chat template)\n"
             "  --no-think         disable thinking (<think></think> prefix)\n"
             "  --mmproj F --image F   vision (LFM3-VL): attach images (repeatable) to the first user message\n"
+            "  --video F          video (LFM3-VL, needs --mmproj; ffmpeg + ffprobe on PATH): 2 fps, repeatable;\n"
+            "                     attached after the images\n"
             "  -n N               max new tokens (default 2048)\n"
             "  -c N               context size (default 32768)\n"
             "  --temp F --top-k N --top-p F --min-p F --repeat-penalty F --repeat-last-n N --seed N\n"
@@ -102,7 +105,7 @@ static bool on_tok(int id, void* ud) {
 
 int main(int argc, char** argv) {
     std::string model, prompt, system, tok_text, mmproj;
-    std::vector<std::string> image_paths;
+    std::vector<std::string> image_paths, video_paths;
     bool interactive = false, raw = false, think = true, bench = false, dump_logits = false, quiet = false;
     bool seq_prefill = false, show_special = false, do_tokenize = false, exact = false, profile = false;
     bool kv_q8 = true;  // default q8_0 KV: faster decode at every context, half the memory (see README)
@@ -119,6 +122,7 @@ int main(int argc, char** argv) {
         else if (a == "-p") prompt = next();
         else if (a == "--mmproj") mmproj = next();
         else if (a == "--image") image_paths.push_back(next());
+        else if (a == "--video") video_paths.push_back(next());
         else if (a == "-f") {
             FILE* fp = fopen(next().c_str(), "rb");
             if (!fp) { perror("prompt file"); return 1; }
@@ -288,10 +292,12 @@ int main(int argc, char** argv) {
         // vision: images go into the first user message as <|vision_start|><|image|><|vision_end|> each
         std::unique_ptr<le::Vision> vis;
         std::vector<le::Image> images;
-        size_t next_image = 0;
-        const int image_tok = tk.id("<|image|>");
-        if (!image_paths.empty()) {
-            if (mmproj.empty()) { fprintf(stderr, "--image needs --mmproj\n"); return 1; }
+        std::vector<le::Video> videos;
+        size_t next_image = 0, next_video = 0;
+        const int image_tok = tk.id("<|image|>"), video_tok = tk.id("<|video|>");
+        const int vstart_tok = tk.id("<|vision_start|>"), vend_tok = tk.id("<|vision_end|>");
+        if (!image_paths.empty() || !video_paths.empty()) {
+            if (mmproj.empty()) { fprintf(stderr, "--image / --video need --mmproj\n"); return 1; }
             vis = std::make_unique<le::Vision>(mmproj, !quiet);
             for (const auto& ip : image_paths) {
                 FILE* fp = fopen(ip.c_str(), "rb");
@@ -306,19 +312,53 @@ int main(int argc, char** argv) {
                 if (!le::decode_image(bytes.data(), bytes.size(), im, err)) { fprintf(stderr, "%s: %s\n", ip.c_str(), err.c_str()); return 1; }
                 images.push_back(std::move(im));
             }
+            for (const auto& vp : video_paths) {
+                le::Video v;
+                std::string err;
+                if (video_tok < 0) { fprintf(stderr, "this model has no <|video|> token\n"); return 1; }
+                if (!le::decode_video_file(vp, v, err)) { fprintf(stderr, "%s: %s\n", vp.c_str(), err.c_str()); return 1; }
+                if (!quiet)
+                    fprintf(stderr, "[video] %s: %dx%d, %zu frames -> %d pairs at %dx%d\n", vp.c_str(), v.src_w, v.src_h,
+                            v.frames.size(), v.n_pairs(), v.frames[0].w, v.frames[0].h);
+                videos.push_back(std::move(v));
+            }
             std::string marks;
             for (size_t i = 0; i < images.size(); i++) marks += "<|vision_start|><|image|><|vision_end|>";
+            for (size_t i = 0; i < videos.size(); i++) marks += "<|vision_start|><|video|><|vision_end|>";
             prompt = marks + prompt;
         }
-        // prefill that replaces each <|image|> token by the image's embeddings (same pending-token rule as prefill)
+        // prefill that replaces each <|image|> token by the image's embeddings and each <|video|> token by
+        // ("<t seconds>" <|vision_start|> pair embeddings <|vision_end|>) per frame pair (same pending-token rule as
+        // prefill)
         auto prefill_mm = [&](const std::vector<int>& toks) {
-            if (!vis || std::find(toks.begin(), toks.end(), image_tok) == toks.end()) { eng.prefill(toks); return; }
+            if (!vis || (std::find(toks.begin(), toks.end(), image_tok) == toks.end() &&
+                         (video_tok < 0 || std::find(toks.begin(), toks.end(), video_tok) == toks.end()))) {
+                eng.prefill(toks);
+                return;
+            }
             std::vector<int> all;
             if (eng.pending(0) >= 0) all.push_back(eng.pending(0));
             all.insert(all.end(), toks.begin(), toks.end() - 1);
             std::vector<int> run;
             auto flush = [&]() { if (!run.empty()) { eng.feed(0, run.data(), (int)run.size()); run.clear(); } };
             for (int t : all) {
+                if (t == video_tok && video_tok >= 0) {
+                    if (next_video >= videos.size()) throw std::runtime_error("more <|video|> tokens than videos");
+                    le::Video& v = videos[next_video++];
+                    for (int g = 0; g < v.n_pairs(); g++) {
+                        const auto st = tk.encode(v.stamps[g]);
+                        run.insert(run.end(), st.begin(), st.end());
+                        run.push_back(vstart_tok);
+                        flush();
+                        const le::Image* f1 = 2 * g + 1 < (int)v.frames.size() ? &v.frames[2 * g + 1] : nullptr;
+                        int n = 0;
+                        const float* e = vis->encode_pair(v.frames[2 * g], f1, n);
+                        if (!quiet) fprintf(stderr, "[vision] video %zu %s: %d tokens, %.1f ms\n", next_video, v.stamps[g].c_str(), n, vis->last_ms());
+                        eng.feed_embd(0, e, n, image_tok);
+                        run.push_back(vend_tok);
+                    }
+                    continue;
+                }
                 if (t != image_tok) { run.push_back(t); continue; }
                 flush();
                 if (next_image >= images.size()) throw std::runtime_error("more <|image|> tokens than images");

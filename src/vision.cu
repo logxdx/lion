@@ -647,8 +647,9 @@ const float* Vision::encode(const Image& im, int& n_tok) {
 
 // a video frame keeps its size (the video pipeline picked it), only snapped to multiples of 32 as llama.cpp does
 static Image snap32(const Image& im) {
-    const int tw = std::max(32, (int)std::nearbyint(im.w / 32.0) * 32), th = std::max(32, (int)std::nearbyint(im.h / 32.0) * 32);
-    return img::resize_bicubic(im, tw, th);
+    int tw, th;
+    img::snap32(im.w, im.h, tw, th);
+    return tw == im.w && th == im.h ? im : img::resize_bicubic(im, tw, th);
 }
 
 const float* Vision::encode_pair(const Image& f0, const Image* f1, int& n_tok) {
@@ -731,6 +732,13 @@ const float* Vision::run(const Image& r, const Image* r2, int& n_tok) {
     cudaEventElapsedTime(&ms, P.e0, P.e1);
     last_ms_ = ms;
     return P.E;
+}
+
+std::vector<float> Vision::encode_pair_host(const Image& f0, const Image* f1, int& n_tok) {
+    const float* d = encode_pair(f0, f1, n_tok);
+    std::vector<float> h((size_t)n_tok * VOUT);
+    VCK(cudaMemcpy(h.data(), d, h.size() * 4, cudaMemcpyDeviceToHost));
+    return h;
 }
 
 std::vector<float> Vision::encode_host(const Image& im, int& n_tok) {

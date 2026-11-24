@@ -5,6 +5,8 @@
 // -> LayerNorm, 2x2 merge, Linear-GELU-Linear -> one 2048-dim embedding per 32x32 pixel block.
 // The embeddings replace the <|image|> token between <|vision_start|> and <|vision_end|> in the LLM prompt.
 #pragma once
+#include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -27,6 +29,17 @@ void smart_resize(int w, int h, int factor, int64_t min_px, int64_t max_px, int&
 // Separable antialiased bicubic (a = -0.5) with torchvision's int16 weights, as llama.cpp's
 // RESIZE_ALGO_BICUBIC | RESIZE_ALGO_FLAG_TORCH (bit-exact with it)
 Image resize_bicubic(const Image& src, int tw, int th);
+// a video frame keeps the size the video pipeline picked, only snapped to the nearest multiple of 32, ties to
+// even, no token cap (as llama.cpp b12674: 597x336 -> 608x320, 3200x1800 -> 3200x1792)
+inline void snap32(int w, int h, int& tw, int& th) {
+    tw = std::max(32, (int)std::nearbyint(w / 32.0) * 32);
+    th = std::max(32, (int)std::nearbyint(h / 32.0) * 32);
+}
+inline int pair_tokens(int w, int h) {  // embeddings of one video frame pair
+    int tw, th;
+    snap32(w, h, tw, th);
+    return (tw / 32) * (th / 32);
+}
 }  // namespace img
 
 // Image token budget of an lfm3vl mmproj, from its metadata only (no GPU): the prompt layout is known before
@@ -60,6 +73,7 @@ public:
     // Encode a pair of video frames (already sized by the video pipeline): frame 0 through the first temporal patch
     // kernel, frame 1 through the second. f1 == nullptr (odd last frame): both kernels, like a still image.
     const float* encode_pair(const Image& f0, const Image* f1, int& n_tok);
+    std::vector<float> encode_pair_host(const Image& f0, const Image* f1, int& n_tok);
 
     double last_ms() const { return last_ms_; }
     size_t gpu_bytes() const { return gpu_bytes_; }

@@ -231,6 +231,42 @@ CLI: `build/liquid -m LFM3-VL-2B-Q8_0.gguf --mmproj mmproj-LFM3-VL-2B-Q8_0.gguf 
 Tests: `tests/test_vl_server.py` (routing, images, cache reuse, swap back, 400 for images to a text model),
 `tests/swap_stress.py` (repeated swaps, leak check), `tests/test_vision.cpp`.
 
+## Video (LFM3-VL)
+
+The server takes the web UI's `input_video` parts (`{data: <base64>, format}`) and `video_url` parts with a base64
+`data:` URL; `/props` reports `modalities.video` (the UI then offers video attachments on `lfm3-vl`) when the VL model
+is loaded and `ffmpeg` + `ffprobe` are on the PATH. CLI: `build/liquid ... --mmproj mmproj.gguf --video clip.mp4 -p "..."`.
+It follows llama.cpp b12674's LFM3 video path (`MTMD_VIDEO_TEMPLATE_LFM3`), checked against it step by step:
+
+- **Frames** (`src/video.cpp`): ffprobe -> n = clamp(trunc(frames / fps * 2), 4, 768), at most the source's, evenly
+  spaced (`round(i * (frames - 1) / (n - 1))`); the size from Qwen-VL's video smart_resize over the whole clip
+  (multiples of 32, 4096 .. 25,165,824 pixels over the frames); ffmpeg scales with the same filter
+  (`bicubic+accurate_rnd+full_chroma_int`, B=0 C=0.5), so the frames are byte-identical to llama.cpp's. Display
+  geometry like llama.cpp: width x sample aspect ratio, width/height swapped for +-90 degree rotation (phone videos).
+  Without a frame count in the container (some webm/mkv): ffmpeg's `fps=2` filter at the source size, frames snapped
+  to multiples of 32 (ties to even, no token cap; measured: 597x336 -> 608x320, 3200x1800 -> 3200x1792).
+- **Encoder**: frames go in pairs, one encoder pass per pair: frame 0 through the first temporal patch kernel, frame 1
+  through the second (`Vision::encode_pair`); a lone last frame goes through both, like a still image.
+- **Prompt**: the template's `<|vision_start|><|video|><|vision_end|>`, `<|video|>` replaced per pair by
+  `<t seconds>` (the pair's mean time, one decimal) `<|vision_start|>` (pair embeddings) `<|vision_end|>`.
+  In the server a video is one checkpoint (after its last pair), so a follow-up question about it starts there.
+
+| measured (RTX 4050) | |
+|---|---|
+| 5 s 640x360 clip: 10 frames, 5 pairs x 220 tokens | decode (ffmpeg) 160 ms, encode ~16 ms per pair (llama.cpp CUDA ~29 ms) |
+| 3200x1800 webm, one 5600-token pair | encode 871 ms (llama.cpp 1795 ms); VRAM peak 4749 MiB with serve.sh's 4 x 64k |
+| prompt tokens vs llama-server, 4 clips (plain, rotated, SAR 2:1, webm) x 3 questions | 12 / 12 identical |
+| greedy 48-token answers vs llama-server, same 12 requests | 8 identical, 4 drift after 11-24 identical words |
+
+**Accuracy** (`tests/test_video.cpp`; `tests/vl_ref_video.cpp` dumps llama.cpp's pair embeddings through libmtmd):
+decoded frames byte-identical to llama.cpp's; pair embeddings vs llama.cpp (CPU): cosine 0.9959 .. 0.9991 mean,
+rel L2 4.1 .. 7.8%, the same band as the still-image path on single frames of the same clip (0.9967 .. 0.9992):
+the int8-activation encoder's content-dependent noise. The pair math itself is checked exactly: two identical frames
+equal the still image at the patch embedding (rel 5e-7, f32 rounding; `LIQUID_VDUMP` stage dumps), and swapping the
+two frames moves the result 13x further from llama.cpp's (rel L2 0.60 vs 0.046), so the kernel order is right.
+Tests: `tests/test_video.cpp`, `tests/test_video_server.py` (web UI and data-URL formats, follow-up reuse, 400 for
+a non-video; also runs against llama-server for parity).
+
 ## Design
 
 **Weights** are repacked on the GPU at load time (lossless, bit-identical values):

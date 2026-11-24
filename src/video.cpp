@@ -167,10 +167,14 @@ bool decode_video_file(const std::string& path, Video& out, std::string& err, co
     out.src_h = atoi(kv["height"].c_str());
     // display geometry, as ffmpeg delivers the frames (and as llama.cpp sizes them): non-square pixels stretch the
     // width by the sample aspect ratio, and ffmpeg auto-rotates, so a +-90 degree rotation swaps width and height
+    int coded_w = out.src_w, coded_h = out.src_h;  // what ffmpeg emits without a scale filter (after auto-rotation)
     const double sar = parse_rational(kv["sample_aspect_ratio"]);
     if (sar > 0 && std::fabs(sar - 1.0) > 1e-6) out.src_w = (int)std::nearbyint(out.src_w * sar);
     const int rot = ((atoi(kv["rotation"].c_str()) % 360) + 360) % 360;
-    if (rot == 90 || rot == 270) std::swap(out.src_w, out.src_h);
+    if (rot == 90 || rot == 270) {
+        std::swap(out.src_w, out.src_h);
+        std::swap(coded_w, coded_h);
+    }
     out.src_fps = parse_rational(kv["r_frame_rate"]);
     const std::string nb = kv["nb_frames"];
     out.src_frames = (!nb.empty() && nb != "N/A") ? atoi(nb.c_str()) : 0;
@@ -189,13 +193,15 @@ bool decode_video_file(const std::string& path, Video& out, std::string& err, co
         img::smart_resize_video(out.src_w, out.src_h, n, fw, fh);
         last = out.indices.back();
         std::string vf = "format=rgb24";
-        if (fw != out.src_w || fh != out.src_h)
+        if (fw != coded_w || fh != coded_h)
             vf += ",scale=" + std::to_string(fw) + ":" + std::to_string(fh) +
                   ":flags=bicubic+accurate_rnd+full_chroma_int:param0=0:param1=0.5";
         args.insert(args.end(), {"-vf", vf, "-frames:v", std::to_string(last + 1)});
     } else {
         // no frame count (some webm/mkv): ffmpeg's fps filter at the source size; frames snapped to 32 when encoded
-        args.insert(args.end(), {"-vf", "fps=2.000000"});
+        std::string vf = "fps=2.000000";
+        if (fw != coded_w || fh != coded_h) vf += ",scale=" + std::to_string(fw) + ":" + std::to_string(fh);
+        args.insert(args.end(), {"-vf", vf});
     }
     args.insert(args.end(), {"-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1", "-loglevel", "error"});
 
@@ -237,6 +243,23 @@ bool decode_video_file(const std::string& path, Video& out, std::string& err, co
         out.stamps.push_back(b);
     }
     return true;
+}
+
+bool video_tools_available(const std::string& ffmpeg_dir) {
+    auto found = [&](const char* name) {
+        if (!ffmpeg_dir.empty()) return access((ffmpeg_dir + "/" + name).c_str(), X_OK) == 0;
+        const char* env = getenv("PATH");
+        const std::string path = env ? env : "";
+        for (size_t i = 0; i <= path.size();) {
+            size_t j = path.find(':', i);
+            if (j == std::string::npos) j = path.size();
+            const std::string d = j > i ? path.substr(i, j - i) : ".";
+            if (access((d + "/" + name).c_str(), X_OK) == 0) return true;
+            i = j + 1;
+        }
+        return false;
+    };
+    return found("ffmpeg") && found("ffprobe");
 }
 
 bool decode_video(const uint8_t* data, size_t n, Video& out, std::string& err, const std::string& ffmpeg_dir) {

@@ -80,7 +80,11 @@ int main(int argc, char** argv) {
         rel = std::sqrt(num / den);
     };
     bool ok = true;
-    {  // identity: a pair of identical frames == the still image, conv(f,k0) + conv(f,k1) == conv(f,k0+k1). Exact up to
+    int stw, sth, ptw, pth;  // the identity check needs the still-image size == the pair size (no token cap hit)
+    vis.target_size(v.frames[0].w, v.frames[0].h, stw, sth);
+    le::img::snap32(v.frames[0].w, v.frames[0].h, ptw, pth);
+    if (stw != ptw || sth != pth) printf("identity: skipped (still image %dx%d, pair %dx%d)\n", stw, sth, ptw, pth);
+    else {  // identity: a pair of identical frames == the still image, conv(f,k0) + conv(f,k1) == conv(f,k0+k1). Exact up to
        // f32 rounding at the patch embedding (checked there, via the encoder's LIQUID_VDUMP stage dump); downstream the
        // int8 activation quantization amplifies that rounding to ~3% rel L2 at the output (measured), so the end-to-end
        // comparison only gets a loose bound.
