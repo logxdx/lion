@@ -334,8 +334,396 @@ __global__ void __launch_bounds__(256, 1) k_gemm(GemmArgs g) {
     }
 }
 
+// ------------------------------------------------------------------------------------------------
+// v2 (Q8): one barrier per k tile. Each thread < 128 copies the 4 weight scales of one row and converts them
+// itself (its own cp.async data is visible to it after cp.async.wait), so the conversion needs no barrier of its
+// own; the next stage is issued after the barrier, when every warp is done with that buffer. Same accumulation
+// order and float operations as k_gemm: bit-identical output.
+// ------------------------------------------------------------------------------------------------
+struct GemmSmem2Q8 {
+    int8_t a[2][GB_M * GB_K];
+    int8_t b[2][GB_N * GB_K];
+    float ad[2][GB_M * 4];
+    half bd[2][GB_N * 4];
+    float ws[2][4][GB_N];
+};
+
+template <int EPI>
+__device__ __forceinline__ void gemm_epilogue(float (&acc)[2][8][4], const GemmArgs& g, int m0, int n0, int wm, int wn,
+                                              int g8, int tig, uint8_t* smem_raw) {
+    if constexpr (EPI == GE_STORE) {
+        const int N = g.w.N;
+#pragma unroll
+        for (int mi = 0; mi < 2; mi++)
+#pragma unroll
+            for (int h = 0; h < 2; h++) {
+                const int t = m0 + wm + mi * 16 + g8 + h * 8;
+                if (t >= g.T) continue;
+#pragma unroll
+                for (int ni = 0; ni < 8; ni++) {
+                    const int col = n0 + wn + ni * 8 + tig * 2;
+                    if (col < N) *(float2*)(g.out + (size_t)t * N + col) = make_float2(acc[mi][ni][h * 2], acc[mi][ni][h * 2 + 1]);
+                }
+            }
+    } else {
+        __syncthreads();  // the last k tile's operands are no longer read
+        float* tile = reinterpret_cast<float*>(smem_raw);
+        constexpr int LD = GB_N + 4;
+#pragma unroll
+        for (int mi = 0; mi < 2; mi++)
+#pragma unroll
+            for (int h = 0; h < 2; h++) {
+                const int r = wm + mi * 16 + g8 + h * 8;
+#pragma unroll
+                for (int ni = 0; ni < 8; ni++) {
+                    const int c = wn + ni * 8 + tig * 2;
+                    tile[r * LD + c] = acc[mi][ni][h * 2];
+                    tile[r * LD + c + 1] = acc[mi][ni][h * 2 + 1];
+                }
+            }
+        __syncthreads();
+        const int NO = g.w.N / 2;
+        for (int it = threadIdx.x; it < GB_M * 8; it += 256) {
+            const int r = it >> 3, pair = (it >> 2) & 1, q = it & 3;
+            const int t = m0 + r;
+            float y[8], amax = 0;
+#pragma unroll
+            for (int i = 0; i < 8; i++) {
+                const float gv = tile[r * LD + pair * 64 + q * 8 + i];
+                const float uv = tile[r * LD + pair * 64 + 32 + q * 8 + i];
+                y[i] = gv / (1.f + __expf(-gv)) * uv;
+                amax = fmaxf(amax, fabsf(y[i]));
+            }
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 1));
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 2));
+            const float d = amax / 127.f, id = d > 0 ? 1.f / d : 0.f;
+            if (t < g.T) {
+                const int ob = (n0 / 64) + pair;
+                uint32_t lo = 0, hi = 0;
+#pragma unroll
+                for (int i = 0; i < 4; i++) lo |= (uint32_t)(uint8_t)(int8_t)roundf(y[i] * id) << (8 * i);
+#pragma unroll
+                for (int i = 0; i < 4; i++) hi |= (uint32_t)(uint8_t)(int8_t)roundf(y[4 + i] * id) << (8 * i);
+                *(uint2*)(g.yq + (size_t)t * NO + ob * 32 + q * 8) = make_uint2(lo, hi);
+                if (q == 0) g.yd[(size_t)t * (NO / 32) + ob] = d;
+            }
+        }
+    }
+}
+
+template <int K>
+__device__ __forceinline__ void gemm2_load_stage(GemmSmem2Q8& sm, int st, const GemmArgs& g, int m0, int n0, int kt) {
+    const int tid = threadIdx.x;
+#pragma unroll
+    for (int i = 0; i < 4; i++) {  // A: 128 rows x 8 chunks
+        const int idx = tid + i * 256, r = idx >> 3, c = idx & 7;
+        const int t = m0 + r;
+        const bool ok = t < g.T;
+        const int8_t* src = g.A + (size_t)(ok ? t : 0) * K + kt * GB_K + c * 16;
+        cp_async16(sm.a[st] + r * GB_K + ((c ^ (r & 7)) * 16), src, ok);
+    }
+    if (tid < 128) {
+        const int t = m0 + tid;
+        const bool ok = t < g.T;
+        cp_async16(sm.ad[st] + tid * 4, g.Ad + (size_t)(ok ? t : 0) * (K / 32) + kt * 4, ok);
+    }
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const int idx = tid + i * 256, r = idx >> 3, c = idx & 7;
+        const int grp = kt * 4 + (c >> 1), hf = c & 1;
+        const int ch = grp >> 5, gl = grp & 31;
+        const int Gc = min(32, K / 32 - ch * 32);
+        const uint8_t* src = g.w.q + (size_t)(n0 + r) * K + ch * 1024 + hf * Gc * 16 + gl * 16;
+        cp_async16(sm.b[st] + r * GB_K + ((c ^ (r & 7)) * 16), src);
+    }
+    if (tid < 128) cp_async8(sm.bd[st] + tid * 4, g.w.d + (size_t)(n0 + tid) * (K / 32) + kt * 4);
+}
+
 template <int K, int EPI>
-inline void launch_gemm(const GemmArgs& g, cudaStream_t s) {
+__global__ void __launch_bounds__(256, 1) k_gemm2(GemmArgs g) {
+    extern __shared__ __align__(128) uint8_t smem_raw[];
+    GemmSmem2Q8& sm = *reinterpret_cast<GemmSmem2Q8*>(smem_raw);
+    const int m0 = blockIdx.x * GB_M, n0 = blockIdx.y * GB_N;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int g8 = lane >> 2, tig = lane & 3;
+    const int wm = (warp & 3) * 32, wn = (warp >> 2) * 64;
+    constexpr int KT = K / GB_K;
+
+    float acc[2][8][4];
+#pragma unroll
+    for (int i = 0; i < 2; i++)
+#pragma unroll
+        for (int j = 0; j < 8; j++) acc[i][j][0] = acc[i][j][1] = acc[i][j][2] = acc[i][j][3] = 0.f;
+
+    gemm2_load_stage<K>(sm, 0, g, m0, n0, 0);
+    cp_commit();
+    for (int kt = 0; kt < KT; kt++) {
+        const int st = kt & 1;
+        cp_wait<0>();
+        if (tid < 128) {  // this thread's own row of weight scales
+            const half* bd = sm.bd[st] + tid * 4;
+#pragma unroll
+            for (int grp = 0; grp < 4; grp++) sm.ws[st][grp][tid] = __half2float(bd[grp]);
+        }
+        __syncthreads();  // stage kt landed for everyone; every warp is done with stage kt-1
+        if (kt + 1 < KT) gemm2_load_stage<K>(sm, st ^ 1, g, m0, n0, kt + 1);
+        cp_commit();
+#pragma unroll
+        for (int grp = 0; grp < 4; grp++) {
+            uint32_t af[2][4];
+#pragma unroll
+            for (int mi = 0; mi < 2; mi++) {
+                const int q = lane >> 3, r = wm + mi * 16 + (lane & 7) + (q & 1) * 8;
+                const int c = grp * 2 + (q >> 1);
+                ldsm_x4(af[mi][0], af[mi][1], af[mi][2], af[mi][3], sm.a[st] + r * GB_K + ((c ^ (r & 7)) * 16));
+            }
+            uint32_t bf[8][2];
+#pragma unroll
+            for (int np = 0; np < 4; np++) {
+                const int q = lane >> 3, r = wn + np * 16 + (lane & 7) + (q >> 1) * 8;
+                const int c = grp * 2 + (q & 1);
+                ldsm_x4(bf[2 * np][0], bf[2 * np][1], bf[2 * np + 1][0], bf[2 * np + 1][1], sm.b[st] + r * GB_K + ((c ^ (r & 7)) * 16));
+            }
+            float xs[2][2];
+#pragma unroll
+            for (int mi = 0; mi < 2; mi++) {
+                xs[mi][0] = sm.ad[st][(wm + mi * 16 + g8) * 4 + grp];
+                xs[mi][1] = sm.ad[st][(wm + mi * 16 + g8 + 8) * 4 + grp];
+            }
+            int c[2][8][4];
+#pragma unroll
+            for (int ni = 0; ni < 8; ni++)
+#pragma unroll
+                for (int mi = 0; mi < 2; mi++) mma_s8_k32(c[mi][ni], af[mi], bf[ni][0], bf[ni][1]);
+#pragma unroll
+            for (int ni = 0; ni < 8; ni++) {
+                const float2 w = *(const float2*)&sm.ws[st][grp][wn + ni * 8 + tig * 2];
+#pragma unroll
+                for (int mi = 0; mi < 2; mi++) {
+                    acc[mi][ni][0] += i2f_magic(c[mi][ni][0]) * (xs[mi][0] * w.x);
+                    acc[mi][ni][1] += i2f_magic(c[mi][ni][1]) * (xs[mi][0] * w.y);
+                    acc[mi][ni][2] += i2f_magic(c[mi][ni][2]) * (xs[mi][1] * w.x);
+                    acc[mi][ni][3] += i2f_magic(c[mi][ni][3]) * (xs[mi][1] * w.y);
+                }
+            }
+        }
+    }
+    gemm_epilogue<EPI>(acc, g, m0, n0, wm, wn, g8, tig, smem_raw);
+}
+
+template <int K, int EPI>
+inline void launch_gemm2(const GemmArgs& g, cudaStream_t s) {
+    dim3 grid((g.T + GB_M - 1) / GB_M, (g.w.N + GB_N - 1) / GB_N);
+    constexpr size_t ep = 128 * 132 * 4;
+    constexpr size_t sm = sizeof(GemmSmem2Q8) > ep ? sizeof(GemmSmem2Q8) : ep;
+    static bool init = false;
+    if (!init) { cudaFuncSetAttribute(k_gemm2<K, EPI>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm); init = true; }
+    k_gemm2<K, EPI><<<grid, 256, sm, s>>>(g);
+}
+
+// ------------------------------------------------------------------------------------------------
+// shared layout / loader for k tile BK through an S-stage cp.async ring (k_gemm4). Deeper rings (BK 64 x 3-4
+// stages) measured slower than double buffering: load latency is not what limits these GEMMs.
+// ------------------------------------------------------------------------------------------------
+template <int BK, int S>
+struct GemmSmem3Q8 {
+    int8_t a[S][GB_M * BK];
+    int8_t b[S][GB_N * BK];
+    float ad[S][GB_M * (BK / 32)];
+    half bd[S][GB_N * (BK / 32)];
+    float ws[S][BK / 32][GB_N];
+};
+
+// 16-byte chunk c of row r -> its swizzled slot: 8 consecutive rows of one chunk column hit 8 distinct bank groups
+template <int BK>
+__device__ __forceinline__ int g3_swz(int r, int c) {
+    if constexpr (BK == 128) return c ^ (r & 7);
+    else return c ^ ((r >> 1) & 3);
+}
+
+template <int K, int BK, int S>
+__device__ __forceinline__ void gemm3_load_stage(GemmSmem3Q8<BK, S>& sm, int st, const GemmArgs& g, int m0, int n0, int kt) {
+    constexpr int CH = BK / 16, GR = BK / 32;  // 16-byte chunks and 32-groups per row
+    const int tid = threadIdx.x;
+#pragma unroll
+    for (int i = 0; i < GB_M * CH / 256; i++) {
+        const int idx = tid + i * 256, r = idx / CH, c = idx % CH;
+        const int t = m0 + r;
+        const bool ok = t < g.T;
+        const int8_t* src = g.A + (size_t)(ok ? t : 0) * K + kt * BK + c * 16;
+        cp_async16(sm.a[st] + r * BK + g3_swz<BK>(r, c) * 16, src, ok);
+    }
+    if (tid < 128) {
+        const int t = m0 + tid;
+        const bool ok = t < g.T;
+        if constexpr (GR == 4) cp_async16(sm.ad[st] + tid * 4, g.Ad + (size_t)(ok ? t : 0) * (K / 32) + kt * 4, ok);
+        else cp_async8(sm.ad[st] + tid * 2, g.Ad + (size_t)(ok ? t : 0) * (K / 32) + kt * 2);  // T-tail rows: unused
+    }
+#pragma unroll
+    for (int i = 0; i < GB_N * CH / 256; i++) {
+        const int idx = tid + i * 256, r = idx / CH, c = idx % CH;
+        const int grp = kt * GR + (c >> 1), hf = c & 1;
+        const int ch = grp >> 5, gl = grp & 31;
+        const int Gc = min(32, K / 32 - ch * 32);
+        const uint8_t* src = g.w.q + (size_t)(n0 + r) * K + ch * 1024 + hf * Gc * 16 + gl * 16;
+        cp_async16(sm.b[st] + r * BK + g3_swz<BK>(r, c) * 16, src);
+    }
+    if (tid < 128) {
+        if constexpr (GR == 4) cp_async8(sm.bd[st] + tid * 4, g.w.d + (size_t)(n0 + tid) * (K / 32) + kt * 4);
+        else asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" ::"r"(smem_u32(sm.bd[st] + tid * 2)),
+                          "l"(g.w.d + (size_t)(n0 + tid) * (K / 32) + kt * 2));
+    }
+}
+
+// ------------------------------------------------------------------------------------------------
+// v4 (Q8): k tile 64, double-buffered, one barrier per k tile, each n8 column's two mma results scaled right away (16 live int32 instead of 64:
+// fewer registers, so MINB CTAs of 256 threads fit per SM) and the SwiGLU epilogue staged in two 64-row halves
+// (half the shared memory). Every accumulator still gets the same additions in the same order: bit-identical.
+// ------------------------------------------------------------------------------------------------
+template <int EPI>
+__device__ __forceinline__ void gemm_epilogue_halves(float (&acc)[2][8][4], const GemmArgs& g, int m0, int n0, int wm,
+                                                     int wn, int g8, int tig, uint8_t* smem_raw) {
+    if constexpr (EPI == GE_STORE) {
+        gemm_epilogue<GE_STORE>(acc, g, m0, n0, wm, wn, g8, tig, smem_raw);
+    } else {
+        float* tile = reinterpret_cast<float*>(smem_raw);
+        constexpr int LD = GB_N + 4;
+        const int NO = g.w.N / 2;
+        const int warp = threadIdx.x >> 5;
+        for (int p = 0; p < 2; p++) {
+            __syncthreads();  // operands / the previous half are no longer read
+            if (((warp & 3) >> 1) == p) {
+#pragma unroll
+                for (int mi = 0; mi < 2; mi++)
+#pragma unroll
+                    for (int h = 0; h < 2; h++) {
+                        const int r = wm + mi * 16 + g8 + h * 8 - p * 64;
+#pragma unroll
+                        for (int ni = 0; ni < 8; ni++) {
+                            const int c = wn + ni * 8 + tig * 2;
+                            tile[r * LD + c] = acc[mi][ni][h * 2];
+                            tile[r * LD + c + 1] = acc[mi][ni][h * 2 + 1];
+                        }
+                    }
+            }
+            __syncthreads();
+            for (int it = threadIdx.x; it < 64 * 8; it += 256) {
+                const int rl = it >> 3, pair = (it >> 2) & 1, q = it & 3;
+                const int t = m0 + p * 64 + rl;
+                float y[8], amax = 0;
+#pragma unroll
+                for (int i = 0; i < 8; i++) {
+                    const float gv = tile[rl * LD + pair * 64 + q * 8 + i];
+                    const float uv = tile[rl * LD + pair * 64 + 32 + q * 8 + i];
+                    y[i] = gv / (1.f + __expf(-gv)) * uv;
+                    amax = fmaxf(amax, fabsf(y[i]));
+                }
+                amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 1));
+                amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 2));
+                const float d = amax / 127.f, id = d > 0 ? 1.f / d : 0.f;
+                if (t < g.T) {
+                    const int ob = (n0 / 64) + pair;
+                    uint32_t lo = 0, hi = 0;
+#pragma unroll
+                    for (int i = 0; i < 4; i++) lo |= (uint32_t)(uint8_t)(int8_t)roundf(y[i] * id) << (8 * i);
+#pragma unroll
+                    for (int i = 0; i < 4; i++) hi |= (uint32_t)(uint8_t)(int8_t)roundf(y[4 + i] * id) << (8 * i);
+                    *(uint2*)(g.yq + (size_t)t * NO + ob * 32 + q * 8) = make_uint2(lo, hi);
+                    if (q == 0) g.yd[(size_t)t * (NO / 32) + ob] = d;
+                }
+            }
+        }
+    }
+}
+
+template <int K, int EPI, int BK, int S, int MINB>
+__global__ void __launch_bounds__(256, MINB) k_gemm4(GemmArgs g) {
+    extern __shared__ __align__(128) uint8_t smem_raw[];
+    using Sm = GemmSmem3Q8<BK, S>;
+    Sm& sm = *reinterpret_cast<Sm*>(smem_raw);
+    constexpr int GR = BK / 32, KT = K / BK;
+    const int m0 = blockIdx.x * GB_M, n0 = blockIdx.y * GB_N;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int g8 = lane >> 2, tig = lane & 3;
+    const int wm = (warp & 3) * 32, wn = (warp >> 2) * 64;
+
+    float acc[2][8][4];
+#pragma unroll
+    for (int i = 0; i < 2; i++)
+#pragma unroll
+        for (int j = 0; j < 8; j++) acc[i][j][0] = acc[i][j][1] = acc[i][j][2] = acc[i][j][3] = 0.f;
+
+#pragma unroll
+    for (int s = 0; s < S - 1; s++) {
+        if (s < KT) gemm3_load_stage<K, BK, S>(sm, s, g, m0, n0, s);
+        cp_commit();
+    }
+    for (int kt = 0; kt < KT; kt++) {
+        const int st = kt % S;
+        cp_wait<S - 2>();
+        if (tid < 128) {
+#pragma unroll
+            for (int grp = 0; grp < GR; grp++) sm.ws[st][grp][tid] = __half2float(sm.bd[st][tid * GR + grp]);
+        }
+        __syncthreads();
+        if (kt + S - 1 < KT) gemm3_load_stage<K, BK, S>(sm, (kt + S - 1) % S, g, m0, n0, kt + S - 1);
+        cp_commit();
+#pragma unroll
+        for (int grp = 0; grp < GR; grp++) {
+            uint32_t af[2][4], bfp[2][2];
+#pragma unroll
+            for (int mi = 0; mi < 2; mi++) {
+                const int q = lane >> 3, r = wm + mi * 16 + (lane & 7) + (q & 1) * 8;
+                const int c = grp * 2 + (q >> 1);
+                ldsm_x4(af[mi][0], af[mi][1], af[mi][2], af[mi][3], sm.a[st] + r * BK + g3_swz<BK>(r, c) * 16);
+            }
+            float xs[2][2];
+#pragma unroll
+            for (int mi = 0; mi < 2; mi++) {
+                xs[mi][0] = sm.ad[st][(wm + mi * 16 + g8) * GR + grp];
+                xs[mi][1] = sm.ad[st][(wm + mi * 16 + g8 + 8) * GR + grp];
+            }
+#pragma unroll
+            for (int ni = 0; ni < 8; ni++) {
+                uint32_t bf[2][2];  // B fragments of the n16 pair (ni even: load both columns)
+                if ((ni & 1) == 0) {
+                    const int q = lane >> 3, r = wn + (ni >> 1) * 16 + (lane & 7) + (q >> 1) * 8;
+                    const int cc = grp * 2 + (q & 1);
+                    ldsm_x4(bfp[0][0], bfp[0][1], bfp[1][0], bfp[1][1], sm.b[st] + r * BK + g3_swz<BK>(r, cc) * 16);
+                }
+                bf[0][0] = bfp[ni & 1][0];
+                bf[0][1] = bfp[ni & 1][1];
+                int c[2][4];
+#pragma unroll
+                for (int mi = 0; mi < 2; mi++) mma_s8_k32(c[mi], af[mi], bf[0][0], bf[0][1]);
+                const float2 w = *(const float2*)&sm.ws[st][grp][wn + ni * 8 + tig * 2];
+#pragma unroll
+                for (int mi = 0; mi < 2; mi++) {
+                    acc[mi][ni][0] += i2f_magic(c[mi][0]) * (xs[mi][0] * w.x);
+                    acc[mi][ni][1] += i2f_magic(c[mi][1]) * (xs[mi][0] * w.y);
+                    acc[mi][ni][2] += i2f_magic(c[mi][2]) * (xs[mi][1] * w.x);
+                    acc[mi][ni][3] += i2f_magic(c[mi][3]) * (xs[mi][1] * w.y);
+                }
+            }
+        }
+    }
+    cp_wait<0>();
+    gemm_epilogue_halves<EPI>(acc, g, m0, n0, wm, wn, g8, tig, smem_raw);
+}
+
+template <int K, int EPI, int BK, int S, int MINB>
+inline void launch_gemm4(const GemmArgs& g, cudaStream_t s) {
+    dim3 grid((g.T + GB_M - 1) / GB_M, (g.w.N + GB_N - 1) / GB_N);
+    constexpr size_t ep = 64 * 132 * 4;
+    constexpr size_t sm = sizeof(GemmSmem3Q8<BK, S>) > ep ? sizeof(GemmSmem3Q8<BK, S>) : ep;
+    static bool init = false;
+    if (!init) { cudaFuncSetAttribute(k_gemm4<K, EPI, BK, S, MINB>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm); init = true; }
+    k_gemm4<K, EPI, BK, S, MINB><<<grid, 256, sm, s>>>(g);
+}
+
+// the original kernel (Q6_K weights; the Q8 reference in bench/gemm_bench.cu)
+template <int K, int EPI>
+inline void launch_gemm_ref(const GemmArgs& g, cudaStream_t s) {
     dim3 grid((g.T + GB_M - 1) / GB_M, (g.w.N + GB_N - 1) / GB_N);
     constexpr size_t ep = 128 * 132 * 4;
     if (g.w.type == W_Q8) {
@@ -349,6 +737,15 @@ inline void launch_gemm(const GemmArgs& g, cudaStream_t s) {
         if (!init) { cudaFuncSetAttribute(k_gemm<W_Q6, K, EPI>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm); init = true; }
         k_gemm<W_Q6, K, EPI><<<grid, 256, sm, s>>>(g);
     }
+}
+
+// Q8_0 weights: k_gemm4 at 2 CTAs per SM for K <= 4096, k_gemm2 for the long K of ffn_down (where k_gemm4's
+// 64-deep k tiles measured slower); bit-identical to launch_gemm_ref (bench/gemm_bench.cu checks it)
+template <int K, int EPI>
+inline void launch_gemm(const GemmArgs& g, cudaStream_t s) {
+    if (g.w.type != W_Q8) return launch_gemm_ref<K, EPI>(g, s);
+    if constexpr (K <= 4096 && K % 64 == 0) launch_gemm4<K, EPI, 64, 2, 2>(g, s);
+    else launch_gemm2<K, EPI>(g, s);
 }
 
 }  // namespace le
