@@ -337,10 +337,21 @@ times its phases).
   flag live in device memory per slot, so steps chain without host round trips; finished sequences leave the batch.
 
 **Prefill** (chunks of 1024 tokens, per slot):
-- int8 tensor-core GEMM (`mma.sync m16n8k32`, `k16` pairs for Q6_K sub-scales), 128x128x128 tiles, cp.async
+- int8 tensor-core GEMM (`mma.sync m16n8k32`, `k16` pairs for Q6_K sub-scales), 128x128 tiles, cp.async
   double buffering, swizzled smem + ldmatrix, CTA order that keeps each weight tile hot in L2, exact per-group
-  scaling with an FP-pipe int->float trick; Q6_K is unpacked to int8 once per CTA. Measured ceiling on this GPU:
-  96 TOPS int8 / 24 TFLOPS f16 with f32 accumulate (`bench/mma_peak.cu`).
+  scaling with an FP-pipe int->float trick; Q6_K is unpacked to int8 once per CTA. Q8_0: one barrier per k tile
+  (each weight-scale row converted by the thread that copied it), K <= 4096 at 2 CTAs per SM (64-deep k tiles,
+  each n8 column's results scaled right away, SwiGLU epilogue in two halves), ffn_down on 128-deep tiles;
+  bit-identical to the original kernel, prefill +3-5%. Measured ceilings on this GPU (warm clocks): 114 TOPS int8,
+  L2 ~1.05 TB/s, DRAM 233 GB/s (`bench/mma_peak.cu`, `bench/l2_bw.cu`).
+  **Why ~35-40 TOPS** (`bench/gemm_bench.cu`, ablation builds, interleaved runs): Q8_0 / q8 activations carry a
+  scale per 32 values, so every `m16n8k32` result (4 int32 per thread) is converted and scaled on its own: 16 FP
+  instructions per MMA, about the issue time of the MMA itself. The kernel sits at the instruction-issue limit;
+  without the scaling it runs +5-10%, without global loads +15-28%, without both +50-80%. Not the limit: L2
+  bandwidth (GEMM uses ~30% of it), DRAM spills (raster order changes nothing), load latency (3-4 stage rings were
+  slower). Going further needs fewer scaling instructions per MMA, which per-32 scales do not allow exactly.
+  Decode is at ~96% of DRAM bandwidth under graph replay; the eager `--profile` GB/s of short kernels (e.g. 210
+  for ffn gate_up) include launch ramp-up (a barrier-free warp-per-tile gate_up kernel measured no faster).
 - Short conv as a parallel 7-tap FIR over the chunk (state from the previous chunk).
 - Tensor-core flash attention (causal + sliding window, 4 query heads share each K/V tile, f32 scores, f16 per-tile
   P·V partial sums), double-buffered K/V tiles (cp.async for f16; register prefetch + `prmt` dequantisation for
