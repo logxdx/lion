@@ -1,6 +1,6 @@
 #!/bin/sh
 # Build tests/vl_ref_embed against a llama.cpp checkout (headers) and build (libs).
-#   LLAMA_SRC=~/llama.cpp/llama.cpp-src LLAMA_LIB=~/llama.cpp/cuda/current tests/vl_ref_embed.sh
+#   LLAMA_SRC=/path/to/llama.cpp LLAMA_LIB=~/llama.cpp/current tests/vl_ref_embed.sh
 set -e
 S=${LLAMA_SRC:?set LLAMA_SRC to a llama.cpp source tree}
 L=${LLAMA_LIB:?set LLAMA_LIB to the directory with libmtmd.so / libllama.so}

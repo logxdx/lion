@@ -6,7 +6,7 @@ No ggml / llama.cpp / cuBLAS at runtime: GGUF loader, BPE tokenizer, kernels, sa
 The only dependency is the CUDA runtime. Up to 8 concurrent sequences (batched decode), q8_0 or f16 KV cache.
 
 All numbers below: same GPU, same GGUF files, one engine at a time. Reference: llama.cpp b12569
-(`~/llama.cpp/cuda/current/llama-server`, `-fa on -ngl 99`). Raw outputs are in `bench/results-*`.
+(`llama-server -fa on -ngl 99`). Raw outputs are in `bench/results-*`.
 
 ## Single stream
 
@@ -91,7 +91,7 @@ Tokenization matches llama.cpp id-for-id (special tokens, CJK, whitespace runs, 
 
 ```sh
 make                       # needs /opt/cuda (nvcc 13.x), builds build/liquid for sm_89
-M=~/llama.cpp/models/lfm3-1.7b/LFM3-1.7B-Q8_0.gguf
+M=~/models/lfm3-1.7b/LFM3-1.7B-Q8_0.gguf
 
 build/liquid -m $M -p "Explain RoPE in two paragraphs."          # chat template, thinking on
 build/liquid -m $M -p "..." --no-think -n 512                    # no <think> block
@@ -274,7 +274,7 @@ Without a server:
 - `tests/split_invariance.sh` — decode attention invariant to how the context is split (exact mode)
 - `nvcc -O3 -arch=sm_89 tests/dequant_q8_test.cu` — bit-exactness of the q8 dequantisation trick
 
-With a reference server (`bench/ref_server.sh ~/llama.cpp/cuda/current <model> 18081`):
+With a reference server (`bench/ref_server.sh ~/llama.cpp/current <model> 18081`):
 - `tests/compare_llama.py`, `tests/drift_stats.py`, `tests/greedy_match.py` (see their headers)
 
 Profiling: `--profile` (per-kernel time + achieved GB/s or TFLOPS), `-DATT_TRACE` builds (`%globaltimer` per

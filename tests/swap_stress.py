@@ -17,6 +17,7 @@ B, IMG, PID = sys.argv[1], sys.argv[2], sys.argv[3]
 ROUNDS = int(sys.argv[4]) if len(sys.argv) > 4 else 10
 TAG = sys.argv[5] if len(sys.argv) > 5 else ""
 img = base64.b64encode(open(IMG, "rb").read()).decode()
+MIME = "image/png" if IMG.lower().endswith(".png") else "image/jpeg"
 
 
 def chat(msgs):
@@ -43,7 +44,7 @@ rows = []
 for i in range(ROUNDS):
     for kind in ("image", "text"):
         if kind == "image":
-            msgs = [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + img}},
+            msgs = [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": f"data:{MIME};base64," + img}},
                                                  {"type": "text", "text": f"Round {i}: what is the main headline?"}]}]
             dt, model, ans = chat(msgs)
             ok = model == "lfm3-vl" and "moon" in ans.lower()

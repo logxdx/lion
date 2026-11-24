@@ -2,7 +2,7 @@
 """End-to-end checks for images + model swapping in liquid-server (LFM3 default + LFM3-VL via --vl-model).
 
 usage: tests/test_vl_server.py [base_url] [image]
-  image defaults to llama.cpp's tools/mtmd/test-1.jpeg (a newspaper front page: "MEN WALK ON MOON")
+  image defaults to tests/assets/front-page.png (a mock newspaper front page: "MEN WALK ON MOON", July 21, 1969)
 """
 import base64
 import json
@@ -13,8 +13,9 @@ import urllib.error
 import urllib.request
 
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8080"
-IMG = sys.argv[2] if len(sys.argv) > 2 else os.path.expanduser(
-    "~/llama.cpp/llama.cpp-src/.claude/worktrees/tier2-b12569/tools/mtmd/test-1.jpeg")
+IMG = sys.argv[2] if len(sys.argv) > 2 else os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets",
+                                                          "front-page.png")
+MIME = "image/png" if IMG.lower().endswith(".png") else "image/jpeg"
 failed = 0
 
 
@@ -41,7 +42,7 @@ def chat(messages, **kw):
     return st, out, time.time() - t0
 
 
-img_url = "data:image/jpeg;base64," + base64.b64encode(open(IMG, "rb").read()).decode()
+img_url = f"data:{MIME};base64," + base64.b64encode(open(IMG, "rb").read()).decode()
 
 st, m = req("/v1/models")
 ids = [x["id"] for x in m.get("data", [])]
