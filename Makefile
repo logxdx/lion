@@ -7,11 +7,11 @@ CXXFLAGS := -O3 -march=native -std=c++17 -Wall -I$(CUDA_INC)
 NVFLAGS  := -O3 -std=c++17 -arch=$(ARCH) --use_fast_math -Xcompiler "-O3 -march=native" -lineinfo
 
 BUILD := build
-CORE  := $(BUILD)/engine.o $(BUILD)/tokenizer.o $(BUILD)/vision.o $(BUILD)/image.o
+CORE  := $(BUILD)/engine.o $(BUILD)/tokenizer.o $(BUILD)/vision.o $(BUILD)/image.o $(BUILD)/video.o
 SERVER_OBJS := $(BUILD)/server.o $(BUILD)/chat.o $(BUILD)/prompt_cache.o $(BUILD)/web_tools.o $(BUILD)/httplib.o
 
 all: $(BUILD)/liquid $(BUILD)/liquid-server
-tests: $(BUILD)/test_engine_api $(BUILD)/test_chat $(BUILD)/test_vision
+tests: $(BUILD)/test_engine_api $(BUILD)/test_chat $(BUILD)/test_vision $(BUILD)/test_video
 
 $(BUILD):
 	mkdir -p $(BUILD)
@@ -23,6 +23,9 @@ $(BUILD)/vision.o: src/vision.cu src/vision.h src/engine.h src/kernels.cuh src/g
 	$(NVCC) $(NVFLAGS) -c $< -o $@
 
 $(BUILD)/image.o: src/image.cpp src/vision.h src/stb_image.h src/gguf.h | $(BUILD)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD)/video.o: src/video.cpp src/video.h src/vision.h | $(BUILD)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(BUILD)/tokenizer.o: src/tokenizer.cpp src/tokenizer.h src/unicode_data.h src/gguf.h | $(BUILD)
@@ -59,6 +62,10 @@ $(BUILD)/test_engine_api: tests/test_engine_api.cpp $(CORE)
 $(BUILD)/test_vision: tests/test_vision.cpp $(CORE)
 	$(CXX) $(CXXFLAGS) -c $< -o $(BUILD)/test_vision.o
 	$(NVCC) -arch=$(ARCH) $(BUILD)/test_vision.o $(CORE) -o $@ -lcudart
+
+$(BUILD)/test_video: tests/test_video.cpp $(CORE)
+	$(CXX) $(CXXFLAGS) -c $< -o $(BUILD)/test_video.o
+	$(NVCC) -arch=$(ARCH) $(BUILD)/test_video.o $(CORE) -o $@ -lcudart
 
 $(BUILD)/test_chat: tests/test_chat.cpp $(BUILD)/chat.o
 	$(CXX) $(CXXFLAGS) $^ -o $@

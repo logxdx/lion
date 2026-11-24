@@ -57,12 +57,16 @@ public:
     // Encode one image: returns a device pointer to [n_tok][2048] f32, valid until the next encode().
     const float* encode(const Image& img, int& n_tok);
     std::vector<float> encode_host(const Image& img, int& n_tok);
+    // Encode a pair of video frames (already sized by the video pipeline): frame 0 through the first temporal patch
+    // kernel, frame 1 through the second. f1 == nullptr (odd last frame): both kernels, like a still image.
+    const float* encode_pair(const Image& f0, const Image* f1, int& n_tok);
 
     double last_ms() const { return last_ms_; }
     size_t gpu_bytes() const { return gpu_bytes_; }
 
     struct Impl;
 private:
+    const float* run(const Image& r, const Image* r2, int& n_tok);  // r (and r2) at their final size
     std::unique_ptr<Impl> p_;
     double last_ms_ = 0;
     size_t gpu_bytes_ = 0;

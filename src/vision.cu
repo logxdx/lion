@@ -32,12 +32,12 @@ constexpr int VPK = 3 * VPATCH * VPATCH;  // 768 inputs per patch
 // patch embedding: X[p][o] = sum_k patch_p[k] * W[o][k], k = kx + 16*ky + 256*c   (f32 tiled GEMM)
 // ---------------------------------------------------------------------------------------------
 __global__ void __launch_bounds__(256) k_patch_embed(const float* __restrict__ img, int W, int H, int nx, int NP,
-                                                     const float* __restrict__ Wp, float* __restrict__ X) {
+                                                     const float* __restrict__ Wp, float* __restrict__ X, int acc) {
     __shared__ float As[32][65];
     __shared__ float Bs[32][65];
     const int tx = threadIdx.x & 15, ty = threadIdx.x >> 4;
     const int p0 = blockIdx.x * 64, o0 = blockIdx.y * 64;
-    float acc[4][4] = {};
+    float accv[4][4] = {};
     for (int k0 = 0; k0 < VPK; k0 += 32) {
         for (int i = threadIdx.x; i < 32 * 64; i += 256) {
             const int kk = i >> 6, pi = i & 63;
@@ -63,7 +63,7 @@ __global__ void __launch_bounds__(256) k_patch_embed(const float* __restrict__ i
 #pragma unroll
             for (int i = 0; i < 4; i++)
 #pragma unroll
-                for (int j = 0; j < 4; j++) acc[i][j] += a[i] * b[j];
+                for (int j = 0; j < 4; j++) accv[i][j] += a[i] * b[j];
         }
         __syncthreads();
     }
@@ -72,7 +72,10 @@ __global__ void __launch_bounds__(256) k_patch_embed(const float* __restrict__ i
         const int p = p0 + ty * 4 + i;
         if (p >= NP) continue;
 #pragma unroll
-        for (int j = 0; j < 4; j++) X[(size_t)p * VD + o0 + tx * 4 + j] = acc[i][j];
+        for (int j = 0; j < 4; j++) {
+            float* o = X + (size_t)p * VD + o0 + tx * 4 + j;
+            *o = acc ? *o + accv[i][j] : accv[i][j];
+        }
     }
 }
 
@@ -417,7 +420,8 @@ struct Vision::Impl {
     };
     std::vector<void*> allocs;
     size_t bytes = 0;
-    float* patch_w = nullptr;  // [1024][768] f32, both temporal kernels summed
+    float* patch_w = nullptr;  // [1024][768] f32, both temporal kernels summed (a still image goes through both)
+    float *patch_w0 = nullptr, *patch_w1 = nullptr;  // the two kernels: video frame pairs (frame 0, frame 1)
     float* emb_norm = nullptr;
     std::vector<Layer> layers;
     float *in_norm_w = nullptr, *in_norm_b = nullptr, *b0 = nullptr, *b2 = nullptr;
@@ -428,7 +432,7 @@ struct Vision::Impl {
 
     // activation buffers, sized for cap_np patches
     int cap_np = 0;
-    float *img = nullptr, *X = nullptr, *O = nullptr, *G = nullptr, *E = nullptr, *hd = nullptr, *yd = nullptr;
+    float *img = nullptr, *img2 = nullptr, *X = nullptr, *O = nullptr, *G = nullptr, *E = nullptr, *hd = nullptr, *yd = nullptr;
     int8_t *hq = nullptr, *yq = nullptr;
     half *Qh = nullptr, *Kh = nullptr, *Vh = nullptr;
     std::vector<void*> act;
@@ -489,6 +493,7 @@ struct Vision::Impl {
         const int n = (np + 127) / 128 * 128;
         auto a = [&](size_t sz) { void* p = nullptr; VCK(cudaMalloc(&p, sz)); act.push_back(p); return p; };
         img = (float*)a((size_t)n * VPK * 4);
+        img2 = (float*)a((size_t)n * VPK * 4);
         X = (float*)a((size_t)n * VD * 4);
         O = (float*)a((size_t)n * VD * 4);
         G = (float*)a((size_t)n * 3 * VD * 4);
@@ -560,9 +565,18 @@ Vision::Vision(const std::string& path, bool verbose) : p_(new Impl) {
             memcpy(&out, &r, 4);
             return out;
         };
-        for (size_t i = 0; i < w.size(); i++) w[i] = h2f(a[i]) + h2f(b[i]);  // ggml order kx,ky,c,o == [o][768]
+        std::vector<float> w0(w.size()), w1(w.size());
+        for (size_t i = 0; i < w.size(); i++) {  // ggml order kx,ky,c,o == [o][768]
+            w0[i] = h2f(a[i]);
+            w1[i] = h2f(b[i]);
+            w[i] = w0[i] + w1[i];
+        }
         P.patch_w = (float*)P.alloc(w.size() * 4);
+        P.patch_w0 = (float*)P.alloc(w.size() * 4);
+        P.patch_w1 = (float*)P.alloc(w.size() * 4);
         VCK(cudaMemcpy(P.patch_w, w.data(), w.size() * 4, cudaMemcpyHostToDevice));
+        VCK(cudaMemcpy(P.patch_w0, w0.data(), w.size() * 4, cudaMemcpyHostToDevice));
+        VCK(cudaMemcpy(P.patch_w1, w1.data(), w.size() * 4, cudaMemcpyHostToDevice));
     }
     P.emb_norm = P.upload_f32(f, "v.embedding_norm.weight");
     P.layers.resize(n_layer);
@@ -613,24 +627,51 @@ int Vision::n_tokens(int w, int h) const {
     return (tw / 32) * (th / 32);
 }
 
+// normalize RGB8 to planar f32 [3][H][W]
+static std::vector<float> to_planar(const Image& r, const float mean[3], const float stdv[3]) {
+    std::vector<float> host((size_t)3 * r.w * r.h);
+    for (int c = 0; c < 3; c++) {
+        const float m = mean[c], is = 1.f / stdv[c];
+        float* dst = host.data() + (size_t)c * r.w * r.h;
+        for (size_t i = 0; i < (size_t)r.w * r.h; i++) dst[i] = (r.rgb[i * 3 + c] / 255.f - m) * is;
+    }
+    return host;
+}
+
 const float* Vision::encode(const Image& im, int& n_tok) {
-    auto& P = *p_;
     int tw, th;
     target_size(im.w, im.h, tw, th);
     const Image r = img::resize_bicubic(im, tw, th);
+    return run(r, nullptr, n_tok);
+}
+
+// a video frame keeps its size (the video pipeline picked it), only snapped to multiples of 32 as llama.cpp does
+static Image snap32(const Image& im) {
+    const int tw = std::max(32, (int)std::nearbyint(im.w / 32.0) * 32), th = std::max(32, (int)std::nearbyint(im.h / 32.0) * 32);
+    return img::resize_bicubic(im, tw, th);
+}
+
+const float* Vision::encode_pair(const Image& f0, const Image* f1, int& n_tok) {
+    const Image a = snap32(f0);
+    if (!f1) return run(a, nullptr, n_tok);  // a lone last frame goes through both kernels, like a still image
+    const Image b = snap32(*f1);
+    if (b.w != a.w || b.h != a.h) throw std::runtime_error("video frames of a pair differ in size");
+    return run(a, &b, n_tok);
+}
+
+const float* Vision::run(const Image& r, const Image* r2, int& n_tok) {
+    auto& P = *p_;
+    const int tw = r.w, th = r.h;
     const int nx = tw / VPATCH, ny = th / VPATCH, NP = nx * ny;
     n_tok = NP / 4;
     P.ensure(NP);
-    // normalize to planar f32 [3][H][W]
-    std::vector<float> host((size_t)3 * tw * th);
-    for (int c = 0; c < 3; c++) {
-        const float m = P.mean[c], is = 1.f / P.stdv[c];
-        float* dst = host.data() + (size_t)c * tw * th;
-        for (size_t i = 0; i < (size_t)tw * th; i++) dst[i] = (r.rgb[i * 3 + c] / 255.f - m) * is;
-    }
+    const std::vector<float> host = to_planar(r, P.mean, P.stdv);
+    std::vector<float> host2;
+    if (r2) host2 = to_planar(*r2, P.mean, P.stdv);
     cudaStream_t s = P.st;
     VCK(cudaEventRecord(P.e0, s));
     VCK(cudaMemcpyAsync(P.img, host.data(), host.size() * 4, cudaMemcpyHostToDevice, s));
+    if (r2) VCK(cudaMemcpyAsync(P.img2, host2.data(), host2.size() * 4, cudaMemcpyHostToDevice, s));
     // LIQUID_VDUMP=dir: intermediate tensors under llama.cpp's names (stage-by-stage comparison with vl_ref_embed)
     const char* dump_dir = getenv("LIQUID_VDUMP");
     auto dump = [&](const std::string& name, const float* a, const float* b, int rows, int cols) {
@@ -650,7 +691,12 @@ const float* Vision::encode(const Image& im, int& n_tok) {
         fwrite(h.data(), 4, h.size(), fp);
         fclose(fp);
     };
-    k_patch_embed<<<dim3((NP + 63) / 64, VD / 64), 256, 0, s>>>(P.img, tw, th, nx, NP, P.patch_w, P.X);
+    if (!r2) {
+        k_patch_embed<<<dim3((NP + 63) / 64, VD / 64), 256, 0, s>>>(P.img, tw, th, nx, NP, P.patch_w, P.X, 0);
+    } else {  // temporal merge: conv(frame0, kernel0) + conv(frame1, kernel1)
+        k_patch_embed<<<dim3((NP + 63) / 64, VD / 64), 256, 0, s>>>(P.img, tw, th, nx, NP, P.patch_w0, P.X, 0);
+        k_patch_embed<<<dim3((NP + 63) / 64, VD / 64), 256, 0, s>>>(P.img2, tw, th, nx, NP, P.patch_w1, P.X, 1);
+    }
     dump("patchifier_out", P.X, nullptr, NP, VD);
     k_rmsnorm<<<NP, 256, 0, s>>>(P.X, P.emb_norm, P.eps);
     dump("embedding_norm", P.X, nullptr, NP, VD);
