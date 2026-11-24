@@ -25,6 +25,7 @@
 #include "prompt_cache.h"
 #include "sampling_defaults.h"
 #include "tokenizer.h"
+#include "decision.h"
 #include "video.h"
 #include "vision.h"
 #include "web_tools.h"
@@ -46,6 +47,7 @@ struct ModelSpec {
     int image_tok = -1;                        // <|image|>
     int video_tok = -1, vstart_tok = -1, vend_tok = -1;  // <|video|>, <|vision_start|>, <|vision_end|>
     bool video = false;                        // takes video (vision + ffmpeg/ffprobe on PATH)
+    std::unique_ptr<d1::Context> d1;           // set: a decision model (lfm3-d1), served at /v1/systemone only
     int ctx = 0;                               // context per sequence (0: the server's -c)
 };
 struct EngineParams {
@@ -75,6 +77,13 @@ struct Request {
     };
     std::vector<ImageIn> images;   // images and video frame pairs, in prompt order
     std::vector<std::vector<std::string>> video_stamps;  // per video: "<t seconds>" for each pair
+    // /v1/systemone (decision model): forward passes of packed questions; images (positions in the shared
+    // prefix) are the same in every pass. The scheduler fills scores: per question, its options' logits.
+    struct DecisionPass { std::vector<int> tokens, groups, outs; };
+    bool decision = false;
+    std::vector<DecisionPass> passes;
+    std::vector<std::vector<std::vector<int>>> label_groups;  // per question (pass order): label token ids per option
+    std::vector<std::vector<float>> scores;
     int image_tok = -1;
     // results (scheduler -> HTTP thread)
     std::mutex m;
@@ -230,16 +239,62 @@ private:
         vis_.reset();
         eng_.reset();
         auto& M = models_[m];
-        eng_ = std::make_unique<le::Engine>(M.path, M.ctx > 0 ? M.ctx : ep_.ctx, true, false, ep_.kv_q8, ep_.slots);
+        eng_ = std::make_unique<le::Engine>(M.path, M.ctx > 0 ? M.ctx : ep_.ctx, true, false, ep_.kv_q8,
+                                            M.d1 ? 1 : ep_.slots);
         eng_->image_hist_token = M.image_tok >= 0 ? M.image_tok : 0;
         if (!M.mmproj.empty()) vis_ = std::make_unique<le::Vision>(M.mmproj, true);
-        if (ep_.cache_ram > 0 || ep_.cache_disk > 0)
+        if (!M.d1 && (ep_.cache_ram > 0 || ep_.cache_disk > 0))
             cache_ = std::make_unique<PromptCache>(*eng_, ep_.cache_ram, ep_.cache_disk, ep_.cache_dirs, M.path);
         active_ = m;
         if (swap) {
             swaps_++;
             log("model %s loaded in %.0f ms (swap #%d)", M.id.c_str(), ms_since(t0), swaps_);
         }
+    }
+
+    void encode_media(Request& r, Request::ImageIn& im) {
+        if (!vis_) throw std::runtime_error("model " + models_[active_].id + " has no vision encoder");
+        if (!im.emb.empty()) return;
+        int nt = 0;
+        im.emb = im.pair ? vis_->encode_pair_host(im.img, im.img2.rgb.empty() ? nullptr : &im.img2, nt)
+                         : vis_->encode_host(im.img, nt);
+        if (nt != im.n) throw std::runtime_error("image token count mismatch");
+        log("req %llu: %s %dx%d -> %d tokens, encoded in %.1f ms", (unsigned long long)r.id,
+            im.pair ? "video frames" : "image", im.img.w, im.img.h, nt, vis_->last_ms());
+        im.img = le::Image{};  // the pixels are no longer needed
+        im.img2 = le::Image{};
+    }
+
+    // a /v1/systemone job: every pass is one forward pass over the shared prefix + its questions
+    void run_decision(Request& r) {
+        if (!eng_->decision()) throw std::runtime_error("model " + models_[active_].id + " is not a decision model");
+        const auto t0 = clk::now();
+        std::vector<Request::ImageIn*> order;
+        for (auto& im : r.images) order.push_back(&im);
+        std::sort(order.begin(), order.end(), [](auto* a, auto* b) { return a->pos < b->pos; });
+        std::vector<float> emb;  // rows of the media positions, in prompt order
+        for (auto* im : order) {
+            encode_media(r, *im);
+            emb.insert(emb.end(), im->emb.begin(), im->emb.end());
+        }
+        const int V = eng_->config().n_vocab;
+        size_t qi = 0, n_tok = 0;
+        for (const auto& p : r.passes) {
+            const auto lg = eng_->decide(p.tokens, p.groups, emb.empty() ? nullptr : emb.data(), p.outs);
+            for (size_t k = 0; k < p.outs.size(); k++, qi++) {
+                std::vector<float> s;
+                for (const auto& g : r.label_groups[qi]) {
+                    float m = -INFINITY;
+                    for (int id : g) m = std::max(m, lg[k * V + id]);
+                    s.push_back(m);
+                }
+                r.scores.push_back(std::move(s));
+            }
+            n_tok += p.tokens.size();
+        }
+        r.prefill_ms = ms_since(t0);
+        log("req %llu: %zu questions, %zu passes, %zu tokens, %.1f ms", (unsigned long long)r.id, qi, r.passes.size(),
+            n_tok, r.prefill_ms);
     }
 
     // feed prompt positions [fed, fed+n): text runs as tokens, image runs as the image's embeddings
@@ -258,17 +313,7 @@ private:
             for (auto& x : r.images)
                 if (i >= x.pos && i < x.pos + x.n) { im = &x; break; }
             if (!im) throw std::runtime_error("internal error: image position without an image");
-            if (!vis_) throw std::runtime_error("model " + models_[active_].id + " has no vision encoder");
-            if (im->emb.empty()) {
-                int nt = 0;
-                im->emb = im->pair ? vis_->encode_pair_host(im->img, im->img2.rgb.empty() ? nullptr : &im->img2, nt)
-                                   : vis_->encode_host(im->img, nt);
-                if (nt != im->n) throw std::runtime_error("image token count mismatch");
-                log("req %llu: %s %dx%d -> %d tokens, encoded in %.1f ms", (unsigned long long)r.id,
-                    im->pair ? "video frames" : "image", im->img.w, im->img.h, nt, vis_->last_ms());
-                im->img = le::Image{};  // the pixels are no longer needed
-                im->img2 = le::Image{};
-            }
+            encode_media(r, *im);
             const int j = std::min(end, im->pos + im->n);
             eng_->feed_embd(s.id, im->emb.data() + (size_t)(i - im->pos) * vis_->n_embd(), j - i, r.image_tok, true);
             i = j;
@@ -309,6 +354,16 @@ private:
                 }
             }
             r->t_admit = clk::now();
+            if (r->decision) {  // one-shot: no slot, the answer is complete when this returns
+                std::string err;
+                try {
+                    run_decision(*r);
+                } catch (const std::exception& ex) {
+                    err = ex.what();
+                }
+                finish_unslotted(r, err.empty() ? "stop" : "error", err);
+                continue;
+            }
             const auto& p = r->prompt;
             if ((int)p.size() + 1 >= eng_->max_ctx()) { finish_unslotted(r, "error", "prompt exceeds the context size"); continue; }
             // pick a slot: longest reusable prefix among free slots, else the least recently used one
@@ -744,6 +799,32 @@ struct ApiServer {
         if (u.is_object() && u.contains("url") && u["url"].is_string()) return u["url"].get<std::string>();
         return "";
     }
+    static void add_image(Request& r, const std::string& bytes) {
+        Request::ImageIn im;
+        std::string err;
+        if (!le::decode_image((const uint8_t*)bytes.data(), bytes.size(), im.img, err)) throw std::runtime_error(err);
+        im.key = fnv1a(bytes);
+        r.images.push_back(std::move(im));
+    }
+    // a video: one entry per frame pair, its "<t seconds>" stamps
+    static void add_video(Request& r, const std::string& bytes) {
+        if (bytes.empty()) throw std::runtime_error("empty video");
+        le::Video v;
+        std::string err;
+        if (!le::decode_video((const uint8_t*)bytes.data(), bytes.size(), v, err)) throw std::runtime_error("video: " + err);
+        const uint64_t h = fnv1a(bytes);
+        const int np = v.n_pairs();
+        for (int g = 0; g < np; g++) {
+            Request::ImageIn im;
+            im.pair = true;
+            im.img = std::move(v.frames[2 * g]);
+            if (2 * g + 1 < (int)v.frames.size()) im.img2 = std::move(v.frames[2 * g + 1]);
+            im.media_end = g == np - 1;
+            im.key = (h ^ ((uint64_t)(g + 1) * 0x9E3779B97F4A7C15ull)) * 1099511628211ull;
+            r.images.push_back(std::move(im));
+        }
+        r.video_stamps.push_back(std::move(v.stamps));
+    }
     // OpenAI image / video parts -> {"type": "image"} / {"type": "video"} (what the chat template renders as
     // <|vision_start|><|image|><|vision_end|> / ...<|video|>...) and the decoded media in prompt order: an image is
     // one entry, a video one entry per frame pair. Images: base64 data: URLs. Videos: input_video {data: base64,
@@ -757,11 +838,7 @@ struct ApiServer {
                         url_of(x.contains("image_url") ? x["image_url"] : x.contains("image") ? x["image"] : json());
                     std::string bytes;
                     if (!data_url(url, bytes)) throw std::runtime_error("images must be base64 data: URLs");
-                    Request::ImageIn im;
-                    std::string err;
-                    if (!le::decode_image((const uint8_t*)bytes.data(), bytes.size(), im.img, err)) throw std::runtime_error(err);
-                    im.key = fnv1a(bytes);
-                    r.images.push_back(std::move(im));
+                    add_image(r, bytes);
                     x = json{{"type", "image"}};
                 } else if (is_video_part(x)) {
                     std::string bytes;
@@ -774,23 +851,7 @@ struct ApiServer {
                     } else if (!data_url(url_of(x.contains("video_url") ? x["video_url"] : json()), bytes)) {
                         throw std::runtime_error("videos must be base64 data: URLs");
                     }
-                    if (bytes.empty()) throw std::runtime_error("empty video");
-                    le::Video v;
-                    std::string err;
-                    if (!le::decode_video((const uint8_t*)bytes.data(), bytes.size(), v, err))
-                        throw std::runtime_error("video: " + err);
-                    const uint64_t h = fnv1a(bytes);
-                    const int np = v.n_pairs();
-                    for (int g = 0; g < np; g++) {
-                        Request::ImageIn im;
-                        im.pair = true;
-                        im.img = std::move(v.frames[2 * g]);
-                        if (2 * g + 1 < (int)v.frames.size()) im.img2 = std::move(v.frames[2 * g + 1]);
-                        im.media_end = g == np - 1;
-                        im.key = (h ^ ((uint64_t)(g + 1) * 0x9E3779B97F4A7C15ull)) * 1099511628211ull;
-                        r.images.push_back(std::move(im));
-                    }
-                    r.video_stamps.push_back(std::move(v.stamps));
+                    add_video(r, bytes);
                     x = json{{"type", "video"}};
                 }
             }
@@ -834,6 +895,105 @@ struct ApiServer {
         return out;
     }
 
+    // POST /v1/systemone: llama.cpp's decision API (see decision.h)
+    void handle_systemone(const httplib::Request& hreq, httplib::Response& res) {
+        auto reply = [&](int status, const d1::ojson& j) {
+            res.status = status;
+            res.set_content(j.dump(-1, ' ', false, d1::ojson::error_handler_t::replace), "application/json; charset=utf-8");
+        };
+        auto fail = [&](int status, const std::string& msg, const char* type) {
+            reply(status, d1::ojson{{"error", {{"code", status}, {"message", msg}, {"type", type}}}});
+        };
+        int mi = -1;
+        for (size_t i = 0; i < models.size(); i++)
+            if (models[i].d1) { mi = (int)i; break; }
+        if (mi < 0) return fail(501, "This model is not a decision model", "not_supported_error");
+        const ModelSpec& M = models[mi];
+        const Tokenizer& tk = *M.tk;
+        auto r = std::make_shared<Request>();
+        r->id = next_id++;
+        r->t_arrive = clk::now();
+        r->model = mi;
+        r->model_id = M.id;
+        r->tk = M.tk.get();
+        r->image_tok = M.image_tok;
+        r->decision = true;
+        std::vector<d1::Question> qs;
+        bool has_media = false;
+        size_t n_tokens = 0;
+        try {
+            const d1::ojson body = d1::ojson::parse(hreq.body);
+            qs = M.d1->parse_questions(body);
+            std::vector<std::string> media;
+            const d1::ojson state = M.d1->parse_state(body, media);
+            has_media = !media.empty();
+            if (has_media && !M.vision)
+                return fail(501, "This server does not support image input for decisions. For a model that supports "
+                                 "it, start it with `--mmproj`", "not_supported_error");
+            std::string marks;  // each medium where the template puts its marker
+            for (const auto& u : media) {
+                std::string bytes;
+                data_url(u, bytes);
+                if (u.rfind("data:video/", 0) == 0) {
+                    if (!M.video) throw std::invalid_argument("video input needs ffmpeg and ffprobe on the server's PATH");
+                    add_video(*r, bytes);
+                    marks += "<|vision_start|><|video|><|vision_end|>";
+                } else {
+                    add_image(*r, bytes);
+                    marks += "<|vision_start|><|image|><|vision_end|>";
+                }
+            }
+            const std::vector<int> pre = layout_media(tk.encode(M.d1->prefix(state, marks)), *r, M);
+            const int mctx = M.ctx > 0 ? M.ctx : sched.max_ctx();
+            for (size_t q0 = 0; q0 < qs.size(); q0 += d1::MAX_PACK) {
+                Request::DecisionPass p;
+                p.tokens = pre;
+                p.groups.assign(pre.size(), 0);
+                const size_t q1 = std::min(qs.size(), q0 + d1::MAX_PACK);
+                for (size_t k = q0; k < q1; k++) {
+                    const auto t = tk.encode((k == q0 ? std::string() : d1::Context::separator(!state.is_null())) + M.d1->question_text(qs[k]));
+                    p.tokens.insert(p.tokens.end(), t.begin(), t.end());
+                    p.groups.insert(p.groups.end(), t.size(), (int)(k - q0 + 1));
+                    p.outs.push_back((int)p.tokens.size() - 1);
+                    r->label_groups.push_back(qs[k].groups);
+                }
+                if ((int)p.tokens.size() > mctx) {
+                    d1::ojson e = {{"error", {{"code", 400},
+                                              {"message", "input (" + std::to_string(p.tokens.size()) +
+                                                              " tokens) is larger than the max context size (" +
+                                                              std::to_string(mctx) + " tokens). skipping"},
+                                              {"type", "exceed_context_size_error"},
+                                              {"n_prompt_tokens", p.tokens.size()},
+                                              {"n_ctx", mctx}}}};
+                    return reply(400, e);
+                }
+                n_tokens += p.tokens.size();
+                r->passes.push_back(std::move(p));
+            }
+        } catch (const d1::ojson::exception& e) {
+            return fail(400, e.what(), "invalid_request_error");
+        } catch (const std::invalid_argument& e) {
+            return fail(400, e.what(), "invalid_request_error");
+        } catch (const std::exception& e) {
+            return fail(400, e.what(), "invalid_request_error");
+        }
+        if (!sched.submit(r)) return fail(503, "server busy: request queue is full", "server_error");
+        {
+            std::unique_lock<std::mutex> l(r->m);
+            r->cv.wait(l, [&] { return r->finished; });
+        }
+        if (r->finish_reason == "error") return fail(500, r->error, "server_error");
+        d1::ojson answers = d1::ojson::object();
+        try {
+            for (size_t k = 0; k < qs.size(); k++) answers[qs[k].id] = M.d1->answer(qs[k], r->scores[k], has_media);
+        } catch (const std::exception& e) {
+            return fail(500, e.what(), "server_error");
+        }
+        reply(200, d1::ojson{{"model", M.id},
+                             {"answers", answers},
+                             {"usage", {{"input_tokens", n_tokens}, {"output_tokens", 0}}}});
+    }
+
     void handle(const httplib::Request& hreq, httplib::Response& res, bool chat_mode) {
         json b;
         try {
@@ -857,8 +1017,14 @@ struct ApiServer {
                 if (models[i].id == b["model"].get<std::string>()) { mi = (int)i; named = true; }
         if (!named && has_media)
             for (size_t i = 0; i < models.size(); i++)
-                if (models[i].vision && (models[i].video || !has_video)) { mi = (int)i; break; }
+                if (models[i].vision && !models[i].d1 && (models[i].video || !has_video)) { mi = (int)i; break; }
         const ModelSpec& M = models[mi];
+        if (M.d1) {
+            res.status = 501;
+            res.set_content(err_json("This model is a decision model without text generation, use /v1/systemone",
+                                     "not_supported_error").dump(), "application/json");
+            return;
+        }
         const Tokenizer& tk = *M.tk;
         r->model = mi;
         r->model_id = M.id;
@@ -1057,13 +1223,18 @@ static void usage() {
             "  --mmproj F                 vision projector for -m (LFM3-VL)\n"
             "  --vl-model F --vl-mmproj F second model (LFM3-VL decoder + mmproj), swapped onto the GPU for requests\n"
             "                             with images (or model = --vl-alias, default lfm3-vl); -m stays the default\n"
-            "  --vl-ctx N                 context per sequence of the VL model (default 65536)\n",
+            "  --vl-ctx N                 context per sequence of the VL model (default 65536)\n"
+            "  --d1-model F [--d1-mmproj F] decision model (d1-2B, lfm3-d1) answering POST /v1/systemone, swapped onto\n"
+            "                             the GPU on demand; --d1-alias (default d1), --d1-ctx N tokens per forward pass\n"
+            "                             (default 8192: the shared prefix, media included, + up to 16 questions)\n",
             le::MAX_SLOTS);
 }
 
 int main(int argc, char** argv) {
     std::string model, host = "127.0.0.1", cache_dir, mmproj, vl_model, vl_mmproj, vl_alias = "lfm3-vl";
     int vl_ctx = 65536;
+    std::string d1_model, d1_mmproj, d1_alias = "d1";
+    int d1_ctx = 8192;
     int port = 8080, slots = 4, ctx = 65536, threads = 0;
     long cache_ram = 4096, cache_disk = 16384;
     bool kv_q8 = true, tools_on = true;
@@ -1091,6 +1262,10 @@ int main(int argc, char** argv) {
         else if (a == "--vl-mmproj") vl_mmproj = next();
         else if (a == "--vl-alias") vl_alias = next();
         else if (a == "--vl-ctx") vl_ctx = std::stoi(next());
+        else if (a == "--d1-model") d1_model = next();
+        else if (a == "--d1-mmproj") d1_mmproj = next();
+        else if (a == "--d1-alias") d1_alias = next();
+        else if (a == "--d1-ctx") d1_ctx = std::stoi(next());
         else if (a == "--max-tokens") scfg.max_tokens = std::stoi(next());
         else if (a == "--temp") ov.temp = std::stof(next());
         else if (a == "--top-k") ov.top_k = std::stoi(next());
@@ -1136,6 +1311,8 @@ int main(int argc, char** argv) {
         std::vector<ModelSpec> models;
         const bool video_tools = le::video_tools_available();
         auto add_model = [&](const std::string& id, const std::string& path, const std::string& mm, int mctx) {
+            for (auto& x : models)
+                if (x.id == id) throw std::runtime_error("two models named " + id + " (see --vl-alias / --d1-alias)");
             ModelSpec M;
             M.ctx = mctx;
             M.id = id;
@@ -1146,6 +1323,11 @@ int main(int argc, char** argv) {
             apply_gguf_sampling(f, M.sp);
             ov.apply(M.sp);
             if (f.has("tokenizer.chat_template")) M.chat_template = f.get("tokenizer.chat_template").str;
+            if (f.has("lfm3.decision.type")) {
+                if (f.get("lfm3.decision.type").str != "lfm3-d1")
+                    throw std::runtime_error(path + ": decision model type " + f.get("lfm3.decision.type").str + " is not supported");
+                M.d1 = std::make_unique<d1::Context>(*M.tk, f);
+            }
             M.image_tok = M.tk->id("<|image|>");
             M.video_tok = M.tk->id("<|video|>");
             M.vstart_tok = M.tk->id("<|vision_start|>");
@@ -1163,8 +1345,13 @@ int main(int argc, char** argv) {
             if (vl_mmproj.empty()) throw std::runtime_error("--vl-model needs --vl-mmproj");
             add_model(vl_alias, vl_model, vl_mmproj, std::min(vl_ctx, ctx));
         }
+        if (!d1_model.empty()) {
+            add_model(d1_alias, d1_model, d1_mmproj, d1_ctx);
+            if (!models.back().d1) throw std::runtime_error(d1_model + ": not a decision model (lfm3.decision.type)");
+        }
         bool any_vision = false, any_video = false;
         for (auto& M : models) {
+            if (M.d1) continue;  // the web UI chats; a decision model only answers /v1/systemone
             any_vision |= M.vision != nullptr;
             any_video |= M.video;
         }
@@ -1195,18 +1382,21 @@ int main(int argc, char** argv) {
             res.set_content(ApiServer::err_json(msg, "server_error").dump(), "application/json");
         });
         srv.Post("/v1/chat/completions", [&](const httplib::Request& q, httplib::Response& r) { api.handle(q, r, true); });
+        srv.Post("/v1/systemone", [&](const httplib::Request& q, httplib::Response& r) { api.handle_systemone(q, r); });
         srv.Post("/chat/completions", [&](const httplib::Request& q, httplib::Response& r) { api.handle(q, r, true); });
         srv.Post("/v1/completions", [&](const httplib::Request& q, httplib::Response& r) { api.handle(q, r, false); });
         srv.Post("/completions", [&](const httplib::Request& q, httplib::Response& r) { api.handle(q, r, false); });
         // With several models the web UI runs in llama-server's router mode (/props role "router"): it shows a model
         // picker and sends "model" with each request. Every model reports "loaded": the scheduler swaps on demand, so
         // the UI never has to load or unload anything.
-        const bool router = models.size() > 1;
+        int n_chat = 0;  // models the web UI can chat with (a decision model only answers /v1/systemone)
+        for (auto& M : models) n_chat += !M.d1;
+        const bool router = n_chat > 1;
         auto model_ctx = [&](const ModelSpec& M) { return M.ctx > 0 ? std::min(M.ctx, sched.max_ctx()) : sched.max_ctx(); };
         auto list_models = [&](const httplib::Request&, httplib::Response& r) {
             json data = json::array();
             for (auto& M : models)
-                data.push_back({{"id", M.id}, {"object", "model"}, {"created", 0}, {"owned_by", "liquid-engine"},
+                if (!M.d1) data.push_back({{"id", M.id}, {"object", "model"}, {"created", 0}, {"owned_by", "liquid-engine"},
                                 {"status", {{"value", "loaded"}}},
                                 {"meta", {{"n_ctx", model_ctx(M)}, {"n_slots", slots}, {"vision", M.vision != nullptr}, {"video", M.video}}}});
             r.set_content(json({{"object", "list"}, {"data", data}}).dump(), "application/json");

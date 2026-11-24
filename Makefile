@@ -8,10 +8,10 @@ NVFLAGS  := -O3 -std=c++17 -arch=$(ARCH) --use_fast_math -Xcompiler "-O3 -march=
 
 BUILD := build
 CORE  := $(BUILD)/engine.o $(BUILD)/tokenizer.o $(BUILD)/vision.o $(BUILD)/image.o $(BUILD)/video.o
-SERVER_OBJS := $(BUILD)/server.o $(BUILD)/chat.o $(BUILD)/prompt_cache.o $(BUILD)/web_tools.o $(BUILD)/httplib.o
+SERVER_OBJS := $(BUILD)/server.o $(BUILD)/chat.o $(BUILD)/prompt_cache.o $(BUILD)/web_tools.o $(BUILD)/httplib.o $(BUILD)/decision.o
 
 all: $(BUILD)/liquid $(BUILD)/liquid-server
-tests: $(BUILD)/test_engine_api $(BUILD)/test_chat $(BUILD)/test_vision $(BUILD)/test_video
+tests: $(BUILD)/test_engine_api $(BUILD)/test_chat $(BUILD)/test_vision $(BUILD)/test_video $(BUILD)/test_decide
 
 $(BUILD):
 	mkdir -p $(BUILD)
@@ -34,7 +34,10 @@ $(BUILD)/tokenizer.o: src/tokenizer.cpp src/tokenizer.h src/unicode_data.h src/g
 $(BUILD)/main.o: src/main.cpp src/engine.h src/tokenizer.h src/gguf.h src/vision.h | $(BUILD)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(BUILD)/server.o: src/server.cpp src/engine.h src/tokenizer.h src/chat.h src/prompt_cache.h src/web_tools.h src/vision.h | $(BUILD)
+$(BUILD)/server.o: src/server.cpp src/engine.h src/tokenizer.h src/chat.h src/prompt_cache.h src/web_tools.h src/vision.h src/video.h src/decision.h | $(BUILD)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD)/decision.o: src/decision.cpp src/decision.h src/tokenizer.h src/gguf.h | $(BUILD)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(BUILD)/chat.o: src/chat.cpp src/chat.h | $(BUILD)
@@ -62,6 +65,10 @@ $(BUILD)/test_engine_api: tests/test_engine_api.cpp $(CORE)
 $(BUILD)/test_vision: tests/test_vision.cpp $(CORE)
 	$(CXX) $(CXXFLAGS) -c $< -o $(BUILD)/test_vision.o
 	$(NVCC) -arch=$(ARCH) $(BUILD)/test_vision.o $(CORE) -o $@ -lcudart
+
+$(BUILD)/test_decide: tests/test_decide.cpp $(CORE)
+	$(CXX) $(CXXFLAGS) -c $< -o $(BUILD)/test_decide.o
+	$(NVCC) -arch=$(ARCH) $(BUILD)/test_decide.o $(CORE) -o $@ -lcudart
 
 $(BUILD)/test_video: tests/test_video.cpp $(CORE)
 	$(CXX) $(CXXFLAGS) -c $< -o $(BUILD)/test_video.o

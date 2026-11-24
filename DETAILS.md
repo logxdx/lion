@@ -267,6 +267,52 @@ two frames moves the result 13x further from llama.cpp's (rel L2 0.60 vs 0.046),
 Tests: `tests/test_video.cpp`, `tests/test_video_server.py` (web UI and data-URL formats, follow-up reuse, 400 for
 a non-video; also runs against llama-server for parity).
 
+## Decisions: d1-2B (`/v1/systemone`)
+
+`serve.sh` adds LiquidAI's d1-2B decision model when `~/models/d1-2b` has it (`--d1-model`, `--d1-mmproj`,
+`--d1-alias` default `d1`, `--d1-ctx` default 8192 tokens per forward pass; Q8_0 by default, Q6_K works too). It is
+swapped onto the GPU like the VL model and answers llama.cpp's `POST /v1/systemone` (it does not chat: chat requests
+naming it get llama.cpp's 501, and the web UI does not list it):
+
+```sh
+curl localhost:11434/v1/systemone -d '{"state": "I bought a kettle last week, it broke, I want my money back.",
+  "questions": {"refund": {"type": "noul", "instructions": "Is the customer asking for a refund?"},
+                "team": {"type": "choice", "instructions": "Which team?", "criteria": {"billing": "Payments", "tech": "Repairs"}},
+                "urgency": {"type": "score", "instructions": "How urgent?", "criteria": ["low", "medium", "high"]}}}'
+# {"model":"d1","answers":{"refund":{"type":"noul","noul":0.996},"team":{"type":"choice","choice":"billing",
+#  "probabilities":{...},"confidence":0.8},"urgency":{"type":"score","score":1.0,"legend":{...},...}},"usage":{...}}
+```
+
+`state` is text, any JSON, chat messages (their image / video parts become media) or null; `files` / `images` take
+up to 8 `data:image/...` or `data:video/...` URLs. Request checks, error messages, the systemone template (the
+model's own, from the GGUF), the escaping of special-token text in user input (U+200B after the first character),
+Python-style `tojson`, label tokens (yes/Yes vs no/No/NO, option codes A.. or the keys, digits), the temperature
+(`lfm3.decision.temperature.*`, read through `%f` as llama.cpp does), median scores and the response format follow
+llama.cpp (`src/decision.cpp`).
+
+**One forward pass for up to 16 questions** (`Engine::decide`): the shared prefix (media, state, `QUESTION:`) once,
+then each question's text (later ones after another `QUESTION:\n` when there is a state). d1 is LFM3 with
+`attention.causal = false`: the 6 global attention layers attend both ways, except that a question's tokens do not
+see the other questions (prefix tokens see everything); the 5 sliding-window layers and the short convs stay causal
+over the whole packed sequence. That rule was measured against llama.cpp b12674, not taken from source: a prefix
+that sees only itself gives P(yes) 0.9835 instead of 0.9961, and packed choice probabilities .67/.31 instead of
+.80/.20; the rule above matches both. The whole pass is one prefill chunk (the decision engine sizes its chunk to
+`--d1-ctx`); global layers use the flash prefill kernel with a group mask (`k_flash_prefill<Q8, true>`, key tiles
+outside the prefix and the tile's own questions are skipped), the logits of the questions' last tokens come from one
+GEMM over the tied embeddings. The text model's kernels are untouched: the group mask is a template branch
+(A/B against the previous binary: pp512 / pp4096 / pp16384 / decode within run-to-run noise).
+
+| measured (RTX 4050) | |
+|---|---|
+| parity vs llama-server b12674, 15 requests (packed, single, null state, JSON + special tokens + unicode, chat state, 21 questions = 2 passes, image, video, 7 error cases) | identical token counts, answers, legends, key order, error messages; probabilities within 0.015 (Q8_0) / 0.010 (Q6_K) |
+| request latency, Q6_K, ours vs llama-server: 3 questions / 16 questions / 1.3k-token state / image + 3 questions | 21.0 / 49.6 / 163 / 86 ms vs 22.7 / 46.8 / 169 / 84 ms |
+| the forward pass itself | the engine's prefill speed (361 tokens: 52 ms on Q6_K, the same as a causal prefill); Q8_0 prefills ~20% faster than Q6_K here |
+| swap to d1 | ~0.5 s; text / d1 / VL rounds: same VRAM every round (4599 / 2849 / 3955 MiB) |
+
+Tests: `tests/test_d1_server.py URL --save ref.json` against llama-server, then `--ref ref.json` against
+liquid-server; `tests/test_decide.cpp` runs `Engine::decide` on hand-made packed prompts (`LIQUID_DECIDE_PROF=1`
+times its phases).
+
 ## Design
 
 **Weights** are repacked on the GPU at load time (lossless, bit-identical values):

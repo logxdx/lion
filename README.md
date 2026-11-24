@@ -14,6 +14,8 @@ and images and video through LFM3-VL-2B, swapped onto the GPU when a request has
 - q8 KV cache, prompt cache in RAM and on disk, tool calls and reasoning in the API
 - Images: own CUDA vision encoder (matches llama.cpp, ~20 ms for a 640x480 photo); text and VL models swap in ~0.4 s
 - Video: 2 fps frame pairs, same frames and prompt layout as llama.cpp (needs `ffmpeg` + `ffprobe` on the PATH)
+- Decisions: d1-2B answers yes/no, multiple-choice and score questions about text, JSON, images or video at
+  `POST /v1/systemone` (llama.cpp's API, same answers), ~20 ms for a few questions
 - Web UI: pick `lfm3` or `lfm3-vl`, attach images or videos; replies can show images and links from the web
 
 ## Run

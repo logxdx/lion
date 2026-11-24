@@ -984,6 +984,9 @@ Engine::Engine(const std::string& path, int max_ctx, bool verbose, bool exact, b
         if (cfg_.head_kv[il] != 0 && cfg_.head_kv[il] != 4) throw std::runtime_error("unexpected n_head_kv");
     if (f.tp("output.weight")) throw std::runtime_error("untied output.weight not supported");
     if (max_ctx_ % 128) max_ctx_ = (max_ctx_ + 127) / 128 * 128;
+    decision_ = f.has("lfm3.attention.causal") && f.u("lfm3.attention.causal") == 0;
+    if (decision_ && n_slots_ != 1) throw std::runtime_error("a decision model runs one sequence");
+    pf_tmax_ = decision_ ? max_ctx_ : PF_TMAX;
 
     CK(cudaStreamCreateWithFlags(&st_, cudaStreamNonBlocking));
     load(f);
@@ -1016,7 +1019,14 @@ Engine::Engine(const std::string& path, int max_ctx, bool verbose, bool exact, b
     CK(cudaMemset(b.slots, 0, MAX_SLOTS * 4));
     CK(cudaMallocHost(&b.h_snap, SNAP_RING * MAX_SLOTS * CTRL_N * 4));
     CK(cudaMallocHost(&b.h_stage, STAGE_RING * 16 * 4));
-    prefill_alloc(b.pf, cfg_, max_ctx_, [this](size_t n) { return alloc(n); });
+    prefill_alloc(b.pf, cfg_, pf_tmax_, [this](size_t n) { return alloc(n); });
+    if (decision_) {
+        d_grp_ = (int*)alloc((size_t)max_ctx_ * 4);
+        d_gspan_ = (int*)alloc((size_t)2 * (max_ctx_ + 1) * 4);
+        d_hq_ = (int8_t*)alloc((size_t)MAX_DECIDE * E);
+        d_hd_ = (float*)alloc((size_t)MAX_DECIDE * E / 32 * 4);
+        d_logits_ = (float*)alloc((size_t)MAX_DECIDE * V * 4);
+    }
     reset();
     if (getenv("LIQUID_OCC")) {
         int o16 = 0, o8 = 0;
@@ -1107,7 +1117,7 @@ void Engine::load(const gguf::File& f) {
             l.q_norm = upload_f32(f, p + "attn_q_norm.weight");
             l.k_norm = upload_f32(f, p + "attn_k_norm.weight");
             l.rope_ff = l.swa ? nullptr : rope_ff;
-            l.cap = l.swa ? cfg_.swa_window + PF_TMAX : max_ctx_;  // SWA ring holds window + one prefill chunk
+            l.cap = l.swa ? cfg_.swa_window + pf_tmax_ : max_ctx_;  // SWA ring holds window + one prefill chunk
             const size_t eb = kv_q8_ ? 1 : 2;
             l.kv_slot_bytes = (size_t)4 * l.cap * 128 * eb;
             l.kc = alloc(n_slots_ * l.kv_slot_bytes);
@@ -1543,10 +1553,10 @@ std::vector<float> Engine::logits() {
 void Engine::prefill_batched(int slot, const int* tokens, int n, const float* emb, bool emb_host) {
     auto& b = *B_;
     auto& p = b.pf;
-    const float eps = cfg_.eps;
     int* hist = b.hist + (size_t)slot * max_ctx_;
-    for (int off = 0; off < n; off += PF_TMAX) {
-        const int T = std::min(PF_TMAX, n - off);
+    if (decision_) throw std::runtime_error("a decision model only runs decide()");
+    for (int off = 0; off < n; off += pf_tmax_) {
+        const int T = std::min(pf_tmax_, n - off);
         const int p0 = n_past_[slot] + off;
         memcpy(p.h_toks, tokens + off, T * 4);
         CK(cudaMemcpyAsync(p.toks, p.h_toks, T * 4, cudaMemcpyHostToDevice, st_));
@@ -1559,6 +1569,19 @@ void Engine::prefill_batched(int slot, const int* tokens, int n, const float* em
             k_embed_batch<<<T, 256, 0, st_>>>(emb_, p.toks, p0, hist, p.X);
         }
         prof_mark("embed", st_);
+        run_layers(slot, T, p0, nullptr, nullptr);
+        CK(cudaGetLastError());
+        CK(cudaStreamSynchronize(st_));
+    }
+}
+
+// the layers over T tokens in p.X (positions p0..), residual stream left in p.X + the last FFN output in p.F.
+// grp/gspan (device): decision-model group mask for the global attention layers (see decide()).
+void Engine::run_layers(int slot, int T, int p0, const int* grp, const int* gspan, bool prefix_all) {
+    auto& b = *B_;
+    auto& p = b.pf;
+    const float eps = cfg_.eps;
+    {
         const float* prevF = nullptr;
         const float* prev_post = nullptr;
         for (int il = 0; il < cfg_.n_layer; il++) {
@@ -1588,12 +1611,21 @@ void Engine::prefill_batched(int slot, const int* tokens, int n, const float* em
                     if (!fa_init) {
                         CK(cudaFuncSetAttribute(k_flash_prefill<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)FA_SMEM));
                         CK(cudaFuncSetAttribute(k_flash_prefill<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)FA_SMEM));
+                        CK(cudaFuncSetAttribute(k_flash_prefill<true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)FA_SMEM));
+                        CK(cudaFuncSetAttribute(k_flash_prefill<false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)FA_SMEM));
                         fa_init = true;
                     }
                     const dim3 fg((T + FA_BQ - 1) / FA_BQ, 4);
                     const int W = l.swa ? cfg_.swa_window : 0;
-                    if (kv_q8_) k_flash_prefill<true><<<fg, 256, FA_SMEM, st_>>>(p.qh, p.big, kc, vc, ks, vs, l.cap, W, p0, T, p.yq, p.yd);
-                    else k_flash_prefill<false><<<fg, 256, FA_SMEM, st_>>>(p.qh, p.big, kc, vc, ks, vs, l.cap, W, p0, T, p.yq, p.yd);
+                    if (grp && !l.swa) {  // decision model, global layer: group mask, no causal mask
+                        const int2* gs = (const int2*)gspan;
+                        if (kv_q8_) k_flash_prefill<true, true><<<fg, 256, FA_SMEM, st_>>>(p.qh, p.big, kc, vc, ks, vs, l.cap, 0, p0, T, p.yq, p.yd, grp, gs, prefix_all);
+                        else k_flash_prefill<false, true><<<fg, 256, FA_SMEM, st_>>>(p.qh, p.big, kc, vc, ks, vs, l.cap, 0, p0, T, p.yq, p.yd, grp, gs, prefix_all);
+                    } else if (kv_q8_) {
+                        k_flash_prefill<true><<<fg, 256, FA_SMEM, st_>>>(p.qh, p.big, kc, vc, ks, vs, l.cap, W, p0, T, p.yq, p.yd);
+                    } else {
+                        k_flash_prefill<false><<<fg, 256, FA_SMEM, st_>>>(p.qh, p.big, kc, vc, ks, vs, l.cap, W, p0, T, p.yq, p.yd);
+                    }
                 }
                 {
                     // useful FLOPs: visible (query, key) pairs x 16 heads x 128 dims x (QK + PV) x 2
@@ -1620,9 +1652,85 @@ void Engine::prefill_batched(int slot, const int* tokens, int n, const float* em
             prevF = p.F;
             prev_post = l.post_ffn_norm;
         }
-        CK(cudaGetLastError());
-        CK(cudaStreamSynchronize(st_));
     }
+}
+
+std::vector<float> Engine::decide(const std::vector<int>& tokens, const std::vector<int>& group, const float* emb,
+                                  const std::vector<int>& out_pos) {
+    if (!decision_) throw std::runtime_error("decide() needs a decision model");
+    const int n = (int)tokens.size(), nq = (int)out_pos.size(), E = cfg_.n_embd, V = cfg_.n_vocab;
+    if (n == 0 || (int)group.size() != n) throw std::runtime_error("decide(): tokens and groups differ in size");
+    if (n > pf_tmax_)
+        throw std::runtime_error("decision prompt of " + std::to_string(n) + " tokens does not fit the context (" +
+                                 std::to_string(pf_tmax_) + ")");
+    if (nq < 1 || nq > MAX_DECIDE) throw std::runtime_error("decide(): 1.." + std::to_string(MAX_DECIDE) + " output rows");
+    // group spans; groups must be contiguous and in order, starting with the prefix (group 0)
+    std::vector<int> span(2, 0);
+    if (group[0] != 0) throw std::runtime_error("decide(): the prompt must start with the shared prefix (group 0)");
+    for (int i = 0; i < n; i++) {
+        const int g = group[i];
+        if (i > 0 && g != group[i - 1]) {
+            if (g != group[i - 1] + 1) throw std::runtime_error("decide(): groups must be contiguous and increasing");
+            span.push_back(i);
+            span.push_back(i);
+        }
+        span[2 * g + 1] = i + 1;
+    }
+    for (int q : out_pos)
+        if (q < 0 || q >= n) throw std::runtime_error("decide(): output position out of range");
+    auto& b = *B_;
+    auto& p = b.pf;
+    // LIQUID_DECIDE_PROF=1: time the phases (stderr)
+    static const bool prof = getenv("LIQUID_DECIDE_PROF") != nullptr;
+    cudaEvent_t ev[6];
+    if (prof) for (auto& e : ev) cudaEventCreate(&e);
+    auto mark = [&](int i) { if (prof) cudaEventRecord(ev[i], st_); };
+    reset(0);
+    mark(0);
+    // token rows (image positions look up token 0, then get their embeddings)
+    for (int i = 0; i < n; i++) p.h_toks[i] = tokens[i] >= 0 ? tokens[i] : 0;
+    CK(cudaMemcpyAsync(p.toks, p.h_toks, (size_t)n * 4, cudaMemcpyHostToDevice, st_));
+    k_embed_batch<<<n, 256, 0, st_>>>(emb_, p.toks, 0, b.hist, p.X);
+    size_t e = 0;
+    for (int i = 0; i < n;) {
+        if (tokens[i] >= 0) { i++; continue; }
+        int j = i;
+        while (j < n && tokens[j] < 0) j++;
+        if (!emb) throw std::runtime_error("decide(): embedding positions without embeddings");
+        CK(cudaMemcpyAsync(p.X + (size_t)i * E, emb + e * E, (size_t)(j - i) * E * 4, cudaMemcpyHostToDevice, st_));
+        e += j - i;
+        i = j;
+    }
+    CK(cudaMemcpyAsync(d_grp_, group.data(), (size_t)n * 4, cudaMemcpyHostToDevice, st_));
+    CK(cudaMemcpyAsync(d_gspan_, span.data(), span.size() * 4, cudaMemcpyHostToDevice, st_));
+    mark(1);
+    run_layers(0, n, 0, d_grp_, d_gspan_, true);
+    mark(2);
+    // the decode head on the output rows: x + postnorm(last ffn out) -> output norm -> int8 -> tied embeddings
+    k_prep<<<n, 256, 0, st_>>>(p.X, p.F, L_.back().post_ffn_norm, out_norm_, cfg_.eps, p.xq, p.xd);
+    for (int k = 0; k < nq; k++) {
+        CK(cudaMemcpyAsync(d_hq_ + (size_t)k * E, p.xq + (size_t)out_pos[k] * E, E, cudaMemcpyDeviceToDevice, st_));
+        CK(cudaMemcpyAsync(d_hd_ + (size_t)k * E / 32, p.xd + (size_t)out_pos[k] * E / 32, E / 32 * 4,
+                           cudaMemcpyDeviceToDevice, st_));
+    }
+    GemmArgs gh{};
+    gh.A = d_hq_; gh.Ad = d_hd_; gh.T = nq; gh.w = emb_; gh.out = d_logits_;
+    launch_gemm<2048, GE_STORE>(gh, st_);
+    mark(3);
+    std::vector<float> out((size_t)nq * V);
+    CK(cudaMemcpyAsync(out.data(), d_logits_, out.size() * 4, cudaMemcpyDeviceToHost, st_));
+    mark(4);
+    CK(cudaGetLastError());
+    CK(cudaStreamSynchronize(st_));
+    if (prof) {
+        float t[4];
+        for (int i = 0; i < 4; i++) cudaEventElapsedTime(&t[i], ev[i], ev[i + 1]);
+        fprintf(stderr, "[decide] %d tokens, %d rows: embed %.2f  layers %.2f  head %.2f  logits copy %.2f ms\n", n, nq,
+                t[0], t[1], t[2], t[3]);
+        for (auto& e : ev) cudaEventDestroy(e);
+    }
+    reset(0);
+    return out;
 }
 
 // ================================================================================================

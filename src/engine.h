@@ -121,6 +121,18 @@ public:
     // (negative ids, used by the server for image positions, are recorded as image_hist_token)
     void write_history(int slot, int p0, const int* tokens, int n);
     int image_hist_token = 0;
+
+    // ---- decision models (lfm3-d1: GGUF lfm3.attention.causal = false) ----
+    bool decision() const { return decision_; }
+    // One forward pass over a packed prompt in slot 0 (its state is reset first; nothing is kept), the whole prompt
+    // as one chunk (at most max_ctx() tokens). group[i]: 0 = shared prefix, k >= 1 = question k (each contiguous,
+    // increasing). Global attention layers attend both ways, except that a question's tokens do not see the other
+    // questions (prefix tokens see everything); sliding-window layers and short convs stay causal over the whole
+    // sequence. This is llama.cpp b12674's packed-question attention (measured against its /v1/systemone). emb: host rows [n][n_embd] for the positions with tokens[i] < 0, in order. Returns the
+    // logits at out_pos, [out_pos.size()][n_vocab] (at most MAX_DECIDE rows).
+    static constexpr int MAX_DECIDE = 16;
+    std::vector<float> decide(const std::vector<int>& tokens, const std::vector<int>& group, const float* emb,
+                              const std::vector<int>& out_pos);
     void sync();
     // per-kernel timing of eager decode steps (stderr)
     void profile_decode(int steps);
@@ -135,6 +147,14 @@ private:
     bool ctrl_dirty_[MAX_SLOTS] = {};  // host n_past/pending changed: upload before the next decode step
     std::vector<int> cur_slots_;       // slot table currently on the device
     bool kv_q8_ = false;
+    bool decision_ = false;           // non-causal decision model (decide() only)
+    int pf_tmax_ = 1024;              // tokens per prefill chunk (decision: max_ctx_)
+    int* d_grp_ = nullptr;            // decide(): group per position, group spans, question rows, logits
+    int* d_gspan_ = nullptr;
+    int8_t* d_hq_ = nullptr;
+    float* d_hd_ = nullptr;
+    float* d_logits_ = nullptr;
+    void run_layers(int slot, int T, int p0, const int* grp, const int* gspan, bool prefix_all = false);
     std::vector<Layer> L_;
     QWeight emb_;                 // token_embd == output (tied)
     float* out_norm_ = nullptr;

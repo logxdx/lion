@@ -10,7 +10,7 @@
 
 namespace le {
 
-constexpr int PF_TMAX = 1024;  // tokens per prefill chunk
+constexpr int PF_TMAX = 1024;  // tokens per prefill chunk (decision models: the whole prompt, one pass)
 
 struct PrefillBufs {
     float *X = nullptr, *O = nullptr, *F = nullptr, *big = nullptr;  // [T][E] x3, [T][6144]
@@ -22,8 +22,8 @@ struct PrefillBufs {
 };
 
 template <class Alloc>
-inline void prefill_alloc(PrefillBufs& p, const Config& c, int, Alloc alloc) {
-    const size_t T = PF_TMAX, E = c.n_embd, F = c.n_ff;
+inline void prefill_alloc(PrefillBufs& p, const Config& c, int tmax, Alloc alloc) {
+    const size_t T = tmax, E = c.n_embd, F = c.n_ff;
     p.X = (float*)alloc(T * E * 4); p.O = (float*)alloc(T * E * 4); p.F = (float*)alloc(T * E * 4);
     p.big = (float*)alloc(T * 6144 * 4);
     p.xq = (int8_t*)alloc(T * E); p.yq = (int8_t*)alloc(T * E); p.aq = (int8_t*)alloc(T * F);
@@ -207,10 +207,14 @@ __device__ __forceinline__ void fa_store_q8_chunk(half* T_, int r, int c16, int4
     *(uint4*)(T_ + r * 128 + ((c1 & 8) | ((c1 ^ r) & 7)) * 8) = make_uint4(hv[4], hv[5], hv[6], hv[7]);
 }
 
-template <bool Q8>
+// G (decision models, one pass from position 0): no causal mask; a query sees the keys of the shared prefix
+// (group 0) and of its own group, and with prefix_all a prefix query sees every key. grp[pos] = group,
+// gspan[g] = [start, end) of group g (contiguous, increasing).
+template <bool Q8, bool G = false>
 __global__ void __launch_bounds__(256) k_flash_prefill(const half* qh, const float* qkvg, const void* kc, const void* vc,
                                                        const half* ks, const half* vs, int cap, int window, int p0,
-                                                       int T, int8_t* oq, float* od) {
+                                                       int T, int8_t* oq, float* od, const int* grp = nullptr,
+                                                       const int2* gspan = nullptr, bool prefix_all = false) {
     extern __shared__ __align__(128) uint8_t fa_dyn[];
     half* const KsB = (half*)fa_dyn;          // [2][FA_BK*128]
     half* const VsB = KsB + 2 * FA_BK * 128;  // [2][FA_BK*128]
@@ -220,7 +224,30 @@ __global__ void __launch_bounds__(256) k_flash_prefill(const half* qh, const flo
     const int t0 = blockIdx.x * FA_BQ + (warp >> 2) * 16;  // first token (chunk-relative) of this warp
     const int qp_first = p0 + blockIdx.x * FA_BQ;
     const int qp_last = p0 + min(T, (blockIdx.x + 1) * FA_BQ) - 1;
-    const int k_lo = window ? max(0, qp_first - window + 1) : 0;
+    // keys [k_lo, k_end); G: the prefix, then (after skipping the gap [gap_lo, gap_hi)) the tile's own groups
+    int k_lo, k_end, gap_lo = 0, gap_hi = 0;
+    if constexpr (G) {
+        const int gf = grp[qp_first], gl = grp[qp_last];
+        k_lo = 0;
+        k_end = gspan[0].y;
+        if (prefix_all && gf == 0) {  // prefix queries see every key
+            k_end = T;
+        } else if (gl > 0) {
+            gap_lo = k_end;
+            gap_hi = gspan[max(gf, 1)].x;
+            k_end = gspan[gl].y;
+        }
+    } else {
+        k_lo = window ? max(0, qp_first - window + 1) : 0;
+        k_end = qp_last + 1;
+    }
+    auto next_kb = [&](int kb_) {
+        int nk = kb_ + FA_BK;
+        if constexpr (G) {
+            if (nk >= gap_lo && nk < gap_hi) nk = gap_hi;
+        }
+        return nk;
+    };
 
     // Q fragments (16 tokens x 128 dims) straight from global
     uint32_t qa[8][4];
@@ -252,7 +279,7 @@ __global__ void __launch_bounds__(256) k_flash_prefill(const half* qh, const flo
         for (int i = threadIdx.x; i < FA_BK * 16; i += 256) {
             const int r = i >> 4, c = i & 15;
             const int kp = kb_ + r;
-            const bool ok = kp <= qp_last;
+            const bool ok = kp < k_end;
             const size_t off = (size_t)((ok ? kp : kb_) % cap) * 128 + c * 8;
             const int sc = (c & 8) | ((c ^ r) & 7);
             cp_async16(Kd + r * 128 + sc * 8, kbase + off, ok);
@@ -267,7 +294,7 @@ __global__ void __launch_bounds__(256) k_flash_prefill(const half* qh, const flo
         for (int it = 0; it < 2; it++) {
             const int i = threadIdx.x + it * 256, r = i >> 3, c16 = i & 7;
             const int kp = kb_ + r;
-            const bool ok = kp <= qp_last;
+            const bool ok = kp < k_end;
             const size_t row = (size_t)kvh * cap + (ok ? kp : kb_) % cap;
 #pragma unroll
             for (int kv = 0; kv < 2; kv++) {
@@ -288,15 +315,21 @@ __global__ void __launch_bounds__(256) k_flash_prefill(const half* qh, const flo
     if constexpr (Q8) { fetch_q8(k_lo); store_q8(0); }
     else issue_f16(k_lo, 0);
 
+    int ga = 0, gb = 0;  // G: groups of this thread's two query rows
+    if constexpr (G) {
+        ga = grp[min(qpa, qp_last)];
+        gb = grp[min(qpb, qp_last)];
+    }
     int iter = 0;
-    for (int kb = k_lo; kb <= qp_last; kb += FA_BK, iter++) {
+    for (int kb = k_lo; kb < k_end; kb = next_kb(kb), iter++) {
         const int cur = iter & 1;
-        const bool has_next = kb + FA_BK <= qp_last;
+        const int kb_next = next_kb(kb);
+        const bool has_next = kb_next < k_end;
         __syncthreads();  // all warps are done with buffer cur^1 (computed last iteration)
         if constexpr (Q8) {
-            if (has_next) fetch_q8(kb + FA_BK);  // global loads overlap this tile's math; stored after it
+            if (has_next) fetch_q8(kb_next);  // global loads overlap this tile's math; stored after it
         } else {
-            if (has_next) issue_f16(kb + FA_BK, cur ^ 1);
+            if (has_next) issue_f16(kb_next, cur ^ 1);
             else cp_commit();  // keep the group count uniform
             cp_wait<1>();
             __syncthreads();  // tile `cur` landed for everyone
@@ -331,8 +364,15 @@ __global__ void __launch_bounds__(256) k_flash_prefill(const half* qh, const flo
 #pragma unroll
             for (int e = 0; e < 2; e++) {
                 const int kp = kb + nt * 8 + tig * 2 + e;
-                const bool va = kp <= qpa && (!window || qpa - kp < window);
-                const bool vb = kp <= qpb && (!window || qpb - kp < window);
+                bool va, vb;
+                if constexpr (G) {
+                    const int gk = kp < k_end ? grp[kp] : -1;
+                    va = gk == 0 || (gk > 0 && (gk == ga || (prefix_all && ga == 0)));
+                    vb = gk == 0 || (gk > 0 && (gk == gb || (prefix_all && gb == 0)));
+                } else {
+                    va = kp <= qpa && (!window || qpa - kp < window);
+                    vb = kp <= qpb && (!window || qpb - kp < window);
+                }
                 s[nt][e] = va ? s[nt][e] * LOG2E : -INFINITY;
                 s[nt][2 + e] = vb ? s[nt][2 + e] * LOG2E : -INFINITY;
                 mxa = fmaxf(mxa, s[nt][e]);
