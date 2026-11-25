@@ -44,6 +44,15 @@ Synthetic caches (`--bench --slots N --depth D`):
 
 6 × 150k fits in VRAM with both quantizations.
 
+After the split mHC for small batches (`1d2664e`, `--steps 400`, Q6_K), measured against the previous build in
+alternating runs:
+
+- 4 × 128k: 16.53 ms per step, 60.5 tok/s per stream (was 16.80 ms);
+- 4 × 1k: 8.45 ms (was 8.72 ms);
+- 1 × 1k: 7.26 ms (was 7.55 ms).
+
+Short `--steps` runs can include a slow phase of the GPU, so use ≥ 400 steps for A/B.
+
 ### Prefill, one stream
 
 `build/raon -m M --bench --prefill N`, 1 slot. The chunk size is chosen automatically from free VRAM: 4,096 rows here,
@@ -229,7 +238,7 @@ Environment knobs:
 
 - `RAON_PROFILE=1`: per-kernel-group timing; it also names the group in which a CUDA error surfaces.
 - `RAON_CHUNK`: overrides the prefill chunk size.
-- A/B switches: `RAON_NOGRAPH`, `RAON_NOGEMM`, `RAON_NOFA`, `RAON_FA16`, `RAON_EXPAND16`, `RAON_PV16`, `RAON_NSPLIT`.
+- A/B switches: `RAON_NOGRAPH`, `RAON_NOGEMM`, `RAON_NOFA`, `RAON_FA16`, `RAON_EXPAND16`, `RAON_PV16`, `RAON_MHC_SPLIT`, `RAON_NSPLIT`.
 - Debugging: `RAON_DUMP`, `RAON_PERTURB`.
 
 Compile switches: `ATTN_PV_F32ACC`, `FA_PV_F32ACC`, `KV_ROWSCALE`.

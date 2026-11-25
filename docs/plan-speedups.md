@@ -1,6 +1,6 @@
 # raon-engine: plan for further speed-ups
 
-Status: 2026-11-25, after `0d8b5f6`.
+Status: 2026-11-25, after `1d2664e`.
 
 Done:
 
@@ -105,7 +105,29 @@ The original plan follows.
 
 **Effort:** medium.
 
-### 5. Delta-rule scan on tensor cores (chunked form)
+### 5. Delta-rule scan on tensor cores (chunked form): INVESTIGATED, not implemented
+
+**Measured:**
+
+- **Compute-bound, not latency-bound.** The prefill scan is ~30 ms per 4,096-row chunk (18 layers, Q6_K). That is ~47 %
+  of the FP32 peak for its 65k multiply-adds per token and head; the floor at peak is ≥ 14 ms.
+- **A barrier-free warp-shuffle rewrite** (`k_rda_scan2`, a warp owning 8 columns, reduce-scatter) ran at the same
+  speed: 30.1 vs 30.5 ms.
+- **Staging 8 tokens of inputs in shared memory** made it slower: 45.7 vs 34.8 ms.
+- **Why it cannot go faster as written:** one sequence's recurrence only offers 256 warps of parallel work.
+
+**Ceiling for the chunked form:**
+
+- It moves the work to tensor cores at a similar FLOP count. The useful rate is f16 with f32 accumulation, ~2 × FP32
+  on this GeForce GPU (TF32 is no faster than FP32).
+- That is at best ~2 × the scan: about −3.5 % on short prefill, and about −1 % on a 128k prefill, where the scan is
+  ~2.5 %.
+- Precision risk: cumulative per-channel decays need 16-token sub-chunks in log space, and the state products run
+  in f16.
+
+`tests/scan_check.cu` checks `k_rda_scan` against an f64 reference (2.3e-7 relative).
+
+The original plan follows.
 
 **Basis:** the RDA scan plus conv/gates are ~12 % of short prefill. The scan is token-sequential per head: a 128×128
 state, updated with a rank-1 delta-rule step per token.
@@ -122,7 +144,33 @@ state after N tokens with the sequential scan.
 
 **Effort:** large; it is the hardest kernel here.
 
-### 6. Fewer, larger decode kernels
+### 6. Fewer, larger decode kernels: DONE where it pays (`1d2664e`)
+
+**Measured first:**
+
+- **A kernel boundary inside the decode graph costs ~0.4 µs.** 240 extra empty kernels add 0.1 ms, so fusing for
+  kernel count alone is worth ≤ 0.2 ms per step.
+- **Group costs at 4 × 1k** (graph-mode ablations):
+
+  | group | cost | why |
+  |---|---|---|
+  | scan | 0.63 ms | its fp32 state traffic at DRAM bandwidth |
+  | mHC | 0.50 ms | latency: one block per row read the whole 17 × 6144 selector matrix |
+  | k_b/v_b | 0.23 ms | at bandwidth |
+  | ssm_f_a/f_b | 0.13 ms | |
+  | everything else | ~0 | |
+
+**Done:** a split mHC for small batches (8 blocks per row, then a combine).
+
+**Result:**
+
+- 4 × 128k: 16.80 → 16.53 ms (−1.6 %);
+- 4 × 1k: 8.72 → 8.45 ms (−3.1 %);
+- 1 × 1k: 7.55 → 7.26 ms (−3.9 %).
+
+The rest of this item has ≤ 0.1 ms left.
+
+The original plan follows.
 
 **Basis:**
 - At 1 stream the step is 7.3 ms against a 5.9 ms weight-read floor.
