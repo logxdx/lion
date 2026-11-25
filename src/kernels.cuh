@@ -360,42 +360,52 @@ __global__ void k_rda_prep(const float* __restrict__ conv, const float* __restri
     gl[o] = lb * sigmoidf_(fb[o] + dt_b[h * D + j]);
     if (j == 0) beta[r * H + h] = b;
 }
-// gated delta rule, sequential over the rows of a segment. grid (nseg, H), block D=128; thread j owns column j of S.
+// gated delta rule, sequential over the rows of a segment. grid (nseg, H), block 256: column j of S is held by two
+// threads (j, half), each owning 64 of its 128 rows in registers; partial dot products meet in shared memory.
 // state layout per (slot, head): S[i][j] at i*D + j (i = key dim, j = value dim)
-__global__ void __launch_bounds__(128) k_rda_scan(const Seg* __restrict__ segs, const float* __restrict__ qn,
+__global__ void __launch_bounds__(256) k_rda_scan(const Seg* __restrict__ segs, const float* __restrict__ qn,
                                                   const float* __restrict__ kn, const float* __restrict__ vs,
                                                   const float* __restrict__ gl, const float* __restrict__ beta,
                                                   float* __restrict__ state, size_t state_slot_stride, int H,
                                                   float* __restrict__ out) {
-    constexpr int D = 128;
-    __shared__ float sq[D], sk[D], sg[D];
+    constexpr int D = 128, HR = D / 2;
+    __shared__ float sq[D], sk[D], sg[D], red[2][D];
     const Seg g = segs[blockIdx.x];
-    const int h = blockIdx.y, j = threadIdx.x, C = H * D;
+    const int h = blockIdx.y, j = threadIdx.x & (D - 1), half = threadIdx.x >> 7, C = H * D;
+    const int i0 = half * HR;
     float* S = state + (size_t)g.slot * state_slot_stride + (size_t)h * D * D;
-    float s[D];
+    float s[HR];
 #pragma unroll
-    for (int i = 0; i < D; i++) s[i] = S[i * D + j];
+    for (int i = 0; i < HR; i++) s[i] = S[(i0 + i) * D + j];
     const float scale = rsqrtf((float)D);
     for (int t = 0; t < g.n; t++) {
         const int r = g.row0 + t;
         const size_t o = (size_t)r * C + h * D;
         __syncthreads();
-        sq[j] = qn[o + j];
-        sk[j] = kn[o + j];
-        sg[j] = __expf(gl[o + j]);
+        if (half == 0) {
+            sq[j] = qn[o + j];
+            sk[j] = kn[o + j];
+        } else {
+            sg[j] = __expf(gl[o + j]);
+        }
         __syncthreads();
         const float v = vs[o + j], b = beta[r * H + h];
         float kv = 0.f;
 #pragma unroll
-        for (int i = 0; i < D; i++) { s[i] *= sg[i]; kv += s[i] * sk[i]; }
-        const float delta = b * (v - kv);
+        for (int i = 0; i < HR; i++) { s[i] *= sg[i0 + i]; kv += s[i] * sk[i0 + i]; }
+        red[half][j] = kv;
+        __syncthreads();
+        const float delta = b * (v - (red[0][j] + red[1][j]));
         float acc = 0.f;
 #pragma unroll
-        for (int i = 0; i < D; i++) { s[i] += sk[i] * delta; acc += s[i] * sq[i]; }
-        out[o + j] = acc * scale;
+        for (int i = 0; i < HR; i++) { s[i] += sk[i0 + i] * delta; acc += s[i] * sq[i0 + i]; }
+        __syncthreads();  // both halves have read red[.][j] before it is reused
+        red[half][j] = acc;
+        __syncthreads();
+        if (half == 0) out[o + j] = (red[0][j] + red[1][j]) * scale;
     }
 #pragma unroll
-    for (int i = 0; i < D; i++) S[i * D + j] = s[i];
+    for (int i = 0; i < HR; i++) S[(i0 + i) * D + j] = s[i];
 }
 // RMSNorm per head (w = ssm_norm) * sigmoid(output gate g2 = qkvg[3C + ...]). grid (R, H), block 128
 __global__ void k_rda_out(const float* __restrict__ o, const float* __restrict__ qkvg, int ldq, const float* __restrict__ w,

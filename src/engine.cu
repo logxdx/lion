@@ -186,7 +186,8 @@ void Engine::run_chunk(const Row* rows, int R) {
     const int nout = (int)sel.size();
     if (nout) CK(cudaMemcpy(w.sel, sel.data(), nout * 4, cudaMemcpyHostToDevice));
     // attention splits per row: ~60 blocks in total (3 waves at 1 block/SM), within the partials buffer
-    const int nsplit = std::max(1, std::min(60 / R, (int)w.opart_n / R));
+    static const int nsplit_env = getenv("RAON_NSPLIT") ? atoi(getenv("RAON_NSPLIT")) : 0;  // experiments
+    const int nsplit = std::max(1, std::min(nsplit_env ? nsplit_env : 60 / R, (int)w.opart_n / R));
 
     // decode batches (one row per slot, all with logits) replay a CUDA graph captured once per batch size; the
     // kernels read positions/tokens from device memory, so the graph is valid for every step and context length
@@ -254,7 +255,7 @@ void Engine::launch_chunk(int R, int nseg, int nout, int nsplit) {
             k_rda_prep<<<dim3(R, RH), D>>>(w.conv, w.fab, nfab, w.fb, Ly.dt_b, c.gate_lb, RH, D, c.dt_rank, w.qn, w.kn,
                                            w.vs, w.gl, w.beta);
             PROF("rda_conv+gates");
-            k_rda_scan<<<dim3(nseg, RH), D>>>(w.segs, w.qn, w.kn, w.vs, w.gl, w.beta, rst, rda_slot, RH, w.ro);
+            k_rda_scan<<<dim3(nseg, RH), 2 * D>>>(w.segs, w.qn, w.kn, w.vs, w.gl, w.beta, rst, rda_slot, RH, w.ro);
             PROF("rda_scan");
             k_rda_out<<<dim3(R, RH), D>>>(w.ro, w.big, 4 * C, Ly.ssm_norm, RH, c.eps, w.s);
             mm(Ly.rda_out, w.s, C, R, w.y, E, w.xq, w.xs);
