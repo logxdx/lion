@@ -17,8 +17,14 @@
 
 namespace raon {
 
+// KV cache scales: KV_ROWSCALE=1 (default): one scale for the 512 latent values and one for the 64 pe values of each
+// row; =0: q8_0 (one scale per 32, as llama.cpp)
+#ifndef KV_ROWSCALE
+#define KV_ROWSCALE 1
+#endif
 namespace attn {
-constexpr int H = 32, L = 576, RK = 512, NB = L / 32;  // heads, row length, latent rank, q8 blocks per row
+constexpr int H = 32, L = 576, RK = 512, NB = L / 32;  // heads, row length, latent rank, 32-blocks per row
+constexpr int KVS = KV_ROWSCALE ? 2 : NB;               // scales per cache row
 constexpr int KT = 32;                                  // keys per tile
 constexpr int LQ = L + 16;                              // int8 row pitch (bytes): ldmatrix conflict-free
 constexpr int VP = RK + 8;                              // f16 V row pitch (halfs)
@@ -26,9 +32,8 @@ constexpr int PP = KT + 8;                              // P row pitch (halfs)
 constexpr int THREADS = 256;
 struct Smem {
     int8_t q[H * LQ];
-    float qs[H * NB];
     int8_t k[2][KT * LQ];
-    half ks[2][KT * NB];
+    half ks[2][KT * KVS];
     half v[KT * VP];
     half p[H * PP];
     float pm[2][H], ps[2][H];
@@ -68,6 +73,13 @@ __device__ __forceinline__ void mma16816_h(uint32_t* c, uint32_t a0, uint32_t a1
 #ifndef ATTN_PV_F32ACC
 #define ATTN_PV_F32ACC 0  // f16 per-tile accumulation: ~10% faster at 6x150k; parity stays within the noise floor (=1: f32)
 #endif
+__device__ __forceinline__ void mma_s8_acc(int* c, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0,
+                                           uint32_t b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
 __device__ __forceinline__ void mma_s8(int* c, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0,
                                        uint32_t b1) {
     asm volatile(
@@ -103,6 +115,19 @@ __global__ void k_mla_cache_write_q8(const float* __restrict__ kv, const float* 
     for (int i = threadIdx.x; i < L; i += blockDim.x) v[i] = i < RK ? kr[i] * inv * w[i] : kr[i];
     __syncthreads();
     const size_t row = (size_t)rows[r].slot * slot_rows + rows[r].pos;
+#if KV_ROWSCALE
+    float m0 = 0.f, m1 = 0.f;
+    for (int i = threadIdx.x; i < L; i += blockDim.x) {
+        if (i < RK) m0 = fmaxf(m0, fabsf(v[i]));
+        else m1 = fmaxf(m1, fabsf(v[i]));
+    }
+    m0 = block_max(m0, red);
+    m1 = block_max(m1, red);
+    const float d0 = __half2float(__float2half(m0 / 127.f)), d1 = __half2float(__float2half(m1 / 127.f));
+    const float i0 = d0 > 0.f ? 1.f / d0 : 0.f, i1 = d1 > 0.f ? 1.f / d1 : 0.f;
+    for (int i = threadIdx.x; i < L; i += blockDim.x) cq[row * L + i] = (int8_t)roundf(v[i] * (i < RK ? i0 : i1));
+    if (threadIdx.x == 0) { cs[row * KVS] = __float2half(d0); cs[row * KVS + 1] = __float2half(d1); }
+#else
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     for (int b = warp; b < NB; b += blockDim.x >> 5) {
         const float x = v[b * 32 + lane];
@@ -111,13 +136,37 @@ __global__ void k_mla_cache_write_q8(const float* __restrict__ kv, const float* 
         cq[row * L + b * 32 + lane] = (int8_t)roundf(x * id);
         if (lane == 0) cs[row * NB + b] = __float2half(d);
     }
+#endif
 }
 
 // Q = [q_lat | q_pe] * scale, int8 per 32 + float scale: qi [R][H][576], qsc [R][H][18]. one warp per 32-block
+// threads to launch for k_mla_qprep
+inline int mla_qprep_threads(int R) { return KV_ROWSCALE ? R * attn::H * 32 : R * attn::H * attn::L; }
 __global__ void k_mla_qprep(const float* __restrict__ qlat, const float* __restrict__ q, int qk, float scale, int R,
                             int8_t* __restrict__ qi, float* __restrict__ qsc) {
     using namespace attn;
     const int gw = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+#if KV_ROWSCALE
+    // one warp per (row, head): scale for the 512 latent values, scale for the 64 pe values
+    if (gw >= R * H) return;
+    const int h = gw % H, r = gw / H;
+    const float* ql = qlat + ((size_t)r * H + h) * RK;
+    const float* qp = q + ((size_t)r * H + h) * qk + (qk - (L - RK));
+    float lv[16], pv[2], m0 = 0.f, m1 = 0.f;
+#pragma unroll
+    for (int i = 0; i < 16; i++) { lv[i] = ql[lane + 32 * i] * scale; m0 = fmaxf(m0, fabsf(lv[i])); }
+#pragma unroll
+    for (int i = 0; i < 2; i++) { pv[i] = qp[lane + 32 * i] * scale; m1 = fmaxf(m1, fabsf(pv[i])); }
+    m0 = warp_max(m0);
+    m1 = warp_max(m1);
+    const float d0 = m0 / 127.f, d1 = m1 / 127.f, i0 = d0 > 0.f ? 1.f / d0 : 0.f, i1 = d1 > 0.f ? 1.f / d1 : 0.f;
+    int8_t* out = qi + ((size_t)r * H + h) * L;
+#pragma unroll
+    for (int i = 0; i < 16; i++) out[lane + 32 * i] = (int8_t)roundf(lv[i] * i0);
+#pragma unroll
+    for (int i = 0; i < 2; i++) out[RK + lane + 32 * i] = (int8_t)roundf(pv[i] * i1);
+    if (lane == 0) { qsc[((size_t)r * H + h) * 2] = d0; qsc[((size_t)r * H + h) * 2 + 1] = d1; }
+#else
     if (gw >= R * H * NB) return;
     const int b = gw % NB, h = (gw / NB) % H, r = gw / (NB * H);
     const int i = b * 32 + lane;
@@ -127,6 +176,7 @@ __global__ void k_mla_qprep(const float* __restrict__ qlat, const float* __restr
     const float d = amax / 127.f, id = d > 0.f ? 1.f / d : 0.f;
     qi[((size_t)r * H + h) * L + i] = (int8_t)roundf(v * id);
     if (lane == 0) qsc[((size_t)r * H + h) * NB + b] = d;
+#endif
 }
 
 // One block = (row, split). Partial results: opart [R][nsplit][H][512] (unnormalised), ml [R][nsplit][H][2] (max, sum)
@@ -152,7 +202,7 @@ k_mla_decode(const int8_t* __restrict__ qi, const float* __restrict__ qsc, const
     }
     const size_t base = (size_t)rows[r].slot * slot_rows;
     const int8_t* Kq = cq + base * L;
-    const half* Ks = cs + base * NB;
+    const half* Ks = cs + base * KVS;
 
     // issue the cp.async copies of the tile starting at key t0 into stage st (zero-filled beyond k1)
     auto issue = [&](int t0, int st) {
@@ -165,10 +215,10 @@ k_mla_decode(const int8_t* __restrict__ qi, const float* __restrict__ qsc, const
                 const bool ok = gk < k1;
                 cp_async16(&S.k[st][key * LQ + col * 16], Kq + (size_t)(ok ? gk : t0) * L + col * 16, ok);
             }
-            for (int wd = tid; wd < KT * NB / 2; wd += THREADS) {  // 9 words of scales per key
-                const int key = wd / (NB / 2), wi = wd % (NB / 2), gk = t0 + key;
+            for (int wd = tid; wd < KT * KVS / 2; wd += THREADS) {  // KVS/2 words of scales per key
+                const int key = wd / (KVS / 2), wi = wd % (KVS / 2), gk = t0 + key;
                 const bool ok = gk < k1;
-                cp_async4((char*)&S.ks[st][key * NB] + wi * 4, (const char*)(Ks + (size_t)(ok ? gk : t0) * NB) + wi * 4,
+                cp_async4((char*)&S.ks[st][key * KVS] + wi * 4, (const char*)(Ks + (size_t)(ok ? gk : t0) * KVS) + wi * 4,
                           ok);
             }
         }
@@ -183,7 +233,6 @@ k_mla_decode(const int8_t* __restrict__ qi, const float* __restrict__ qsc, const
         const int h = c / (L / 16), col = c % (L / 16);
         *(int4*)&S.q[h * LQ + col * 16] = *(const int4*)&qr[h * L + col * 16];
     }
-    for (int i = tid; i < H * NB; i += THREADS) S.qs[i] = qsc[(size_t)r * H * NB + i];
     if (tid < H) { S.m[tid] = -INFINITY; S.l[tid] = 0.f; }
 
     // O^T accumulators: warp owns latent dims [warp*64, +64) = 4 m-tiles; heads = 4 n-tiles
@@ -198,11 +247,12 @@ k_mla_decode(const int8_t* __restrict__ qi, const float* __restrict__ qsc, const
     const int g = lane >> 2, t4 = lane & 3;
     const int mt = warp >> 2, nt = warp & 3;  // score tile of this warp: keys mt*16.., heads nt*8..
     const int key0 = mt * 16 + g, h0 = nt * 8 + 2 * t4;
-    float qreg0[NB], qreg1[NB];  // this thread's two heads' query scales, for every q8 block
+    constexpr int QS = KV_ROWSCALE ? 2 : NB;  // query scales per head
+    float qreg0[QS], qreg1[QS];  // this thread's two heads' query scales
 #pragma unroll
-    for (int b = 0; b < NB; b++) {
-        qreg0[b] = qsc[((size_t)r * H + h0) * NB + b];
-        qreg1[b] = qsc[((size_t)r * H + h0 + 1) * NB + b];
+    for (int b = 0; b < QS; b++) {
+        qreg0[b] = qsc[((size_t)r * H + h0) * QS + b];
+        qreg1[b] = qsc[((size_t)r * H + h0 + 1) * QS + b];
     }
     int it = 0;
     for (int t0 = k0; t0 < k1; t0 += KT, it++) {
@@ -220,10 +270,30 @@ k_mla_decode(const int8_t* __restrict__ qi, const float* __restrict__ qsc, const
         {
             const int8_t* ab = &S.k[st][(mt * 16 + (lane & 15)) * LQ + (lane >> 4) * 16];
             const int8_t* bb = &S.q[(nt * 8 + (lane & 7)) * LQ + ((lane >> 3) & 1) * 16];
-            const half* ksr0 = &S.ks[st][key0 * NB];
-            const half* ksr1 = &S.ks[st][(key0 + 8) * NB];
+            const half* ksr0 = &S.ks[st][key0 * KVS];
+            const half* ksr1 = &S.ks[st][(key0 + 8) * KVS];
             const float* qs0 = qreg0;
             const float* qs1 = qreg1;
+#if KV_ROWSCALE
+            // int32 accumulation over the latent (16 steps) and the pe (2 steps); one float epilogue per tile
+            int cl[4] = {0, 0, 0, 0}, cpe[4] = {0, 0, 0, 0};
+#pragma unroll
+            for (int b = 0; b < NB; b++) {
+                uint32_t a0, a1, a2, a3, b0, b1;
+                ldsm_x4(a0, a1, a2, a3, ab + b * 32);
+                ldsm_x2(b0, b1, bb + b * 32);
+                if (b < RK / 32) mma_s8_acc(cl, a0, a1, a2, a3, b0, b1);
+                else mma_s8_acc(cpe, a0, a1, a2, a3, b0, b1);
+            }
+            {
+                const float kl0 = __half2float(ksr0[0]), kl1 = __half2float(ksr1[0]);
+                const float kp0 = __half2float(ksr0[1]), kp1 = __half2float(ksr1[1]);
+                s[0] = (float)cl[0] * (kl0 * qs0[0]) + (float)cpe[0] * (kp0 * qs0[1]);
+                s[1] = (float)cl[1] * (kl0 * qs1[0]) + (float)cpe[1] * (kp0 * qs1[1]);
+                s[2] = (float)cl[2] * (kl1 * qs0[0]) + (float)cpe[2] * (kp1 * qs0[1]);
+                s[3] = (float)cl[3] * (kl1 * qs1[0]) + (float)cpe[3] * (kp1 * qs1[1]);
+            }
+#else
 #ifndef ATTN_SKIP_S
 #pragma unroll
             for (int b = 0; b < NB; b++) {
@@ -242,6 +312,7 @@ k_mla_decode(const int8_t* __restrict__ qi, const float* __restrict__ qsc, const
                 s[2] += i2f_exact(c[2]) * (k1s * q0s);
                 s[3] += i2f_exact(c[3]) * (k1s * q1s);
             }
+#endif
             if (t0 + key0 >= k1) { s[0] = -INFINITY; s[1] = -INFINITY; }
             if (t0 + key0 + 8 >= k1) { s[2] = -INFINITY; s[3] = -INFINITY; }
         }
@@ -253,7 +324,7 @@ k_mla_decode(const int8_t* __restrict__ qi, const float* __restrict__ qsc, const
 #endif
             const int key = c / (RK / 16), col = c % (RK / 16);
             const uint4 raw = *(const uint4*)&S.k[st][key * LQ + col * 16];
-            const half2 d2 = __half2half2(S.ks[st][key * NB + col / 2]);
+            const half2 d2 = __half2half2(S.ks[st][key * KVS + (KV_ROWSCALE ? 0 : col / 2)]);
             // int8 -> f16 exactly: bytes b^0x80 = b+128 placed under exponent 0x64 give 1024+b+128; minus 1152 = b
             const half2 bias = __float2half2_rn(1152.f);
             const uint32_t wv[4] = {raw.x ^ 0x80808080u, raw.y ^ 0x80808080u, raw.z ^ 0x80808080u, raw.w ^ 0x80808080u};

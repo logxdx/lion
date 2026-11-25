@@ -57,7 +57,7 @@ __global__ void k_cache_dequant(const int8_t* __restrict__ cq, const half* __res
     const int r = idx / (fa::L / 8), c = idx % (fa::L / 8);
     const size_t row = row0 + r;
     const int2 raw = *(const int2*)&cq[row * fa::L + c * 8];
-    const float d = __half2float(cs[row * (fa::L / 32) + c / 4]);
+    const float d = __half2float(cs[row * attn::KVS + (KV_ROWSCALE ? (c < fa::RK / 8 ? 0 : 1) : c / 4)]);
     const int8_t* b = (const int8_t*)&raw;
     uint4 o;
     o.x = pack_h2(d * b[0], d * b[1]); o.y = pack_h2(d * b[2], d * b[3]);

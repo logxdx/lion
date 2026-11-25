@@ -64,10 +64,10 @@ Engine::Engine(const std::string& gguf, int n_slots, int max_ctx, bool verbose)
     CK(cudaMalloc(&conv_state_, conv_n * 4));
     CK(cudaMalloc(&rda_state_, rda_n * 4));
     CK(cudaMalloc(&kv_q_, kv_rows * c.latent()));
-    CK(cudaMalloc(&kv_s_, kv_rows * (c.latent() / 32) * 2));
+    CK(cudaMalloc(&kv_s_, kv_rows * attn::KVS * 2));
     CK(cudaMemset(conv_state_, 0, conv_n * 4));
     CK(cudaMemset(rda_state_, 0, rda_n * 4));
-    state_bytes_ = conv_n * 4 + rda_n * 4 + kv_rows * (c.latent() + c.latent() / 32 * 2);
+    state_bytes_ = conv_n * 4 + rda_n * 4 + kv_rows * (c.latent() + attn::KVS * 2);
 
     ws_ = new Ws;
     Ws& w = *ws_;
@@ -358,7 +358,7 @@ void Engine::launch_chunk(int R, int nseg, int nout, int nsplit, int pf_slot, in
             PROF("rda_out");
         } else {
             int8_t* kq = kv_q_ + (size_t)Ly.mla_idx * max_ctx_ * L;
-            half* ks = kv_s_ + (size_t)Ly.mla_idx * max_ctx_ * (L / 32);
+            half* ks = kv_s_ + (size_t)Ly.mla_idx * max_ctx_ * attn::KVS;
             mmq(Ly.q_a, w.hq, w.hs, w.qa, c.q_lora);
             k_rmsnorm_quant<<<R, c.q_lora>>>(w.qa, c.q_lora, Ly.q_a_norm, c.eps_latent, w.xq, w.xs);
             mmq(Ly.q_b, w.xq, w.xs, w.q, H * c.k_mla);
@@ -393,7 +393,7 @@ void Engine::launch_chunk(int R, int nseg, int nout, int nsplit, int pf_slot, in
                 PROF("mla_prefill_attn");
             } else {
                 mm(Ly.k_b, w.q, H * c.k_mla, R, w.qlat, H * c.kv_lora, w.xq, w.xs, c.kv_lora, c.k_mla);
-                k_mla_qprep<<<cdiv(R * H * L, 256), 256>>>(w.qlat, w.q, c.k_mla, 1.f / sqrtf((float)c.k_mla), R, w.qi,
+                k_mla_qprep<<<cdiv(mla_qprep_threads(R), 256), 256>>>(w.qlat, w.q, c.k_mla, 1.f / sqrtf((float)c.k_mla), R, w.qi,
                                                             w.qsc);
                 PROF("mla_kb+qprep");
                 k_mla_decode<RowMeta><<<dim3(R, nsplit), attn::THREADS, sizeof(attn::Smem)>>>(
@@ -486,7 +486,7 @@ void Engine::bench_fill(int slot, int depth) {
     for (int l = 0; l < m_.n_mla; l++) {
         const size_t row0 = ((size_t)slot * m_.n_mla + l) * max_ctx_;
         k_fill_rand<<<1024, 256>>>(kv_q_ + row0 * L, (size_t)depth * L, 1234u + l);
-        k_fill_half<<<1024, 256>>>(kv_s_ + row0 * (L / 32), (size_t)depth * (L / 32), 0.02f);
+        k_fill_half<<<1024, 256>>>(kv_s_ + row0 * attn::KVS, (size_t)depth * attn::KVS, 0.02f);
     }
     CK(cudaDeviceSynchronize());
 }
