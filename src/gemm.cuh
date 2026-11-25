@@ -135,6 +135,131 @@ k_gemm_q8(const int8_t* __restrict__ xq, const float* __restrict__ xs, const int
         }
 }
 
+// ---------------------------------------------------------------- Q8_0, deeper stages
+// Same math as k_gemm_q8 with KS q8 blocks (32 x KS of K) per pipeline stage: one barrier per KS k-steps.
+// 2 stages; the weight scales of the next stage are prefetched into registers during the math.
+template <int KS>
+struct GQ8V {
+    static constexpr int BM = 128, BN = 128, BK = 32 * KS, THREADS = 256, P = BK + 16;
+    int8_t a[2][BM * P];
+    int8_t b[2][BN * P];
+    float as[2][KS][BM];
+    float bs[2][KS][BN];
+};
+
+template <int KS>
+__global__ void __launch_bounds__(256, 2)
+k_gemm_q8v(const int8_t* __restrict__ xq, const float* __restrict__ xs, const int8_t* __restrict__ wq,
+           const half* __restrict__ wd, int T, int N, int K, float* __restrict__ y, int ldy) {
+    using C = GQ8V<KS>;
+    constexpr int BM = C::BM, BN = C::BN, BK = C::BK, P = C::P;
+    extern __shared__ __align__(16) uint8_t smem_raw[];
+    C& S = *reinterpret_cast<C*>(smem_raw);
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int m0 = blockIdx.x * BM, n0 = blockIdx.y * BN;
+    const int nks = K / BK, KB = K / 32;
+    const int wm = warp >> 1, wn = warp & 1;
+
+    auto issue = [&](int ks, int st) {
+        if (ks < nks) {
+            for (int c = tid; c < BM * (BK / 16); c += 256) {
+                const int row = c / (BK / 16), part = c % (BK / 16);
+                const int t = m0 + row;
+                g_cp16(&S.a[st][row * P + part * 16], xq + (size_t)(t < T ? t : 0) * K + ks * BK + part * 16, t < T);
+                g_cp16(&S.b[st][row * P + part * 16], wq + (size_t)(n0 + row) * K + ks * BK + part * 16, true);
+            }
+            for (int c = tid; c < BM * KS; c += 256) {
+                const int row = c / KS, u = c % KS, t = m0 + row;
+                g_cp4(&S.as[st][u][row], xs + (size_t)(t < T ? t : 0) * KB + ks * KS + u, t < T);
+            }
+        }
+        g_commit();
+    };
+    // weight scales: thread handles entries c = tid + 256 * i of the KS x BN table
+    constexpr int WPT = (BN * KS + 255) / 256;
+    float wpre[WPT];
+    auto load_ws = [&](int ks) {
+#pragma unroll
+        for (int i = 0; i < WPT; i++) {
+            const int c = tid + 256 * i;
+            if (c < BN * KS && ks < nks) {
+                const int row = c / KS, u = c % KS;
+                wpre[i] = __half2float(wd[(size_t)(n0 + row) * KB + ks * KS + u]);
+            }
+        }
+    };
+    auto store_ws = [&](int st) {
+#pragma unroll
+        for (int i = 0; i < WPT; i++) {
+            const int c = tid + 256 * i;
+            if (c < BN * KS) S.bs[st][c % KS][c / KS] = wpre[i];
+        }
+    };
+
+    float acc[2][8][4];
+#pragma unroll
+    for (int i = 0; i < 2; i++)
+#pragma unroll
+        for (int j = 0; j < 8; j++)
+#pragma unroll
+            for (int k = 0; k < 4; k++) acc[i][j][k] = 0.f;
+
+    issue(0, 0);
+    load_ws(0);
+    store_ws(0);
+    const int g = lane >> 2, t4 = lane & 3;
+    for (int ks = 0; ks < nks; ks++) {
+        const int st = ks & 1;
+        g_wait<0>();
+        __syncthreads();
+        issue(ks + 1, st ^ 1);
+        load_ws(ks + 1);
+#pragma unroll
+        for (int u = 0; u < KS; u++) {
+            uint32_t a[2][4], b[8][2];
+#pragma unroll
+            for (int i = 0; i < 2; i++)
+                g_ldsm_x4(a[i][0], a[i][1], a[i][2], a[i][3],
+                          &S.a[st][(wm * 32 + i * 16 + (lane & 15)) * P + u * 32 + (lane >> 4) * 16]);
+#pragma unroll
+            for (int j = 0; j < 8; j += 2)
+                g_ldsm_x4(b[j][0], b[j][1], b[j + 1][0], b[j + 1][1],
+                          &S.b[st][(wn * 64 + j * 8 + (lane & 7) + ((lane >> 4) & 1) * 8) * P + u * 32 + ((lane >> 3) & 1) * 16]);
+            float ra[2][2], cb[8][2];
+#pragma unroll
+            for (int i = 0; i < 2; i++) {
+                ra[i][0] = S.as[st][u][wm * 32 + i * 16 + g];
+                ra[i][1] = S.as[st][u][wm * 32 + i * 16 + g + 8];
+            }
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                cb[j][0] = S.bs[st][u][wn * 64 + j * 8 + 2 * t4];
+                cb[j][1] = S.bs[st][u][wn * 64 + j * 8 + 2 * t4 + 1];
+            }
+#pragma unroll
+            for (int i = 0; i < 2; i++)
+#pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    int c[4];
+                    g_mma_s8(c, a[i][0], a[i][1], a[i][2], a[i][3], b[j][0], b[j][1]);
+                    acc[i][j][0] += i2f_exact(c[0]) * (ra[i][0] * cb[j][0]);
+                    acc[i][j][1] += i2f_exact(c[1]) * (ra[i][0] * cb[j][1]);
+                    acc[i][j][2] += i2f_exact(c[2]) * (ra[i][1] * cb[j][0]);
+                    acc[i][j][3] += i2f_exact(c[3]) * (ra[i][1] * cb[j][1]);
+                }
+        }
+        store_ws(st ^ 1);  // read in the next iteration, after its barrier
+    }
+#pragma unroll
+    for (int i = 0; i < 2; i++)
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+            const int t = m0 + wm * 32 + i * 16 + g, n = n0 + wn * 64 + j * 8 + 2 * t4;
+            if (t < T) *(float2*)&y[(size_t)t * ldy + n] = make_float2(acc[i][j][0], acc[i][j][1]);
+            if (t + 8 < T) *(float2*)&y[(size_t)(t + 8) * ldy + n] = make_float2(acc[i][j][2], acc[i][j][3]);
+        }
+}
+
 // ---------------------------------------------------------------- Q6_K weights
 // Q6_K: 6-bit values with an int8 scale per 16 and a half scale per 256. A 32-wide k-step (one activation block) is
 // one (half, r) slice of a 256-block: 32 contiguous low-nibble bytes + 32 contiguous high-bit bytes, two sub-scales.

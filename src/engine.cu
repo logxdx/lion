@@ -110,6 +110,7 @@ Engine::Engine(const std::string& gguf, int n_slots, int max_ctx, bool verbose)
     CK(cudaFuncSetAttribute(k_mla_decode<RowMeta>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sizeof(attn::Smem)));
     CK(cudaFuncSetAttribute(k_gemm_q8, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sizeof(gq8::Smem)));
     CK(cudaFuncSetAttribute(k_gemm_q6, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sizeof(gq6::Smem)));
+    CK(cudaFuncSetAttribute(k_gemm_q8v<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sizeof(GQ8V<2>)));
     CK(cudaMalloc(&w.xq, (size_t)R * 2 * c.n_ff));
     w.xs = falloc((size_t)R * 2 * c.n_ff / 32);
     w.hn = falloc((size_t)R * E);
@@ -180,7 +181,8 @@ static void mm(const Mat& W, const float* x, int ldx, int R, float* y, int ldy, 
     }
     if (!no_gemm && R > 8 && W.type == W_Q8 && W.N % gq8::BN == 0) {
         dim3 grid((R + gq8::BM - 1) / gq8::BM, W.N / gq8::BN);
-        k_gemm_q8<<<grid, gq8::THREADS, sizeof(gq8::Smem)>>>(xq, xs, W.q, W.d, R, W.N, W.K, y, ldy);
+        if (W.K % 64 == 0) k_gemm_q8v<2><<<grid, 256, sizeof(GQ8V<2>)>>>(xq, xs, W.q, W.d, R, W.N, W.K, y, ldy);
+        else k_gemm_q8<<<grid, gq8::THREADS, sizeof(gq8::Smem)>>>(xq, xs, W.q, W.d, R, W.N, W.K, y, ldy);
         return;
     }
     for (int b0 = 0; b0 < R; b0 += 8) {
