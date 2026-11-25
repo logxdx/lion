@@ -237,10 +237,10 @@ k_mla_decode(const int8_t* __restrict__ qi, const float* __restrict__ qsc, const
                 mma_s8(c, a0, a1, a2, a3, b0, b1);
                 const float k0s = __half2float(ksr0[b]), k1s = __half2float(ksr1[b]);
                 const float q0s = qs0[b], q1s = qs1[b];
-                s[0] += (float)c[0] * (k0s * q0s);
-                s[1] += (float)c[1] * (k0s * q1s);
-                s[2] += (float)c[2] * (k1s * q0s);
-                s[3] += (float)c[3] * (k1s * q1s);
+                s[0] += i2f_exact(c[0]) * (k0s * q0s);
+                s[1] += i2f_exact(c[1]) * (k0s * q1s);
+                s[2] += i2f_exact(c[2]) * (k1s * q0s);
+                s[3] += i2f_exact(c[3]) * (k1s * q1s);
             }
             if (t0 + key0 >= k1) { s[0] = -INFINITY; s[1] = -INFINITY; }
             if (t0 + key0 + 8 >= k1) { s[2] = -INFINITY; s[3] = -INFINITY; }

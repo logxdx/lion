@@ -46,6 +46,8 @@ __device__ __forceinline__ float block_max(float v, float* red) {
     float t = lane < nw ? red[lane] : -INFINITY;
     return warp_max(t);
 }
+// exact int32 -> float for |c| < 2^22 with full-rate integer + float adds (I2F runs at 16/clk/SM on sm_89, FADD at 128)
+__device__ __forceinline__ float i2f_exact(int c) { return __int_as_float(c + 0x4B400000) - 12582912.f; }
 __device__ __forceinline__ float sigmoidf_(float x) { return 1.f / (1.f + __expf(-x)); }
 __device__ __forceinline__ float siluf_(float x) { return x / (1.f + __expf(-x)); }
 __device__ __forceinline__ float gelu_tanh(float x) {

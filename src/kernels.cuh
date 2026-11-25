@@ -267,6 +267,163 @@ __global__ void k_hc_post(float* __restrict__ X, const float* __restrict__ y, co
     for (int d = 0; d < 4; d++) Xr[d * E + i] = c[d] * x0 + c[4 + d] * x1 + c[8 + d] * x2 + c[12 + d] * x3 + p[d] * yv;
 }
 
+// ---------------------------------------------------------------- fused mHC step, one row per block (192 threads x 8)
+// In order, all optional:
+//   add:  X_s += RMSNorm_aw(A)          (per-layer-input output, added to every stream; aw == null: plain add)
+//   post: X_d  = sum_s comb[s*4+d] X_s + post_d * Y    (with the post/comb of the previous pre step)
+//   writes X back if it changed; sum: S = sscale * sum_s X_s
+//   pre:  m = fn . (X / rms(X)) + base -> pre/post/comb (as k_hc_pre); H = RMSNorm_nw(sum_i pre_i X_i)
+struct MhcArgs {
+    float* X; int R;
+    const float *A, *aw;                  // add
+    const float* Y; float *post, *comb;   // post (read) and pre outputs (written; same buffers)
+    float* S; float sscale;               // stream sum
+    const half* fn; const float *base, *chart, *nw; float* H;  // pre
+    float hc_eps, eps, mag;
+};
+__global__ void __launch_bounds__(192) k_mhc(MhcArgs a) {
+    constexpr int E = 1536, HC = 4, MIX = 17, HC2 = 16, T = 192, V = 8;
+    __shared__ float red[8][MIX + 1];
+    __shared__ float sm_m[MIX], sm_pre[HC], sm_cb[HC2], sm_bc[24];
+    const int r = blockIdx.x, t = threadIdx.x, lane = t & 31, warp = t >> 5, e0 = t * V;
+    float* Xr = a.X + (size_t)r * HC * E;
+    float x[HC][V];
+#pragma unroll
+    for (int s = 0; s < HC; s++) {
+        const float4 u = *(const float4*)&Xr[s * E + e0], w = *(const float4*)&Xr[s * E + e0 + 4];
+        x[s][0] = u.x; x[s][1] = u.y; x[s][2] = u.z; x[s][3] = u.w; x[s][4] = w.x; x[s][5] = w.y; x[s][6] = w.z; x[s][7] = w.w;
+    }
+    // block reduction of n values (n <= 18) held per thread; result broadcast via red[0][i]
+    auto reduce = [&](float* v, int n) {
+#pragma unroll 1
+        for (int i = 0; i < n; i++) {
+            float s = v[i];
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+            v[i] = s;
+        }
+        __syncthreads();
+        if (lane == 0)
+            for (int i = 0; i < n; i++) red[warp][i] = v[i];
+        __syncthreads();
+        if (t < n) {
+            float s = 0.f;
+            for (int w = 0; w < T / 32; w++) s += red[w][t];
+            sm_bc[t] = s;
+        }
+        __syncthreads();
+        for (int i = 0; i < n; i++) v[i] = sm_bc[i];
+    };
+    bool changed = false;
+    if (a.A) {
+        float av[V], ss = 0.f;
+        const float4 u = *(const float4*)&a.A[(size_t)r * E + e0], w = *(const float4*)&a.A[(size_t)r * E + e0 + 4];
+        av[0] = u.x; av[1] = u.y; av[2] = u.z; av[3] = u.w; av[4] = w.x; av[5] = w.y; av[6] = w.z; av[7] = w.w;
+        float inv = 1.f;
+        if (a.aw) {
+#pragma unroll
+            for (int i = 0; i < V; i++) ss += av[i] * av[i];
+            reduce(&ss, 1);
+            inv = rsqrtf(ss / E + a.eps);
+        }
+#pragma unroll
+        for (int i = 0; i < V; i++) {
+            const float v = av[i] * inv * (a.aw ? a.aw[e0 + i] : 1.f);
+#pragma unroll
+            for (int s = 0; s < HC; s++) x[s][i] += v;
+        }
+        changed = true;
+    }
+    if (a.Y) {
+        float cm[HC2], pp[HC];
+#pragma unroll
+        for (int i = 0; i < HC2; i++) cm[i] = a.comb[r * HC2 + i];
+#pragma unroll
+        for (int i = 0; i < HC; i++) pp[i] = a.post[r * HC + i];
+        const float4 u = *(const float4*)&a.Y[(size_t)r * E + e0], w = *(const float4*)&a.Y[(size_t)r * E + e0 + 4];
+        const float yv[V] = {u.x, u.y, u.z, u.w, w.x, w.y, w.z, w.w};
+#pragma unroll
+        for (int i = 0; i < V; i++) {
+            const float x0 = x[0][i], x1 = x[1][i], x2 = x[2][i], x3 = x[3][i];
+#pragma unroll
+            for (int d = 0; d < HC; d++) x[d][i] = cm[d] * x0 + cm[4 + d] * x1 + cm[8 + d] * x2 + cm[12 + d] * x3 + pp[d] * yv[i];
+        }
+        changed = true;
+    }
+    if (changed) {
+#pragma unroll
+        for (int s = 0; s < HC; s++) {
+            *(float4*)&Xr[s * E + e0] = make_float4(x[s][0], x[s][1], x[s][2], x[s][3]);
+            *(float4*)&Xr[s * E + e0 + 4] = make_float4(x[s][4], x[s][5], x[s][6], x[s][7]);
+        }
+    }
+    if (a.S) {
+        float sv[V];
+#pragma unroll
+        for (int i = 0; i < V; i++) sv[i] = (x[0][i] + x[1][i] + x[2][i] + x[3][i]) * a.sscale;
+        *(float4*)&a.S[(size_t)r * E + e0] = make_float4(sv[0], sv[1], sv[2], sv[3]);
+        *(float4*)&a.S[(size_t)r * E + e0 + 4] = make_float4(sv[4], sv[5], sv[6], sv[7]);
+    }
+    if (!a.fn) return;
+    // ---- pre: rms over the 4 streams, 17 selector dots, then the mix
+    float v[MIX + 1];
+#pragma unroll
+    for (int m = 0; m < MIX; m++) v[m] = 0.f;
+    float ss = 0.f;
+#pragma unroll
+    for (int s = 0; s < HC; s++)
+#pragma unroll
+        for (int i = 0; i < V; i++) ss += x[s][i] * x[s][i];
+#pragma unroll
+    for (int m = 0; m < MIX; m++) {
+#pragma unroll
+        for (int s = 0; s < HC; s++) {
+            const uint4 raw = *(const uint4*)&a.fn[(size_t)m * HC * E + s * E + e0];
+            const half2* h2 = (const half2*)&raw;
+#pragma unroll
+            for (int q = 0; q < 4; q++) {
+                const float2 f = __half22float2(h2[q]);
+                v[m] += f.x * x[s][2 * q] + f.y * x[s][2 * q + 1];
+            }
+        }
+    }
+    v[MIX] = ss;
+    reduce(v, MIX + 1);
+    const float inv = rsqrtf(v[MIX] / (HC * E) + a.hc_eps);
+    if (t < MIX) sm_m[t] = v[t] * inv + a.base[t];
+    __syncthreads();
+    if (t < 2 * HC) {
+        const float sg = sigmoidf_(sm_m[t]);
+        if (t < HC) sm_pre[t] = sg;
+        else a.post[r * HC + t - HC] = sg * a.mag;
+    }
+    if (t < HC2) {
+        float e = 0.f;
+        for (int k = 0; k < MIX; k++) e += a.chart[t * MIX + k] * sm_m[k];
+        sm_cb[t] = e;
+    }
+    __syncthreads();
+    if (t < HC2) {
+        float mx = -INFINITY;
+        for (int j = 0; j < HC2; j++) mx = fmaxf(mx, sm_cb[j] * a.chart[MIX * HC2 + j]);
+        a.comb[r * HC2 + t] = sm_cb[t] / (1.f + mx) + a.chart[MIX * HC2 + HC2 + t];
+    }
+    float hv[V], hs = 0.f;
+#pragma unroll
+    for (int i = 0; i < V; i++) {
+        hv[i] = sm_pre[0] * x[0][i] + sm_pre[1] * x[1][i] + sm_pre[2] * x[2][i] + sm_pre[3] * x[3][i];
+        hs += hv[i] * hv[i];
+    }
+    reduce(&hs, 1);
+    const float ih = rsqrtf(hs / E + a.eps);
+    float* Hr = a.H + (size_t)r * E;
+    float o[V];
+#pragma unroll
+    for (int i = 0; i < V; i++) o[i] = hv[i] * ih * a.nw[e0 + i];
+    *(float4*)&Hr[e0] = make_float4(o[0], o[1], o[2], o[3]);
+    *(float4*)&Hr[e0 + 4] = make_float4(o[4], o[5], o[6], o[7]);
+}
+
 // sum of streams (per-layer-input gate input) or mean (final)
 __global__ void k_stream_sum(const float* __restrict__ X, float* __restrict__ s, int E, int R, float scale) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;

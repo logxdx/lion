@@ -287,10 +287,29 @@ void Engine::launch_chunk(int R, int nseg, int nout, int nsplit, int pf_slot, in
         k_hc_post<<<cdiv(R * E, 256), 256>>>(w.X, w.y, w.post, w.comb, E, R);
         PROF("mhc_post");
     };
+    // fused mHC step (k_mhc); RAON_OLDMHC=1 runs the separate kernels instead (A/B)
+    static const bool old_mhc = getenv("RAON_OLDMHC") != nullptr;
+    auto mhc = [&](const float* addv, const float* aw, bool post, float* S, float sscale, const Layer* pre, bool ffn) {
+        MhcArgs a{};
+        a.X = w.X; a.R = R; a.A = addv; a.aw = aw;
+        a.Y = post ? w.y : nullptr; a.post = w.post; a.comb = w.comb;
+        a.S = S; a.sscale = sscale;
+        if (pre) {
+            a.fn = (ffn ? pre->hc_ffn_fn : pre->hc_attn_fn).d;
+            a.base = ffn ? pre->hc_ffn_base : pre->hc_attn_base;
+            a.chart = ffn ? pre->hc_ffn_chart : pre->hc_attn_chart;
+            a.nw = ffn ? pre->ffn_norm : pre->attn_norm;
+            a.H = w.h;
+        }
+        a.hc_eps = c.hc_eps; a.eps = c.eps; a.mag = c.hc_mag;
+        k_mhc<<<R, 192>>>(a);
+        PROF("mhc");
+    };
 
     for (int il = 0; il < NL; il++) {
         const Layer& Ly = m_.layers[il];
-        hc_pre(Ly.hc_attn_fn, Ly.hc_attn_base, Ly.hc_attn_chart, Ly.attn_norm);
+        if (old_mhc) hc_pre(Ly.hc_attn_fn, Ly.hc_attn_base, Ly.hc_attn_chart, Ly.attn_norm);
+        else mhc(il ? w.y2 : nullptr, il ? m_.layers[il - 1].ple_post_norm : nullptr, false, nullptr, 0.f, &Ly, false);
         if (Ly.rda) {
             float* cst = conv_state_ + (size_t)Ly.rda_idx * 3 * 3 * C;
             float* rst = rda_state_ + (size_t)Ly.rda_idx * RH * D * D;
@@ -354,22 +373,34 @@ void Engine::launch_chunk(int R, int nseg, int nout, int nsplit, int pf_slot, in
             mm(Ly.mla_out, w.o, H * c.v_mla, R, w.y, E, w.xq, w.xs);
             PROF("mla_vb+gate+out");
         }
-        hc_post();
         // FFN
-        hc_pre(Ly.hc_ffn_fn, Ly.hc_ffn_base, Ly.hc_ffn_chart, Ly.ffn_norm);
+        if (old_mhc) {
+            hc_post();
+            hc_pre(Ly.hc_ffn_fn, Ly.hc_ffn_base, Ly.hc_ffn_chart, Ly.ffn_norm);
+        } else {
+            mhc(nullptr, nullptr, true, nullptr, 0.f, &Ly, true);
+        }
         mm(Ly.ffn_up, w.h, E, R, w.big, 2 * c.n_ff, w.xq, w.xs);
         PROF("ffn_up");
         k_swiglu<<<cdiv(R * c.n_ff, 256), 256>>>(w.big, w.act, c.n_ff, R);
         mm(Ly.ffn_down, w.act, c.n_ff, R, w.y, E, w.xq, w.xs);
         PROF("ffn_down");
-        hc_post();
-        // per-layer input
-        k_stream_sum<<<cdiv(R * E, 256), 256>>>(w.X, w.s, E, R, 1.f);
+        // per-layer input; the fused path adds RMSNorm(proj) to the streams at the next mHC step
+        if (old_mhc) {
+            hc_post();
+            k_stream_sum<<<cdiv(R * E, 256), 256>>>(w.X, w.s, E, R, 1.f);
+        } else {
+            mhc(nullptr, nullptr, true, w.s, 1.f, nullptr, false);
+        }
         mm(Ly.ple_gate, w.s, E, R, w.qa, G, w.xq, w.xs);
         k_gelu_mul<<<cdiv(R * G, 256), 256>>>(w.qa, w.ple, il, NL, G, w.qan, R);
-        mm(Ly.ple_proj, w.qan, G, R, w.y, E, w.xq, w.xs);
-        k_rmsnorm<<<dim3(R, 1), 256>>>(w.y, E, w.y2, E, Ly.ple_post_norm, E, c.eps);
-        k_add_streams<<<cdiv(R * E, 256), 256>>>(w.X, w.y2, E, R);
+        if (old_mhc) {
+            mm(Ly.ple_proj, w.qan, G, R, w.y, E, w.xq, w.xs);
+            k_rmsnorm<<<dim3(R, 1), 256>>>(w.y, E, w.y2, E, Ly.ple_post_norm, E, c.eps);
+            k_add_streams<<<cdiv(R * E, 256), 256>>>(w.X, w.y2, E, R);
+        } else {
+            mm(Ly.ple_proj, w.qan, G, R, w.y2, E, w.xq, w.xs);
+        }
         PROF("ple_layer");
         static const bool dump = getenv("RAON_DUMP") != nullptr;  // debugging: per-layer stream checksums
         if (dump) {
@@ -381,7 +412,8 @@ void Engine::launch_chunk(int R, int nseg, int nout, int nsplit, int pf_slot, in
         }
     }
     if (nout == 0) return;
-    k_stream_sum<<<cdiv(R * E, 256), 256>>>(w.X, w.s, E, R, 1.f / HC);
+    if (old_mhc) k_stream_sum<<<cdiv(R * E, 256), 256>>>(w.X, w.s, E, R, 1.f / HC);
+    else mhc(w.y2, m_.layers[NL - 1].ple_post_norm, false, w.s, 1.f / HC, nullptr, false);
     k_rmsnorm<<<dim3(R, 1), 256>>>(w.s, E, w.hn, E, m_.output_norm, E, c.eps);
     k_gather<<<nout, 256>>>(w.hn, w.sel, nout, E, w.hsel);
     mm(m_.tok_embd, w.hsel, E, nout, w.logits, c.n_vocab, w.xq, w.xs);

@@ -118,10 +118,10 @@ k_gemm_q8(const int8_t* __restrict__ xq, const float* __restrict__ xs, const int
             for (int j = 0; j < 8; j++) {
                 int c[4];
                 g_mma_s8(c, a[i][0], a[i][1], a[i][2], a[i][3], b[j][0], b[j][1]);
-                acc[i][j][0] += (float)c[0] * (ra[i][0] * cb[j][0]);
-                acc[i][j][1] += (float)c[1] * (ra[i][0] * cb[j][1]);
-                acc[i][j][2] += (float)c[2] * (ra[i][1] * cb[j][0]);
-                acc[i][j][3] += (float)c[3] * (ra[i][1] * cb[j][1]);
+                acc[i][j][0] += i2f_exact(c[0]) * (ra[i][0] * cb[j][0]);
+                acc[i][j][1] += i2f_exact(c[1]) * (ra[i][0] * cb[j][1]);
+                acc[i][j][2] += i2f_exact(c[2]) * (ra[i][1] * cb[j][0]);
+                acc[i][j][3] += i2f_exact(c[3]) * (ra[i][1] * cb[j][1]);
             }
     }
     // store
