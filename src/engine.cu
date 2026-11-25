@@ -51,7 +51,7 @@ static float* falloc(size_t n) {
 }
 
 Engine::Engine(const std::string& gguf, int n_slots, int max_ctx, bool verbose)
-    : n_slots_(n_slots), max_ctx_(max_ctx), rmax_(getenv("RAON_CHUNK") ? atoi(getenv("RAON_CHUNK")) : 256) {
+    : n_slots_(n_slots), max_ctx_(max_ctx), rmax_(256) {
     m_ = load_model(gguf, verbose);
     for (const Layer& Ly : m_.layers)  // the fused path feeds these from int8 producers: they must be Q8_0 / Q6_K
         for (const Mat* M : {&Ly.wqkv, &Ly.rda_out, &Ly.q_a, &Ly.q_b, &Ly.attn_gate, &Ly.mla_out, &Ly.ffn_up, &Ly.ffn_down,
@@ -71,7 +71,43 @@ Engine::Engine(const std::string& gguf, int n_slots, int max_ctx, bool verbose)
 
     ws_ = new Ws;
     Ws& w = *ws_;
-    const int R = rmax_, E = c.n_embd, H = c.mla_heads, C = c.rda_heads * c.rda_dim;
+    const int E = c.n_embd, H = c.mla_heads, C = c.rda_heads * c.rda_dim;
+    // decode-path buffers (absorbed attention) serve at most rdec_ rows per chunk; prefill chunks of one sequence use
+    // the expanded attention and do not need them
+    rdec_ = std::max(n_slots, 64);
+    const int RD = rdec_;
+    CK(cudaMalloc(&w.qi, (size_t)RD * H * c.latent()));
+    w.qsc = falloc((size_t)RD * H * (c.latent() / 32));
+    w.qlat = falloc((size_t)RD * H * c.kv_lora);
+    w.olat = falloc((size_t)RD * H * c.kv_lora);
+    w.opart_n = 256;
+    w.opart = falloc(w.opart_n * H * c.kv_lora);
+    w.ml = falloc(w.opart_n * H * 2);
+    w.lmax = std::max(n_slots, 16);  // rows that can request logits per chunk
+    w.logits = falloc((size_t)w.lmax * c.n_vocab);
+    CK(cudaMalloc(&w.cf, (size_t)FA_KB * c.latent() * 2));
+    CK(cudaMalloc(&w.E, (size_t)FA_KB * fa::EW * 2));
+    CK(cudaMalloc(&w.k8, (size_t)FA_KB * H * c.k_mla));
+    w.ks8 = falloc((size_t)FA_KB * H * 2);
+
+    // per-row workspace: bytes for one row (floats unless noted)
+    const size_t per_row = 4 * ((size_t)c.hc * E + 6 * (size_t)E + 4 + 16 + 2 * (size_t)c.n_ff + std::max(E, C) +
+                                (size_t)c.n_ple * c.n_layer + (c.dt_rank + 2 * c.rda_heads) + 6 * (size_t)C +
+                                c.rda_heads + c.q_lora + (size_t)H * c.k_mla + c.latent() + 3 * (size_t)H * c.v_mla +
+                                2 * (size_t)c.n_ff / 32 + E / 32 + H * 2 + H * 2) +
+                           2 * (size_t)c.n_ff + E + (size_t)H * c.k_mla /*int8*/ + 2 * (size_t)H * c.k_mla /*qf*/ + 64;
+    if (getenv("RAON_CHUNK")) {
+        rmax_ = atoi(getenv("RAON_CHUNK"));
+    } else {  // largest chunk <= 2048 rows (multiple of 128) that fits in free VRAM with a 256 MB margin
+        size_t fr = 0, tot = 0;
+        CK(cudaMemGetInfo(&fr, &tot));
+        const size_t margin = (size_t)256 << 20;
+        const size_t fit = fr > margin ? (fr - margin) / per_row : 0;
+        rmax_ = (int)std::min<size_t>(2048, fit) / 128 * 128;
+        if (rmax_ < 64) rmax_ = 64;
+    }
+    const int R = rmax_;
+    if (verbose) fprintf(stderr, "raon: prefill chunk %d rows (%.0f MiB workspace)\n", R, R * per_row / 1048576.0);
     w.R = R;
     CK(cudaMalloc(&w.toks, R * 4));
     CK(cudaMalloc(&w.sel, R * 4));
@@ -79,20 +115,14 @@ Engine::Engine(const std::string& gguf, int n_slots, int max_ctx, bool verbose)
     CK(cudaMalloc(&w.segs, R * sizeof(Seg)));
     w.X = falloc((size_t)R * c.hc * E);
     w.e = falloc((size_t)R * E);
-    w.flat = falloc((size_t)R * c.hc * E);
-    w.mixes = falloc((size_t)R * 32);
     w.post = falloc((size_t)R * 4);
     w.comb = falloc((size_t)R * 16);
     w.h = falloc((size_t)R * E);
     w.y = falloc((size_t)R * E);
     w.y2 = falloc((size_t)R * E);
     w.big = falloc((size_t)R * 2 * c.n_ff);
-    w.act = falloc((size_t)R * c.n_ff);
     w.s = falloc((size_t)R * std::max(E, C));  // stream sum (E wide) and the RDA gated output (C = 2048 wide)
-    w.ple_rows = falloc((size_t)R * c.n_ple * c.n_layer);
-    w.ple_proj = falloc((size_t)R * c.n_ple * c.n_layer);
     w.ple = falloc((size_t)R * c.n_ple * c.n_layer);
-    w.conv = falloc((size_t)R * 3 * C);
     w.fab = falloc((size_t)R * (c.dt_rank + 2 * c.rda_heads));
     w.fb = falloc((size_t)R * C);
     w.qn = falloc((size_t)R * C);
@@ -102,18 +132,10 @@ Engine::Engine(const std::string& gguf, int n_slots, int max_ctx, bool verbose)
     w.beta = falloc((size_t)R * c.rda_heads);
     w.ro = falloc((size_t)R * C);
     w.qa = falloc((size_t)R * c.q_lora);
-    w.qan = falloc((size_t)R * c.q_lora);
     w.q = falloc((size_t)R * H * c.k_mla);
     w.kv = falloc((size_t)R * c.latent());
-    w.qlat = falloc((size_t)R * H * c.kv_lora);
-    w.olat = falloc((size_t)R * H * c.kv_lora);
     w.o = falloc((size_t)R * H * c.v_mla);
     w.gate = falloc((size_t)R * H * c.v_mla);
-    CK(cudaMalloc(&w.qi, (size_t)R * H * c.latent()));
-    w.qsc = falloc((size_t)R * H * (c.latent() / 32));
-    w.opart_n = 256;
-    w.opart = falloc(w.opart_n * H * c.kv_lora);
-    w.ml = falloc(w.opart_n * H * 2);
     CK(cudaFuncSetAttribute(k_mla_decode<RowMeta>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sizeof(attn::Smem)));
     CK(cudaFuncSetAttribute(k_gemm_q8, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sizeof(gq8::Smem)));
     CK(cudaFuncSetAttribute(k_gemm_q6, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sizeof(gq6::Smem)));
@@ -122,21 +144,15 @@ Engine::Engine(const std::string& gguf, int n_slots, int max_ctx, bool verbose)
     w.xs = falloc((size_t)R * 2 * c.n_ff / 32);
     w.hn = falloc((size_t)R * E);
     w.hsel = falloc((size_t)R * E);
-    w.lmax = std::max(n_slots, 16);  // rows that can request logits per chunk
-    w.logits = falloc((size_t)w.lmax * c.n_vocab);
-    CK(cudaMalloc(&w.qf, (size_t)R * H * c.k_mla * 2));
-    CK(cudaMalloc(&w.cf, (size_t)FA_KB * c.latent() * 2));
-    CK(cudaMalloc(&w.E, (size_t)FA_KB * fa::EW * 2));
     w.ofa = falloc((size_t)H * R * c.v_mla);
     w.mlfa = falloc((size_t)H * R * 2);
+    CK(cudaMalloc(&w.qf, (size_t)R * H * c.k_mla * 2));
     CK(cudaFuncSetAttribute(k_fa, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sizeof(fa::Smem)));
     CK(cudaFuncSetAttribute(k_fa8, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sizeof(fa8::Smem)));
     CK(cudaMalloc(&w.q8, (size_t)R * H * c.k_mla));
     CK(cudaMalloc(&w.hq, (size_t)R * E));
     w.hs = falloc((size_t)R * E / 32);
-    CK(cudaMalloc(&w.k8, (size_t)FA_KB * H * c.k_mla));
     w.qs8 = falloc((size_t)R * H * 2);
-    w.ks8 = falloc((size_t)FA_KB * H * 2);
 }
 
 Engine::~Engine() {
@@ -253,6 +269,7 @@ void Engine::run_chunk(const Row* rows, int R) {
     // a single segment of more than 16 rows is a prefill chunk: expanded attention (RAON_NOFA: decode kernel per row)
     static const bool no_fa = getenv("RAON_NOFA") != nullptr;
     const bool pf = !no_fa && nseg == 1 && R > 16;
+    if (!pf && R > rdec_) throw std::runtime_error("decode-path chunk larger than its buffers");
     const int pf_slot = pf ? segs[0].slot : -1, pf_pos0 = pf ? rows[0].pos : 0;
 
     // decode batches (one row per slot, all with logits) replay a CUDA graph captured once per batch size; the
@@ -286,9 +303,11 @@ void Engine::launch_chunk(int R, int nseg, int nout, int nsplit, int pf_slot, in
     g_prof.start();
     const Mat& te = m_.tok_embd;
     k_embed<<<R, 256>>>(te.type, te.q, te.qh, te.sc, te.d, E, w.toks, w.e, w.X, HC);
-    k_ple_rows<<<R, 256>>>(m_.ple_table, m_.ple_type, m_.ple_row_bytes, G * NL, w.toks, sqrtf((float)G), w.ple_rows);
-    mm(m_.ple_model_proj, w.e, E, R, w.ple_proj, G * NL, w.xq, w.xs);
-    k_ple_combine<<<dim3(R, NL), G>>>(w.ple_proj, w.ple_rows, m_.ple_proj_norm, G, c.eps, w.ple);
+    float* ple_rows = w.big;                          // the per-layer-input temporaries live in big (12288 per row)
+    float* ple_proj = w.big + (size_t)R * G * NL;
+    k_ple_rows<<<R, 256>>>(m_.ple_table, m_.ple_type, m_.ple_row_bytes, G * NL, w.toks, sqrtf((float)G), ple_rows);
+    mm(m_.ple_model_proj, w.e, E, R, ple_proj, G * NL, w.xq, w.xs);
+    k_ple_combine<<<dim3(R, NL), G>>>(ple_proj, ple_rows, m_.ple_proj_norm, G, c.eps, w.ple);
     PROF("embed+ple");
 
     const size_t conv_slot = (size_t)m_.n_rda * 3 * 3 * C, rda_slot = (size_t)m_.n_rda * RH * D * D;
@@ -422,8 +441,11 @@ void Engine::launch_chunk(int R, int nseg, int nout, int nsplit, int pf_slot, in
 std::vector<float> Engine::forward(const std::vector<Row>& rows) {
     const int V = m_.cfg.n_vocab;
     std::vector<float> out;
-    for (size_t b0 = 0; b0 < rows.size(); b0 += rmax_) {
-        const int n = (int)std::min<size_t>(rmax_, rows.size() - b0);
+    for (size_t b0 = 0; b0 < rows.size();) {
+        int n = (int)std::min<size_t>(rmax_, rows.size() - b0);
+        // a chunk mixing sequences runs the decode-path attention: at most rdec_ rows
+        for (int i = 1; i < n; i++)
+            if (rows[b0 + i].slot != rows[b0].slot) { n = std::min(n, rdec_); break; }
         run_chunk(rows.data() + b0, n);
         g_prof.calls++;
         int nout = 0;
@@ -433,6 +455,7 @@ std::vector<float> Engine::forward(const std::vector<Row>& rows) {
             out.resize(old + (size_t)nout * V);
             CK(cudaMemcpy(out.data() + old, ws_->logits, (size_t)nout * V * 4, cudaMemcpyDeviceToHost));
         }
+        b0 += n;
     }
     CK(cudaGetLastError());
     return out;

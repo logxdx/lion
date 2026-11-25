@@ -97,7 +97,7 @@ private:
     void run_chunk(const Row* rows, int n);
     void launch_chunk(int R, int nseg, int nout, int nsplit, int pf_slot, int pf_pos0);
     Model m_;
-    int n_slots_, max_ctx_, rmax_;
+    int n_slots_, max_ctx_, rmax_, rdec_ = 64;
     // per-slot state
     float* conv_state_ = nullptr;   // [slot][n_rda][3][6144]
     float* rda_state_ = nullptr;    // [slot][n_rda][16][128][128]
