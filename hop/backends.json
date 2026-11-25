@@ -3,15 +3,15 @@
   "idle_unload_s": 600,
   "start_timeout_s": 300,
   "default_model": "lfm3",
-  "ui_dir": "build/webui",
-  "tools_dir": ["tools/webtools", "../liquid-engine/tools/webtools"],
+  "ui_dir": ["webui", "build/webui"],
+  "tools_dir": ["tools/webtools", "servers/liquine/tools/webtools"],
   "node": "node",
   "tool_timeout_s": 300,
   "state_dir": "~/.cache/hop",
   "backends": [
     {
       "name": "liquid-engine",
-      "command": ["~/liquine/serve.sh", "--no-ui", "--no-tools"],
+      "command": ["servers/liquine/serve.sh", "--no-ui", "--no-tools"],
       "env": {"PORT": "11500"},
       "port": 11500,
       "routes": ["/v1/systemone"],
@@ -23,7 +23,7 @@
     },
     {
       "name": "raon-engine",
-      "command": ["~/raon/serve.sh", "--no-ui", "--no-tools"],
+      "command": ["servers/raon/serve.sh", "--no-ui", "--no-tools"],
       "env": {"PORT": "11501"},
       "port": 11501,
       "models": [

@@ -37,20 +37,33 @@ time the model's server ran, or built from `backends.json`. Server logs are in `
 
 ```sh
 make webui                 # the Lion web UI bundle (pinned llama.cpp release, checksum-verified)
-make webtools              # node dependencies of the tools (in ../liquid-engine/tools/webtools)
+make webtools              # node dependencies of the tools (in servers/liquine/tools/webtools)
 ./serve.sh                 # or: python3 hop.py --config backends.json [--listen host:port] [--idle S] [--no-tools]
 ```
 
-**The servers.** `backends.json` starts each server from its installed copy (`~/liquine/serve.sh`,
-`~/raon/serve.sh`) on an internal port (11500, 11501), with `--no-ui --no-tools`. Point `command` at a build in this
-repo, or add another server, by editing that file. A server needs:
+**The servers.** `backends.json` starts each server as `servers/<name>/serve.sh` (paths are relative to the config) on
+an internal port (11500, 11501), with `--no-ui --no-tools`. In this repo, `servers/liquine` and `servers/raon` are
+symlinks to `../liquid-engine` and `../raon-engine`. Add another server by editing that file. A server needs:
 
 - `/health`, answering 200 once it is ready;
 - the OpenAI routes;
 - exit on SIGTERM.
 
-**Installed copy.** It lives in `~/hop` (`hop.py`, `backends.json`, `serve.sh`, `build/webui`, `tools/webtools`), and
-starts as `hop` (`~/.local/bin/hop` → `~/hop/serve.sh`).
+`ui_dir` and `tools_dir` take a list of candidates; the first present wins (`webui`, then `build/webui`).
+
+**Installed copy.** Everything lives under `~/hop`, and hop starts as `hop` (`~/.local/bin/hop` → `~/hop/serve.sh`):
+
+```
+~/hop/
+  serve.sh  hop.py  backends.json  README.md    the gateway
+  webui/                                        the Lion web UI
+  tools/webtools/                               web_search, web_fetch, pdf (one copy, shared)
+  servers/liquine/                              liquid-server, liquid, its web UI; serve.sh  (liquid-serve)
+  servers/raon/                                 raon-server, raon, its web UI; serve.sh      (raon-serve)
+```
+
+Each server's `tools` is a symlink to `../../tools`. Its standalone script (`~/.local/bin/liquid-serve`, `raon-serve`)
+still runs it alone, with its own UI and tools.
 
 **Port 11434** is also liquid-serve's default: run either hop or a standalone liquid-serve, not both. A standalone
 server you start yourself (for example raon-serve on :11435) holds GPU memory that hop then cannot use.

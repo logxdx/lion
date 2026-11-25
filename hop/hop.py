@@ -296,11 +296,14 @@ class Gateway:
         self.fleet = Fleet(self.backends, cfg.get("start_timeout_s", 300),
                            args.idle if args.idle is not None else cfg.get("idle_unload_s", 600), os.path.join(state, "logs"))
         self.fleet.on_ready = self.refresh_props
-        self.ui_dir = path_of(base, cfg.get("ui_dir", "build/webui"))
+        # ui_dir: a directory or a list of candidates; the first that exists is used (install: webui, repo: build/webui)
+        cands = cfg.get("ui_dir", ["webui", "build/webui"])
+        cands = [path_of(base, d) for d in ([cands] if isinstance(cands, str) else cands)]
+        self.ui_dir = next((d for d in cands if os.path.isdir(d)), cands[0])
         self.tools = None
         if not args.no_tools and cfg.get("tools", True):
             # tools_dir: a directory or a list of candidates; the first with its node dependencies installed is used
-            cands = cfg.get("tools_dir", ["tools/webtools", "../liquid-engine/tools/webtools"])
+            cands = cfg.get("tools_dir", ["tools/webtools", "servers/liquine/tools/webtools"])
             cands = [path_of(base, d) for d in ([cands] if isinstance(cands, str) else cands)]
             tdir = next((d for d in cands if os.path.isdir(os.path.join(d, "node_modules"))), cands[0])
             self.tools = Tools(tdir, cfg.get("node", "node"), cfg.get("tool_timeout_s", 300))
