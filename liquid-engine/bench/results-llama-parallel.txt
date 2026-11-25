@@ -1,0 +1,3 @@
+llama-server streams=4 pp=512: prefill 8648.1 t/s (per slot), decode aggregate 380.0 t/s, per stream 95.0 t/s (phase-2 prompt tokens re-evaluated: [4, 4, 4, 4])
+llama-server streams=4 pp=32768: prefill 8299.2 t/s (per slot), decode aggregate 244.7 t/s, per stream 61.2 t/s (phase-2 prompt tokens re-evaluated: [4, 4, 4, 4])
+llama-server streams=4 pp=100000: prefill 5443.5 t/s (per slot), decode aggregate 142.8 t/s, per stream 35.7 t/s (phase-2 prompt tokens re-evaluated: [4, 4, 4, 4])
