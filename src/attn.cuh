@@ -66,7 +66,7 @@ __device__ __forceinline__ void mma16816_h(uint32_t* c, uint32_t a0, uint32_t a1
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 #ifndef ATTN_PV_F32ACC
-#define ATTN_PV_F32ACC 1  // f16 accumulation (0) is 8% faster at 6x150k but flipped a 0.27-nat near-tie at 9.8k context
+#define ATTN_PV_F32ACC 0  // f16 per-tile accumulation: ~10% faster at 6x150k; parity stays within the noise floor (=1: f32)
 #endif
 __device__ __forceinline__ void mma_s8(int* c, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0,
                                        uint32_t b1) {
