@@ -23,7 +23,7 @@ and images and video through LFM3-VL-2B, swapped onto the GPU when a request has
 ```sh
 make                      # CUDA 13 (nvcc in /opt/cuda), sm_89
 make webui webtools       # web UI bundle (+ liquine branding) + the tools' node deps
-./serve.sh                # text: 4 slots x 100k context; images: LFM3-VL at 64k, swapped in on demand
+./serve.sh                # text: 4 slots x 128k context; images: LFM3-VL at 128k; d1: 32k per pass; swapped in on demand
 ```
 
 Open `http://127.0.0.1:11434/` for the web UI, or point any OpenAI client at `http://127.0.0.1:11434/v1` (model `lfm3`;

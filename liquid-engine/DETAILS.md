@@ -116,7 +116,7 @@ nothing measurable: 106.3 vs 106.2 tok/s at 40k context, `bench/penalty_window.p
 
 ```sh
 make webui webtools                          # once: llama.cpp web UI bundle + the tools' node deps
-./serve.sh                                   # 4 slots x 100k context, q8 KV, RAM + disk prompt cache, port 11434
+./serve.sh                                   # 4 slots x 128k context, q8 KV, RAM + disk prompt cache, port 11434
 build/liquid-server -m $M -np 4 -c 100000 --port 8080 --cache-ram-mib 4096 --cache-disk-mib 16384
 curl localhost:8080/v1/chat/completions -d '{"messages":[{"role":"user","content":"hi"}],"stream":true}'
 ```
@@ -191,8 +191,8 @@ a cold read of the 318 MB entry at the NVMe's measured 1.4 GB/s adds ~220 ms).
 
 ## Images: LFM3-VL-2B and model swapping
 
-`serve.sh` runs two models: LFM3-1.7B (default, 4 x 100k) and LFM3-VL-2B (`--vl-model`, `--vl-mmproj`, `--vl-ctx`,
-default 64k; Q8_0 decoder + Q8_0 mmproj). One is on the GPU at a time. A request goes to the VL model when its
+`serve.sh` runs two models: LFM3-1.7B (default, 4 x 128k) and LFM3-VL-2B (`--vl-model`, `--vl-mmproj`, `--vl-ctx`,
+`serve.sh` 128000, server default 64k; Q8_0 decoder + Q8_0 mmproj). One is on the GPU at a time. A request goes to the VL model when its
 messages contain images (OpenAI `image_url` parts with base64 `data:` URLs, what the web UI sends) or when it names
 `lfm3-vl`; everything else goes to the default. When the queue head needs the other model, the scheduler lets running
 requests finish, moves every slot to the prompt cache, frees the GPU and loads the other model (requests keep arrival
