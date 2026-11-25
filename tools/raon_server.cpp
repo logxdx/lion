@@ -93,6 +93,7 @@ public:
         cv_.notify_all();
     }
     void wake() { cv_.notify_all(); }
+    std::string vram() { std::lock_guard<std::mutex> lk(info_mu_); return vram_; }
     json slots_json() {
         std::lock_guard<std::mutex> lk(info_mu_);
         return info_;
@@ -244,8 +245,8 @@ private:
 
     void run() {
         try {
-            eng_ = std::make_unique<Engine>(opt_.model, opt_.slots, opt_.ctx, true);
-            if (opt_.checkpoints > 0) eng_->set_checkpoints(opt_.checkpoints);
+            eng_ = std::make_unique<Engine>(opt_.model, opt_.slots, opt_.ctx, true, opt_.checkpoints);
+            vram_ = eng_->vram_report();
         } catch (const std::exception& e) {
             std::lock_guard<std::mutex> lk(mu_);
             load_error_ = e.what();
@@ -372,6 +373,7 @@ private:
     Clock::time_point next_prefill_ = Clock::now();
     std::mutex info_mu_;
     json info_ = json::array();
+    std::string vram_;
 };
 
 // ---------------------------------------------------------------- request parsing
@@ -641,6 +643,17 @@ int main(int argc, char** argv) {
     };
 
     svr.Get("/health", [&](const httplib::Request&, httplib::Response& res) { send_json(res, {{"status", "ok"}}); });
+    // the configuration this server runs with, and its VRAM use
+    svr.Get("/props", [&](const httplib::Request&, httplib::Response& res) {
+        send_json(res, {{"model", opt.model}, {"alias", opt.alias}, {"slots", opt.slots}, {"ctx", opt.ctx},
+                        {"chunk_busy", opt.chunk_busy}, {"prefill_share", opt.prefill_share}, {"checkpoints", opt.checkpoints},
+                        {"defaults", {{"temperature", opt.defaults.temperature}, {"top_p", opt.defaults.top_p},
+                                      {"top_k", opt.defaults.top_k}, {"min_p", opt.defaults.min_p},
+                                      {"presence_penalty", opt.defaults.presence_penalty},
+                                      {"frequency_penalty", opt.defaults.frequency_penalty},
+                                      {"repetition_penalty", opt.defaults.repetition_penalty}}},
+                        {"vram", sched.vram()}});
+    });
     svr.Get("/slots", [&](const httplib::Request&, httplib::Response& res) { send_json(res, sched.slots_json()); });
     auto models = [&](const httplib::Request&, httplib::Response& res) {
         send_json(res, {{"object", "list"},
@@ -863,7 +876,11 @@ int main(int argc, char** argv) {
 
     signal(SIGINT, [](int) { if (g_svr) g_svr->stop(); });
     signal(SIGTERM, [](int) { if (g_svr) g_svr->stop(); });
-    fprintf(stderr, "raon-server: %d slots x %d tokens, listening on http://%s:%d\n", opt.slots, opt.ctx, opt.host.c_str(), opt.port);
+    fprintf(stderr, "raon-server: %d slots x %d tokens, chunk-busy %d, prefill-share %.2f, checkpoints %d, defaults: temp %.2f "
+                    "top_p %.2f top_k %d min_p %.2f presence %.2f frequency %.2f repeat %.2f; listening on http://%s:%d\n",
+            opt.slots, opt.ctx, opt.chunk_busy, opt.prefill_share, opt.checkpoints, opt.defaults.temperature, opt.defaults.top_p,
+            opt.defaults.top_k, opt.defaults.min_p, opt.defaults.presence_penalty, opt.defaults.frequency_penalty,
+            opt.defaults.repetition_penalty, opt.host.c_str(), opt.port);
     if (!svr.listen(opt.host, opt.port)) {
         fprintf(stderr, "raon-server: cannot listen on %s:%d\n", opt.host.c_str(), opt.port);
         sched.stop();

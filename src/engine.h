@@ -100,7 +100,9 @@ struct SampleOut {
 
 class Engine {
 public:
-    Engine(const std::string& gguf, int n_slots, int max_ctx, bool verbose = true);
+    // ckpt_per_slot: recurrent-state checkpoints per slot, allocated up front (before the prefill chunk is sized
+    // from the free VRAM).
+    Engine(const std::string& gguf, int n_slots, int max_ctx, bool verbose = true, int ckpt_per_slot = 0);
     ~Engine();
     const Config& cfg() const { return m_.cfg; }
     int n_slots() const { return n_slots_; }
@@ -109,7 +111,6 @@ public:
     void reset(int slot);
     // Recurrent-state checkpoint of a slot (conv + delta-rule state, ~19 MB; the latent cache needs none: positions
     // past the checkpoint are simply rewritten). `per_slot` checkpoints per slot, allocated on first save.
-    void set_checkpoints(int per_slot) { ckpt_per_slot_ = per_slot; }
     void save_state(int slot, int k = 0);
     void load_state(int slot, int k = 0);
     // Run a batch: rows of the same slot must be consecutive and in position order. Returns logits for rows with
@@ -123,6 +124,9 @@ public:
     // Benchmarking: fill a slot's latent cache [0, depth) and recurrent state with synthetic values.
     void bench_fill(int slot, int depth);
     size_t gpu_bytes() const;
+    int chunk_rows() const { return rmax_; }
+    // VRAM: "weights X MiB, ... , device used U of T MiB" (allocations of this engine and the device total)
+    std::string vram_report() const;
 
 private:
     void run_chunk(const Row* rows, int n);
@@ -137,7 +141,7 @@ private:
     half* kv_s_ = nullptr;          // q8 scales            [slot][n_mla][max_ctx][18]
     float* ckpt_ = nullptr;         // checkpoints of conv + rda state [slot][k] (allocated on first save)
     int ckpt_per_slot_ = 1;
-    size_t state_bytes_ = 0;
+    size_t state_bytes_ = 0, ckpt_bytes_ = 0, ws_bytes_ = 0;
     // workspace
     struct Ws;
     Ws* ws_ = nullptr;

@@ -58,7 +58,7 @@ static float* falloc(size_t n) {
     return p;
 }
 
-Engine::Engine(const std::string& gguf, int n_slots, int max_ctx, bool verbose)
+Engine::Engine(const std::string& gguf, int n_slots, int max_ctx, bool verbose, int ckpt_per_slot)
     : n_slots_(n_slots), max_ctx_(max_ctx), rmax_(256) {
     m_ = load_model(gguf, verbose);
     for (const Layer& Ly : m_.layers)  // the fused path feeds these from int8 producers: they must be Q8_0 / Q6_K
@@ -76,6 +76,13 @@ Engine::Engine(const std::string& gguf, int n_slots, int max_ctx, bool verbose)
     CK(cudaMemset(conv_state_, 0, conv_n * 4));
     CK(cudaMemset(rda_state_, 0, rda_n * 4));
     state_bytes_ = conv_n * 4 + rda_n * 4 + kv_rows * (c.latent() + attn::KVS * 2);
+    if (ckpt_per_slot > 0) {   // before the chunk is sized from the free memory
+        ckpt_per_slot_ = ckpt_per_slot;
+        ckpt_bytes_ = (size_t)n_slots * ckpt_per_slot * (conv_n + rda_n) / n_slots * 4;
+        CK(cudaMalloc(&ckpt_, ckpt_bytes_));
+    }
+    size_t free0 = 0, tot0 = 0;
+    CK(cudaMemGetInfo(&free0, &tot0));
 
     ws_ = new Ws;
     Ws& w = *ws_;
@@ -115,12 +122,12 @@ Engine::Engine(const std::string& gguf, int n_slots, int max_ctx, bool verbose)
                            2 * (size_t)c.n_ff + E + (size_t)H * c.k_mla /*int8*/ + 2 * (size_t)H * c.k_mla /*qf*/ + 64;
     if (getenv("RAON_CHUNK")) {
         rmax_ = atoi(getenv("RAON_CHUNK"));
-    } else {  // largest chunk <= 2048 rows (multiple of 128) that fits in free VRAM with a 256 MB margin
+    } else {  // largest chunk <= 4096 rows (multiple of 128) that fits in free VRAM with a 256 MB margin
         size_t fr = 0, tot = 0;
         CK(cudaMemGetInfo(&fr, &tot));
         const size_t margin = (size_t)256 << 20;
         const size_t fit = fr > margin ? (fr - margin) / per_row : 0;
-        rmax_ = (int)std::min<size_t>(2048, fit) / 128 * 128;
+        rmax_ = (int)std::min<size_t>(4096, fit) / 128 * 128;
         if (rmax_ < 64) rmax_ = 64;
     }
     const int R = rmax_;
@@ -170,6 +177,10 @@ Engine::Engine(const std::string& gguf, int n_slots, int max_ctx, bool verbose)
     CK(cudaMalloc(&w.hq, (size_t)R * E));
     w.hs = falloc((size_t)R * E / 32);
     w.qs8 = falloc((size_t)R * H * 2);
+    size_t free1 = 0, tot1 = 0;
+    CK(cudaMemGetInfo(&free1, &tot1));
+    ws_bytes_ = free0 > free1 ? free0 - free1 : 0;
+    if (verbose) fprintf(stderr, "raon: VRAM %s\n", vram_report().c_str());
 }
 
 Engine::~Engine() {
@@ -193,10 +204,9 @@ void Engine::save_state(int slot, int k) {
     const size_t conv1 = (size_t)m_.n_rda * 3 * 3 * c.rda_heads * c.rda_dim;
     const size_t rda1 = (size_t)m_.n_rda * c.rda_heads * c.rda_dim * c.rda_dim;
     if (k < 0 || k >= ckpt_per_slot_) throw std::runtime_error("save_state: bad checkpoint index");
-    const size_t total = (size_t)n_slots_ * ckpt_per_slot_ * (conv1 + rda1) * 4;
     if (!ckpt_) {
-        CK(cudaMalloc(&ckpt_, total));
-        state_bytes_ += total;
+        ckpt_bytes_ = (size_t)n_slots_ * ckpt_per_slot_ * (conv1 + rda1) * 4;
+        CK(cudaMalloc(&ckpt_, ckpt_bytes_));
     }
     float* dst = ckpt_ + ((size_t)slot * ckpt_per_slot_ + k) * (conv1 + rda1);
     CK(cudaMemcpy(dst, conv_state_ + slot * conv1, conv1 * 4, cudaMemcpyDeviceToDevice));
@@ -708,6 +718,21 @@ void Engine::bench_fill(int slot, int depth) {
     CK(cudaDeviceSynchronize());
 }
 
-size_t Engine::gpu_bytes() const { return m_.gpu_bytes + state_bytes_; }
+size_t Engine::gpu_bytes() const { return m_.gpu_bytes + state_bytes_ + ckpt_bytes_; }
+
+std::string Engine::vram_report() const {
+    size_t fr = 0, tot = 0;
+    cudaMemGetInfo(&fr, &tot);
+    const double M = 1048576.0;
+    const Config& c = m_.cfg;
+    const size_t kv = (size_t)n_slots_ * m_.n_mla * max_ctx_ * (c.latent() + attn::KVS * 2);
+    char b[320];
+    snprintf(b, sizeof b,
+             "weights %.0f MiB, latent KV cache %.0f MiB (%d x %d tokens), recurrent state %.0f MiB, checkpoints %.0f MiB, "
+             "workspace %.0f MiB (chunk %d rows); device used %.0f of %.0f MiB",
+             m_.gpu_bytes / M, kv / M, n_slots_, max_ctx_, (state_bytes_ - kv) / M, ckpt_bytes_ / M, ws_bytes_ / M, rmax_,
+             (tot - fr) / M, tot / M);
+    return b;
+}
 
 }  // namespace raon
