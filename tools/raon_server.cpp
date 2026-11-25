@@ -27,6 +27,7 @@
 #include "engine.h"
 #include "httplib/httplib.h"
 #include "tokenizer.h"
+#include "web_tools.h"
 
 using namespace raon;
 using json = nlohmann::ordered_json;
@@ -45,6 +46,9 @@ struct Options {
     SamplingParams defaults;  // generation_config.json of Raon-1 nano: temperature 0.1, presence_penalty 1.5
     std::string ui_dir;       // web UI bundle (default: <binary dir>/webui, built by `make webui`)
     bool ui = true;
+    std::string tools_dir, node = "node";   // server tools (default: <binary dir>/../tools/webtools)
+    bool tools = true;
+    int tool_timeout = 300;   // seconds per tool call
 };
 
 struct TokEvent {
@@ -618,7 +622,12 @@ static void usage() {
             "                       default sampling (default: temp 0.1, presence 1.5 from generation_config.json)\n"
             "  --threads N          HTTP worker threads (default 32)\n"
             "  --ui-dir DIR         web UI served at / (default <binary dir>/webui; build it with: make webui)\n"
-            "  --no-ui              serve the API only\n");
+            "  --no-ui              serve the API only\n"
+            "  --tools-dir DIR      server tools web_search / web_fetch / pdf, served at /tools like llama-server's\n"
+            "                       built-in tools (default <binary dir>/../tools/webtools; node deps: make webtools)\n"
+            "  --no-tools           do not serve /tools\n"
+            "  --node PATH          node binary for the tools (default node)\n"
+            "  --tool-timeout S     per tool call (default 300)\n");
 }
 
 int main(int argc, char** argv) {
@@ -643,6 +652,10 @@ int main(int argc, char** argv) {
         else if (a == "--threads") opt.threads = std::stoi(next());
         else if (a == "--ui-dir") opt.ui_dir = next();
         else if (a == "--no-ui") opt.ui = false;
+        else if (a == "--tools-dir") opt.tools_dir = next();
+        else if (a == "--no-tools") opt.tools = false;
+        else if (a == "--node") opt.node = next();
+        else if (a == "--tool-timeout") opt.tool_timeout = std::stoi(next());
         else if (a == "--temp") opt.defaults.temperature = std::stof(next());
         else if (a == "--top-p") opt.defaults.top_p = std::stof(next());
         else if (a == "--top-k") opt.defaults.top_k = std::stoi(next());
@@ -966,7 +979,50 @@ int main(int argc, char** argv) {
     auto ok_json = [&](const httplib::Request&, httplib::Response& res) { send_json(res, {{"success", true}}); };
     svr.Get("/v1/catalog.json", [&](const httplib::Request&, httplib::Response& res) { send_json(res, json::array()); });
     svr.Post("/v1/streams/lookup", [&](const httplib::Request&, httplib::Response& res) { send_json(res, json::array()); });
-    svr.Get("/tools", [&](const httplib::Request&, httplib::Response& res) { send_json(res, json::array()); });   // no server tools
+    // Server tools, llama-server's /tools contract (see web_tools.h): the web UI lists them next to its own tools and
+    // calls them through POST /tools when the model asks for them
+    std::unique_ptr<WebTools> wtools;
+    std::string tools_state = "off (--no-tools)";
+    if (opt.tools) {
+        std::string dir = opt.tools_dir;
+        if (dir.empty()) {
+            std::error_code ec;
+            dir = (std::filesystem::read_symlink("/proc/self/exe", ec).parent_path().parent_path() / "tools" / "webtools").string();
+        }
+        wtools = std::make_unique<WebTools>(dir, opt.node, opt.tool_timeout);
+        if (wtools->enabled()) {
+            tools_state.clear();
+            for (const auto& t : wtools->list()) tools_state += (tools_state.empty() ? "" : ", ") + t.value("tool", std::string());
+            tools_state += " (" + dir + ")";
+        } else {
+            tools_state = "disabled: " + wtools->error();
+        }
+    }
+    auto tools_off = [&](httplib::Response& res) {
+        if (wtools && wtools->enabled()) return false;
+        // what llama-server answers without --tools; the UI then hides server tools
+        send_json(res, {{"error", {{"message", "server tools are disabled"}, {"type", "permission_error"}, {"code", 403}}}}, 403);
+        return true;
+    };
+    svr.Get("/tools", [&](const httplib::Request&, httplib::Response& res) {
+        if (!tools_off(res)) send_json(res, wtools->list());
+    });
+    svr.Post("/tools", [&](const httplib::Request& q, httplib::Response& res) {
+        if (tools_off(res)) return;
+        json b = json::parse(q.body, nullptr, false);
+        if (!b.is_object() || !b.contains("tool") || !b["tool"].is_string())
+            return send_error(res, 400, "expected {\"tool\": name, \"params\": {...}}");
+        const std::string name = b["tool"].get<std::string>();
+        if (!wtools->has(name)) return send_error(res, 404, "unknown tool \"" + name + "\"");
+        if (b.value("stream", false)) return send_error(res, 404, "tool \"" + name + "\" does not support stream = true");
+        json params = b.contains("params") && b["params"].is_object() ? b["params"] : json::object();
+        params.erase("cwd");   // like llama-server: the working directory comes only from the x-tool-cwd header
+        if (q.has_header("x-tool-cwd")) params["cwd"] = q.get_header_value("x-tool-cwd");
+        const auto t0 = Clock::now();
+        json out = wtools->call(name, params, q.is_connection_closed);
+        fprintf(stderr, "raon-server: tool %s: %s in %.0f ms\n", name.c_str(), out.contains("error") ? "error" : "ok", ms_since(t0));
+        send_json(res, out);
+    });
     svr.Post("/models/load", ok_json);
     svr.Post("/models/unload", ok_json);
     svr.Get("/models/sse", [](const httplib::Request&, httplib::Response& res) {
@@ -1012,6 +1068,7 @@ int main(int argc, char** argv) {
             opt.defaults.top_k, opt.defaults.min_p, opt.defaults.presence_penalty, opt.defaults.frequency_penalty,
             opt.defaults.repetition_penalty, opt.host.c_str(), opt.port);
     fprintf(stderr, "raon-server: web UI: %s\n", ui_state.c_str());
+    fprintf(stderr, "raon-server: tools: %s\n", tools_state.c_str());
     if (!svr.listen(opt.host, opt.port)) {
         fprintf(stderr, "raon-server: cannot listen on %s:%d\n", opt.host.c_str(), opt.port);
         sched.stop();

@@ -28,10 +28,11 @@ REPLACEMENTS = [
     ("*", "llama_settings_", "raon_settings_", 1),             # settings export file name
     ("*", "HARNESS:`llama.app`", "HARNESS:`raon`", 1),
     ("*", "`https://llama.app/v1/catalog.json`", "`./v1/catalog.json`", 1),  # served (empty) by raon-server
+    ("*", "TOOLS:`--tools`", "TOOLS:`--no-tools`", 1),
     ("*", "`To enable Server Tools you need to run llama-server with ${ay.TOOLS} all or ${ay.TOOLS} <name> flag.${e}`",
-     "`Server Tools are not available in raon-server.${e}`", 2),
+     "`Server Tools are off: start raon-server without ${ay.TOOLS}.${e}`", 2),
     ("*", "<span>Run llama-server with <code> </code> flag to enable <strong>Server Tools</strong>.</span>",
-     "<span>raon-server has no <code> </code> option: <strong>Server Tools</strong> are not available.</span>", 1),
+     "<span>Start raon-server without <code> </code> to enable <strong>Server Tools</strong>.</span>", 1),
     ("*", "(Run <pre>llama-server</pre> with <pre> </pre> flag)",
      "(not available in <pre>raon-server</pre><pre class=\"hidden\"> </pre>)", 1),
     ("*", "Use llama-server proxy", "Use server proxy", 1),

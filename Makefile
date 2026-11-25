@@ -28,10 +28,13 @@ $(BUILD)/chat.o: src/chat.cpp src/chat.h | $(BUILD)
 $(BUILD)/httplib.o: third_party/httplib/httplib.cpp third_party/httplib/httplib.h | $(BUILD)
 	$(CXX) $(CXXFLAGS) -w -Ithird_party/httplib -c $< -o $@
 
-$(BUILD)/raon_server.o: tools/raon_server.cpp src/engine.h src/tokenizer.h src/chat.h | $(BUILD)
+$(BUILD)/raon_server.o: tools/raon_server.cpp src/engine.h src/tokenizer.h src/chat.h src/web_tools.h | $(BUILD)
 	$(CXX) $(CXXFLAGS) $(INC) -c $< -o $@
 
-$(BUILD)/raon-server: $(ENGINE) $(BUILD)/tokenizer.o $(BUILD)/chat.o $(BUILD)/httplib.o $(BUILD)/raon_server.o | $(BUILD)
+$(BUILD)/web_tools.o: src/web_tools.cpp src/web_tools.h | $(BUILD)
+	$(CXX) $(CXXFLAGS) $(INC) -c $< -o $@
+
+$(BUILD)/raon-server: $(ENGINE) $(BUILD)/tokenizer.o $(BUILD)/chat.o $(BUILD)/httplib.o $(BUILD)/web_tools.o $(BUILD)/raon_server.o | $(BUILD)
 	$(NVCC) $(FLAGS) $^ -o $@ -lpthread
 
 $(BUILD)/raon-tok: $(BUILD)/tokenizer.o tools/raon_tok.cpp | $(BUILD)
@@ -52,6 +55,10 @@ $(BUILD):
 clean:
 	rm -rf $(BUILD)
 
+# Server tools (web_search, web_fetch, pdf): node dependencies of tools/webtools (raon-server runs node tools.ts)
+webtools:
+	cd tools/webtools && npm ci --no-audit --no-fund
+
 # Web UI: llama.cpp's prebuilt chat UI (MIT), pinned and checksum-verified, rebranded by brand/rebrand.py.
 # raon-server serves build/webui at / (next to the binary; --ui-dir to override).
 UI_VERSION ?= b12569
@@ -67,4 +74,4 @@ webui: $(UI_TAR)
 	rm -rf $(BUILD)/webui && mkdir -p $(BUILD)/webui && tar -xzf $(UI_TAR) -C $(BUILD)/webui
 	python3 brand/rebrand.py $(BUILD)/webui
 
-.PHONY: all clean tests webui
+.PHONY: all clean tests webui webtools

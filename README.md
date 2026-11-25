@@ -242,11 +242,24 @@ Server support for the UI, in llama-server's formats:
 - `reasoning_format: none` (thinking inline);
 - `n_predict: 0` (prefill only, used by the UI's "Pre-fill KV cache after response": the next turn then starts from
   the saved state);
-- empty answers for what raon-server does not have: `/tools`, `/v1/catalog.json`, `/v1/streams/lookup`, and the
-  `/models/*` router calls.
+- empty answers for what raon-server does not have: `/v1/catalog.json`, `/v1/streams/lookup`, and the `/models/*`
+  router calls.
+
+**Server tools** (ported from liquid-engine): `web_search`, `web_fetch`, and `pdf` (when `liteparse` is installed).
+
+- They are served at `/tools` in llama-server's format, so the UI offers them to the model and runs them when it
+  calls one (the UI asks for permission per call).
+- Each call runs `node tools/webtools/tools.ts call <name>` in its own process group, with a timeout
+  (`--tool-timeout`, default 300 s), and is cancelled when the client disconnects.
+- `web_search` tries TinyFish, LangSearch and Exa when their API key is set (environment or keyring), then
+  Wikipedia (no key).
+- `--no-tools` turns them off (`/tools` answers 403, as llama-server without `--tools`).
+- `--tools-dir` and `--node` point elsewhere.
+- Their Node dependencies install with `make webtools`.
 
 ```
 make webui                         # downloads the pinned bundle (once), verifies it, rebrands into build/webui
+make webtools                      # node dependencies of the server tools (npm ci in tools/webtools)
 build/raon-server -m model.gguf    # UI on http://127.0.0.1:8080/ ; --ui-dir DIR, --no-ui
 ```
 
