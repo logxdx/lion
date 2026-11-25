@@ -147,8 +147,7 @@ struct Smem {
     uint8_t ql[ST][BN * BK];
     uint8_t qh[ST][BN * BK];
     float as[ST][BM];
-    float bd[ST][BN];
-    int8_t bsc[ST][BN * 2];
+    float bf[ST][2][BN];  // per column: sub-scale x d, for the two 16-wide halves of the k-step
     int8_t b[BN * P];  // unpacked weights of the current k-step
 };
 }  // namespace gq6
@@ -189,10 +188,10 @@ k_gemm_q6(const int8_t* __restrict__ xq, const float* __restrict__ xs, const uin
             } else {
                 const int nn = tid - BM;
                 const size_t rn = (size_t)(n0 + nn);
-                S.bd[st][nn] = __half2float(wd[rn * (K / 256) + blk]);
+                const float dd = __half2float(wd[rn * (K / 256) + blk]);
                 const int si = blk * 16 + hf * 8 + 2 * r;
-                S.bsc[st][2 * nn] = wsc[rn * (K / 16) + si];
-                S.bsc[st][2 * nn + 1] = wsc[rn * (K / 16) + si + 1];
+                S.bf[st][0][nn] = (float)wsc[rn * (K / 16) + si] * dd;
+                S.bf[st][1][nn] = (float)wsc[rn * (K / 16) + si + 1] * dd;
             }
         }
         g_commit();
@@ -237,8 +236,7 @@ k_gemm_q6(const int8_t* __restrict__ xq, const float* __restrict__ xs, const uin
         for (int j = 0; j < 8; j += 2)
             g_ldsm_x4(b[j][0], b[j][1], b[j + 1][0], b[j + 1][1],
                       &S.b[(wn * 64 + j * 8 + (lane & 7) + ((lane >> 4) & 1) * 8) * P + ((lane >> 3) & 1) * 16]);
-        float ra[2][2], cd[8][2];
-        int s0[8][2], s1[8][2];
+        float ra[2][2], f0[8][2], f1[8][2];
 #pragma unroll
         for (int i = 0; i < 2; i++) {
             ra[i][0] = S.as[st][wm * 32 + i * 16 + g];
@@ -249,21 +247,23 @@ k_gemm_q6(const int8_t* __restrict__ xq, const float* __restrict__ xs, const uin
 #pragma unroll
             for (int q = 0; q < 2; q++) {
                 const int nn = wn * 64 + j * 8 + 2 * t4 + q;
-                cd[j][q] = S.bd[st][nn];
-                s0[j][q] = S.bsc[st][2 * nn];
-                s1[j][q] = S.bsc[st][2 * nn + 1];
+                f0[j][q] = S.bf[st][0][nn];
+                f1[j][q] = S.bf[st][1][nn];
             }
+        // each k16 partial (< 2^17) converts exactly; sub-scales are folded into f0 / f1
 #pragma unroll
         for (int i = 0; i < 2; i++)
 #pragma unroll
             for (int j = 0; j < 8; j++) {
                 int cl[4], ch[4];
-                g_mma_s8k16(cl, a[i][0], a[i][1], b[j][0]);  // k 0-15: sub-block 0
-                g_mma_s8k16(ch, a[i][2], a[i][3], b[j][1]);  // k 16-31: sub-block 1
-                acc[i][j][0] += (float)(cl[0] * s0[j][0] + ch[0] * s1[j][0]) * (ra[i][0] * cd[j][0]);
-                acc[i][j][1] += (float)(cl[1] * s0[j][1] + ch[1] * s1[j][1]) * (ra[i][0] * cd[j][1]);
-                acc[i][j][2] += (float)(cl[2] * s0[j][0] + ch[2] * s1[j][0]) * (ra[i][1] * cd[j][0]);
-                acc[i][j][3] += (float)(cl[3] * s0[j][1] + ch[3] * s1[j][1]) * (ra[i][1] * cd[j][1]);
+                g_mma_s8k16(cl, a[i][0], a[i][1], b[j][0]);
+                g_mma_s8k16(ch, a[i][2], a[i][3], b[j][1]);
+#pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    const int q = e & 1;
+                    const float rr = ra[i][e >> 1];
+                    acc[i][j][e] += (i2f_exact(cl[e]) * f0[j][q] + i2f_exact(ch[e]) * f1[j][q]) * rr;
+                }
             }
     }
 #pragma unroll
