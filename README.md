@@ -8,9 +8,25 @@ decodes 46-49 tok/s in total, whatever the concurrency, and prefills at ~640 tok
 
 ## Status (2026-11-25)
 
-Built and working: the forward pass, multi-stream decode and long prefill.
+Built and working:
 
-Not built yet: the tokenizer, chat template, sampling options and the server. The CLI takes token ids.
+- the forward pass, multi-stream decode and long prefill;
+- the tokenizer, chat template and GPU sampling;
+- `raon-server`, an OpenAI-compatible server with continuous batching and prompt reuse across turns.
+
+Not built: MTP speculative decoding, structured output (`response_format` JSON / grammars), images.
+
+### Server (`raon-server`, Q6_K, 4 slots × 128k)
+
+Measured with `tests/server_bench.py` and `tests/server_test.py`:
+
+| | result |
+|---|---|
+| cold 117k-token prompt, first token | 52.9 s (2,217 tok/s) |
+| 4 streams at ~117k context, all generating | 56.6-57.2 tok/s per stream, 227 tok/s total |
+| a stream generating while another 117k prompt prefills (`--prefill-share 0.5`) | ~49 tok/s |
+| next turn of a 9.8k-token conversation | 9,898 of 9,915 prompt tokens reused, prefill 31 ms |
+| 4 streams, short context | 108-111 tok/s per stream, ~420 tok/s total |
 
 ### Decode, tok/s per stream
 
@@ -38,6 +54,21 @@ The chunk size is chosen automatically from free VRAM (2048 rows here):
 | Q6_K | 6,105 (llama.cpp 6,670) | 5,618 (5,620) | **82.3 s, 1,867 tok/s** |
 
 ### Correctness
+
+Front end, each checked against KRAFTON llama.cpp:
+
+- **Tokenizer:** 337/337 cases token-identical to `llama-tokenize` (`tests/tokenizer_check.py`): real documents,
+  source code, NFD input, invalid UTF-8, specials, 300 random multi-script strings. A 137k-token prompt tokenizes
+  in 68 ms.
+- **Chat template:** 16/16 byte-identical to llama-server `/apply-template` (`tests/template_check.py`), incl. tools,
+  tool calls, tool results, reasoning and `enable_thinking`.
+- **Sampler:** 289/289 picks identical to a full-vocabulary reference of llama.cpp's chain (`tests/sampling_check.cu`).
+- **Whole stack, greedy chat vs llama-server (CPU):** 4/12 identical (`tests/chat_parity.py`).
+  - 5 differ only in formatting: llama.cpp keeps a trailing `\n` in `reasoning_content`; raon-server trims it, as the
+    template does when the reasoning comes back.
+  - 3 diverge at a near-tie (top-2 log-prob gap 0.04, 0.14, 0.52).
+
+Engine:
 
 `tests/parity.py` compares greedy decoding and top-k log-probs against KRAFTON llama.cpp (q8_0 KV), on short chat
 prompts and a 9,773-token document.
@@ -101,10 +132,69 @@ One CUDA graph per batch size.
   gate, q_a norm, SwiGLU.
 - **RDA conv** is folded into the gate / L2-norm kernel.
 
+### Tokenizer
+
+Byte-level BPE read from the GGUF, ported from KRAFTON llama.cpp:
+
+- longest-first special tokens;
+- NFC normalization (tables generated from llama.cpp's `unicode-data.cpp` by `tools/gen_unicode.py`);
+- the `raon` pre-tokenizer split (multi-word chunks, right-aligned digit groups);
+- merge-rank BPE over token-id pairs.
+
+### Sampling
+
+On the GPU, per output row:
+
+1. presence / frequency / repetition penalties and `logit_bias` are applied to the logits in place;
+2. two passes produce the top 128 candidates and the log-normalizers at T = 1 and at the row's temperature.
+
+The host then runs llama.cpp's chain on those ~1 KB: top-k → top-p → min-p on T = 1 probabilities, then the draw at
+the temperature, with the caller's uniform number (seedable).
+
+When the decision reaches past the 128 candidates (a flat distribution with top-p, or the draw falls in the tail),
+the host merges the row's 64 sorted slices only as far as needed, so the result is exact.
+
+Cost: +0.36 ms per step at 4 × 128k, instead of copying 4 MB of logits per step.
+
+### Server
+
+`tools/raon_server.cpp`, built on cpp-httplib and nlohmann/json (MIT, in `third_party/`).
+
+**Endpoints:**
+
+- `/v1/chat/completions` and `/v1/completions`, streaming (SSE) or not, with:
+  - `reasoning_content`;
+  - Qwen3-coder XML tool calls parsed into OpenAI `tool_calls`, argument types taken from the tool schema;
+  - `logprobs`, `stop`, `seed`, `logit_bias`, `max_tokens`;
+  - `chat_template_kwargs.enable_thinking`;
+  - `stream_options.include_usage`, plus `timings`.
+- `/v1/models`, `/health`, `/slots`, `/tokenize`, `/detokenize`, `/apply-template`.
+
+**Scheduling:**
+
+- One thread owns the GPU.
+- Each iteration runs at most one prefill chunk (2,048 tokens), then one batched decode step over all generating
+  requests.
+- While others generate, prefill gets `--prefill-share` of the GPU time (default 0.5).
+- A client disconnect cancels its request.
+
+**Prompt reuse:**
+
+- A slot keeps the tokens its state covers.
+- It also keeps up to `--checkpoints` (default 4) snapshots of the recurrent state (~19 MB each). Each is taken
+  where a chat prompt's generation prefix begins, which is where the next turn of the same conversation diverges.
+- A new request takes the idle slot with the longest reusable prefix. Re-sent history, edited last turns and
+  agent tool loops then prefill only the new tokens.
+- The latent cache needs no snapshot: positions past the reuse point are rewritten.
+
+**Defaults:** sampling defaults follow the model's `generation_config.json` (temperature 0.1, presence_penalty 1.5),
+as vLLM applies them. Request fields and CLI flags override them.
+
 ## Build and run
 
 ```
-make                                   # nvcc 13.x, sm_89
+make                                   # nvcc 13.x, sm_89: build/raon, build/raon-server, build/raon-tok
+build/raon-server -m model.gguf --slots 4 --ctx 131072 --port 8080  # OpenAI API on http://127.0.0.1:8080/v1
 build/raon -m model.gguf --tokens 259201,882,198 -n 32 --top 5     # greedy, JSON lines with top-k log-probs
 build/raon -m model.gguf --bench --slots 6 --depth 153600          # decode benchmark
 build/raon -m model.gguf --bench --prefill 153600                  # prefill benchmark
@@ -120,6 +210,19 @@ Environment knobs:
 - Debugging: `RAON_DUMP`, `RAON_PERTURB`.
 
 Compile switches: `ATTN_PV_F32ACC`, `FA_PV_F32ACC`, `KV_ROWSCALE`.
+
+Checks of the front end and the server:
+
+```
+python3 tests/tokenizer_check.py --model model.gguf --ref ~/llama.cpp/raon-src/build/bin/llama-tokenize --fuzz 300
+python3 tests/template_check.py --url http://127.0.0.1:8191 --render build/template_render   # vs llama-server
+make tests && build/sampling_check model.gguf
+python3 tests/server_test.py --url http://127.0.0.1:8080 --doc doc.txt
+python3 tests/chat_parity.py --raon http://127.0.0.1:8080 --ref http://127.0.0.1:8191
+python3 tests/server_bench.py --url http://127.0.0.1:8080 --doc doc.txt --clients 4 --tokens 120000 --gen 512
+```
+
+`build/raon --bench ... --sample [--temp T --top-p P]` times decode steps with GPU sampling instead of a logits copy.
 
 `tests/ab.sh` runs interleaved A/B benchmarks and discards any round that overlaps another GPU process.
 `tests/gemm_bench.cu`, `gemm_q6_check.cu`, `gemm_f16_check.cu` and `gemv_bench.cu` are kernel benches and checks.

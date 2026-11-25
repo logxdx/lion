@@ -75,6 +75,29 @@ void free_model(Model& m);
 // One row of a forward batch: a token at a position of a sequence slot.
 struct Row { int slot, pos, tok; bool logits; };
 
+// Sampling, as llama.cpp's default chain: penalties -> top_k -> top_p -> min_p -> temperature -> draw.
+// temperature <= 0 is greedy. Penalties follow the OpenAI/vLLM definitions over the tokens passed in `counts`
+// (the server passes the generated tokens).
+struct SamplingParams {
+    float temperature = 1.f;
+    int top_k = 0;            // 0 = off
+    float top_p = 1.f, min_p = 0.f;
+    float presence_penalty = 0.f, frequency_penalty = 0.f, repetition_penalty = 1.f;
+    int n_logprobs = 0;       // top alternatives to report (<= 20)
+};
+struct SampleIn {
+    SamplingParams p;
+    const std::vector<std::pair<int, int>>* counts = nullptr;    // (token, times generated)
+    const std::vector<std::pair<int, float>>* bias = nullptr;    // OpenAI logit_bias
+    double u = 0.5;           // uniform [0, 1) drawn by the caller (its RNG and seed)
+};
+struct SampleOut {
+    int token = -1;
+    float logprob = 0.f;      // log-softmax of the penalised logits at temperature 1
+    std::vector<std::pair<int, float>> top;
+    bool full_copy = false;   // the pick needed the whole logits row (diagnostics)
+};
+
 class Engine {
 public:
     Engine(const std::string& gguf, int n_slots, int max_ctx, bool verbose = true);
@@ -84,17 +107,26 @@ public:
     int max_ctx() const { return max_ctx_; }
 
     void reset(int slot);
+    // Recurrent-state checkpoint of a slot (conv + delta-rule state, ~19 MB; the latent cache needs none: positions
+    // past the checkpoint are simply rewritten). `per_slot` checkpoints per slot, allocated on first save.
+    void set_checkpoints(int per_slot) { ckpt_per_slot_ = per_slot; }
+    void save_state(int slot, int k = 0);
+    void load_state(int slot, int k = 0);
     // Run a batch: rows of the same slot must be consecutive and in position order. Returns logits for rows with
     // logits=true, in row order, as [n_out][n_vocab] on the host.
     std::vector<float> forward(const std::vector<Row>& rows);
     // Feed a prompt into a slot (chunked); returns logits of its last token.
     std::vector<float> prefill(int slot, const std::vector<int>& toks, int pos0 = 0);
+    // Run a batch and sample a token for each row with logits=true (one SampleIn per such row, in row order).
+    // Only ~1 KB per row leaves the GPU unless the pick reaches past the top candidates.
+    std::vector<SampleOut> step(const std::vector<Row>& rows, const std::vector<SampleIn>& in);
     // Benchmarking: fill a slot's latent cache [0, depth) and recurrent state with synthetic values.
     void bench_fill(int slot, int depth);
     size_t gpu_bytes() const;
 
 private:
     void run_chunk(const Row* rows, int n);
+    void sample_chunk(const SampleIn* in, int nout, SampleOut* out);
     void launch_chunk(int R, int nseg, int nout, int nsplit, int pf_slot, int pf_pos0);
     Model m_;
     int n_slots_, max_ctx_, rmax_, rdec_ = 64;
@@ -103,6 +135,8 @@ private:
     float* rda_state_ = nullptr;    // [slot][n_rda][16][128][128]
     int8_t* kv_q_ = nullptr;        // latent cache values [slot][n_mla][max_ctx][576]
     half* kv_s_ = nullptr;          // q8 scales            [slot][n_mla][max_ctx][18]
+    float* ckpt_ = nullptr;         // checkpoints of conv + rda state [slot][k] (allocated on first save)
+    int ckpt_per_slot_ = 1;
     size_t state_bytes_ = 0;
     // workspace
     struct Ws;

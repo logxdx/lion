@@ -1,18 +1,50 @@
 NVCC  ?= /opt/cuda/bin/nvcc
+CUDA  ?= /opt/cuda
 ARCH  ?= sm_89
 FLAGS ?= -O3 -std=c++17 -arch=$(ARCH) -lineinfo --default-stream per-thread -Xcompiler -Wall,-Wno-unused-function
 BUILD := build
 
-SRC  := src/model.cu src/engine.cu
-HDRS := $(wildcard src/*.h src/*.cuh)
+CXX      ?= g++
+CXXFLAGS ?= -O2 -std=c++17 -Wall -Wno-unused-function
+INC      := -Isrc -Ithird_party -I$(CUDA)/include
 
-all: $(BUILD)/raon
+HDRS := $(wildcard src/*.h src/*.cuh)
+ENGINE := $(BUILD)/model.o $(BUILD)/engine.o
+
+all: $(BUILD)/raon $(BUILD)/raon-server $(BUILD)/raon-tok
 
 $(BUILD)/%.o: src/%.cu $(HDRS) | $(BUILD)
 	$(NVCC) $(FLAGS) -Isrc -c $< -o $@
 
-$(BUILD)/raon: $(BUILD)/model.o $(BUILD)/engine.o tools/raon.cu $(HDRS) | $(BUILD)
-	$(NVCC) $(FLAGS) -Isrc $(BUILD)/model.o $(BUILD)/engine.o tools/raon.cu -o $@
+$(BUILD)/raon: $(ENGINE) tools/raon.cu $(HDRS) | $(BUILD)
+	$(NVCC) $(FLAGS) -Isrc $(ENGINE) tools/raon.cu -o $@
+
+$(BUILD)/tokenizer.o: src/tokenizer.cpp src/tokenizer.h src/unicode_tables.h src/gguf.h | $(BUILD)
+	$(CXX) $(CXXFLAGS) $(INC) -c $< -o $@
+
+$(BUILD)/chat.o: src/chat.cpp src/chat.h | $(BUILD)
+	$(CXX) $(CXXFLAGS) $(INC) -c $< -o $@
+
+$(BUILD)/httplib.o: third_party/httplib/httplib.cpp third_party/httplib/httplib.h | $(BUILD)
+	$(CXX) $(CXXFLAGS) -w -Ithird_party/httplib -c $< -o $@
+
+$(BUILD)/raon_server.o: tools/raon_server.cpp src/engine.h src/tokenizer.h src/chat.h | $(BUILD)
+	$(CXX) $(CXXFLAGS) $(INC) -c $< -o $@
+
+$(BUILD)/raon-server: $(ENGINE) $(BUILD)/tokenizer.o $(BUILD)/chat.o $(BUILD)/httplib.o $(BUILD)/raon_server.o | $(BUILD)
+	$(NVCC) $(FLAGS) $^ -o $@ -lpthread
+
+$(BUILD)/raon-tok: $(BUILD)/tokenizer.o tools/raon_tok.cpp | $(BUILD)
+	$(CXX) $(CXXFLAGS) $(INC) $^ -o $@
+
+# checks (see tests/*.py for the reference-based ones)
+tests: $(BUILD)/sampling_check $(BUILD)/template_render
+
+$(BUILD)/sampling_check: $(ENGINE) tests/sampling_check.cu | $(BUILD)
+	$(NVCC) $(FLAGS) -Isrc $^ -o $@
+
+$(BUILD)/template_render: $(BUILD)/chat.o tests/template_render.cpp | $(BUILD)
+	$(CXX) $(CXXFLAGS) $(INC) $^ -o $@
 
 $(BUILD):
 	mkdir -p $(BUILD)
@@ -20,4 +52,4 @@ $(BUILD):
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all clean
+.PHONY: all clean tests

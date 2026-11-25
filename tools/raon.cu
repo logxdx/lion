@@ -52,7 +52,8 @@ static void emit(int step, const float* lg, int V, int top, int chosen) {
 int main(int argc, char** argv) {
     std::string model, toks_s;
     int n = 16, top = 5, ctx = 8192, slots = 1, depth = 0, steps = 32, prefill_n = 0;
-    bool bench = false;
+    bool bench = false, sample = false;
+    float b_temp = 0.8f, b_top_p = 0.95f;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&]() { return std::string(argv[++i]); };
@@ -63,6 +64,9 @@ int main(int argc, char** argv) {
         else if (a == "--top") top = atoi(next().c_str());
         else if (a == "--ctx") ctx = atoi(next().c_str());
         else if (a == "--bench") bench = true;
+        else if (a == "--temp") b_temp = atof(next().c_str());
+        else if (a == "--top-p") b_top_p = atof(next().c_str());
+        else if (a == "--sample") sample = true;   // bench: sample on the GPU (Engine::step), no logits copy
         else if (a == "--slots") slots = atoi(next().c_str());
         else if (a == "--depth") depth = atoi(next().c_str());
         else if (a == "--steps") steps = atoi(next().c_str());
@@ -97,24 +101,34 @@ int main(int argc, char** argv) {
         fprintf(stderr, "GPU memory: %.0f MiB (weights + states + caches)\n", eng.gpu_bytes() / 1048576.0);
         for (int s = 0; s < slots; s++) eng.bench_fill(s, depth);
         std::vector<double> ms;
+        raon::SampleIn si;
+        si.p.temperature = b_temp;
+        si.p.top_p = b_top_p;
+        int full = 0, picks = 0;
+        auto run = [&](const std::vector<raon::Row>& rows) {
+            if (sample)
+                for (const auto& o : eng.step(rows, std::vector<raon::SampleIn>(rows.size(), si))) { full += o.full_copy; picks++; }
+            else eng.forward(rows);
+        };
         // warm-up: >= 1.5 s of steps at the same positions (GPU clocks ramp up; graphs get captured)
         const auto w0 = std::chrono::steady_clock::now();
         while (std::chrono::duration<double>(std::chrono::steady_clock::now() - w0).count() < 1.5) {
             std::vector<raon::Row> rows;
             for (int s = 0; s < slots; s++) rows.push_back({s, depth, 1000 + 37 * s, true});
-            eng.forward(rows);
+            run(rows);
         }
         for (int i = 0; i < steps; i++) {
             std::vector<raon::Row> rows;
             for (int s = 0; s < slots; s++) rows.push_back({s, depth + i, 1000 + 37 * s + i, true});
             auto a = std::chrono::steady_clock::now();
-            eng.forward(rows);
+            run(rows);
             ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count());
         }
         std::sort(ms.begin(), ms.end());
         const double med = ms[ms.size() / 2];
         printf("bench slots=%d depth=%d: step %.2f ms (median of %d), %.1f tok/s per stream, %.1f tok/s total\n", slots,
                depth, med, (int)ms.size(), 1000.0 / med, slots * 1000.0 / med);
+        if (sample) printf("sampling: %d of %d picks needed more than the top candidates\n", full, picks);
         return 0;
     }
     if (model.empty() || toks_s.empty()) {

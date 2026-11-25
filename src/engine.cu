@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <map>
+#include <numeric>
 #include <stdexcept>
 
 #include "engine.h"
@@ -10,6 +12,7 @@
 #include "attn.cuh"
 #include "gemm.cuh"
 #include "prefill_attn.cuh"
+#include "sampling.cuh"
 #include "prof.h"
 #include "util.cuh"
 
@@ -41,6 +44,11 @@ struct Engine::Ws {
     float* hs = nullptr;
     float *qs8 = nullptr, *ks8 = nullptr;
     float *ofa = nullptr, *mlfa = nullptr;
+    // sampling
+    float *stemp = nullptr, *ck = nullptr, *stats = nullptr, *ok = nullptr, *olse = nullptr;
+    int *ci = nullptr, *oi = nullptr;
+    smp::Adjust* adj = nullptr;
+    int adj_cap = 0;
 };
 static constexpr int FA_KB = 4096;  // keys per expansion block
 
@@ -85,6 +93,15 @@ Engine::Engine(const std::string& gguf, int n_slots, int max_ctx, bool verbose)
     w.ml = falloc(w.opart_n * H * 2);
     w.lmax = std::max(n_slots, 16);  // rows that can request logits per chunk
     w.logits = falloc((size_t)w.lmax * c.n_vocab);
+    w.stemp = falloc(w.lmax);
+    w.ck = falloc((size_t)w.lmax * smp::CHUNKS * smp::CHUNK_N);
+    CK(cudaMalloc(&w.ci, (size_t)w.lmax * smp::CHUNKS * smp::CHUNK_N * 4));
+    w.stats = falloc((size_t)w.lmax * smp::CHUNKS * 3);
+    w.ok = falloc((size_t)w.lmax * smp::SAMPLE_K);
+    CK(cudaMalloc(&w.oi, (size_t)w.lmax * smp::SAMPLE_K * 4));
+    w.olse = falloc((size_t)w.lmax * 2);
+    CK(cudaFuncSetAttribute(smp::k_topk2, cudaFuncAttributeMaxDynamicSharedMemorySize, smp::MERGE_N * 8));
+    if (c.n_vocab > smp::CHUNKS * smp::CHUNK_N) throw std::runtime_error("vocab too large for the sampler");
     CK(cudaMalloc(&w.cf, (size_t)FA_KB * c.latent() * 2));
     CK(cudaMalloc(&w.E, (size_t)FA_KB * fa::EW * 2));
     CK(cudaMalloc(&w.k8, (size_t)FA_KB * H * c.k_mla));
@@ -158,7 +175,7 @@ Engine::Engine(const std::string& gguf, int n_slots, int max_ctx, bool verbose)
 Engine::~Engine() {
     g_prof.report();
     free_model(m_);
-    cudaFree(conv_state_); cudaFree(rda_state_); cudaFree(kv_q_); cudaFree(kv_s_);
+    cudaFree(conv_state_); cudaFree(rda_state_); cudaFree(kv_q_); cudaFree(kv_s_); cudaFree(ckpt_);
     // workspace is freed with the process (v1)
     delete ws_;
 }
@@ -169,6 +186,31 @@ void Engine::reset(int slot) {
     const size_t rda1 = (size_t)m_.n_rda * c.rda_heads * c.rda_dim * c.rda_dim;
     CK(cudaMemset(conv_state_ + slot * conv1, 0, conv1 * 4));
     CK(cudaMemset(rda_state_ + slot * rda1, 0, rda1 * 4));
+}
+
+void Engine::save_state(int slot, int k) {
+    const Config& c = m_.cfg;
+    const size_t conv1 = (size_t)m_.n_rda * 3 * 3 * c.rda_heads * c.rda_dim;
+    const size_t rda1 = (size_t)m_.n_rda * c.rda_heads * c.rda_dim * c.rda_dim;
+    if (k < 0 || k >= ckpt_per_slot_) throw std::runtime_error("save_state: bad checkpoint index");
+    const size_t total = (size_t)n_slots_ * ckpt_per_slot_ * (conv1 + rda1) * 4;
+    if (!ckpt_) {
+        CK(cudaMalloc(&ckpt_, total));
+        state_bytes_ += total;
+    }
+    float* dst = ckpt_ + ((size_t)slot * ckpt_per_slot_ + k) * (conv1 + rda1);
+    CK(cudaMemcpy(dst, conv_state_ + slot * conv1, conv1 * 4, cudaMemcpyDeviceToDevice));
+    CK(cudaMemcpy(dst + conv1, rda_state_ + slot * rda1, rda1 * 4, cudaMemcpyDeviceToDevice));
+}
+
+void Engine::load_state(int slot, int k) {
+    if (!ckpt_ || k < 0 || k >= ckpt_per_slot_) throw std::runtime_error("load_state: no such checkpoint");
+    const Config& c = m_.cfg;
+    const size_t conv1 = (size_t)m_.n_rda * 3 * 3 * c.rda_heads * c.rda_dim;
+    const size_t rda1 = (size_t)m_.n_rda * c.rda_heads * c.rda_dim * c.rda_dim;
+    const float* src = ckpt_ + ((size_t)slot * ckpt_per_slot_ + k) * (conv1 + rda1);
+    CK(cudaMemcpy(conv_state_ + slot * conv1, src, conv1 * 4, cudaMemcpyDeviceToDevice));
+    CK(cudaMemcpy(rda_state_ + slot * rda1, src + conv1, rda1 * 4, cudaMemcpyDeviceToDevice));
 }
 
 // ---------------------------------------------------------------- matmul dispatch
@@ -457,6 +499,181 @@ std::vector<float> Engine::forward(const std::vector<Row>& rows) {
         }
         b0 += n;
     }
+    CK(cudaGetLastError());
+    return out;
+}
+
+// ---------------------------------------------------------------- sampling
+// Picks an entry of a list of logits sorted in descending order, following llama.cpp's chain (top_k -> top_p ->
+// min_p on temperature-1 probabilities, then the draw at the temperature). `complete`: the list is the whole
+// vocabulary; otherwise lse1/lseT (log-normalisers over the whole vocabulary at T = 1 and of logits / T) are used for
+// the draw. Returns -1 when the answer depends on entries past the list.
+static int pick(const float* v, int n, bool complete, double lse1, double lseT, const SamplingParams& p, double u) {
+    if (p.temperature <= 0.f || p.top_k == 1 || n == 1) return 0;
+    int keep = n;
+    bool open = !complete;   // the kept set may continue past the list
+    bool k_open = false;     // top_k reaches past the list: its normaliser is unknown
+    if (p.top_k > 0) {
+        if (p.top_k <= n) { keep = p.top_k; open = false; }
+        else if (open) k_open = true;
+    }
+    if (p.top_p < 1.f) {
+        if (k_open) return -1;
+        double z = lse1;
+        if (p.top_k > 0 && !open) {   // probabilities renormalised over the top-k set
+            double s = 0;
+            for (int i = 0; i < keep; i++) s += std::exp((double)v[i] - v[0]);
+            z = v[0] + std::log(s);
+        }
+        double cum = 0;
+        int i = 0;
+        for (; i < keep; i++) {
+            cum += std::exp((double)v[i] - z);
+            if (cum >= p.top_p) break;
+        }
+        if (i < keep) { keep = i + 1; open = false; }
+        else if (open) return -1;
+    }
+    if (p.min_p > 0.f) {
+        const double thr = v[0] + std::log((double)p.min_p);
+        int i = 0;
+        while (i < keep && v[i] >= thr) i++;
+        if (i < keep) { keep = std::max(i, 1); open = false; }
+        else if (open) return -1;
+    }
+    const double invT = 1.0 / p.temperature;
+    if (!open) {
+        const double m = v[0] * invT;
+        double s = 0;
+        for (int i = 0; i < keep; i++) s += std::exp(v[i] * invT - m);
+        const double target = u * s;
+        double cum = 0;
+        for (int i = 0; i < keep; i++) {
+            cum += std::exp(v[i] * invT - m);
+            if (cum > target) return i;
+        }
+        return keep - 1;
+    }
+    if (k_open) return -1;
+    double cum = 0;   // whole vocabulary at temperature T: walk the list, the rest is the tail
+    for (int i = 0; i < n; i++) {
+        cum += std::exp(v[i] * invT - lseT);
+        if (cum > u) return i;
+    }
+    return -1;
+}
+
+void Engine::sample_chunk(const SampleIn* in, int nout, SampleOut* out) {
+    Ws& w = *ws_;
+    const int V = m_.cfg.n_vocab, K = smp::SAMPLE_K;
+    std::vector<smp::Adjust> adj;
+    std::vector<float> temp(nout);
+    for (int r = 0; r < nout; r++) {
+        const SamplingParams& p = in[r].p;
+        temp[r] = p.temperature > 0.f ? p.temperature : 1.f;
+        std::map<int, std::pair<float, float>> a;   // token -> (rep, add)
+        if (in[r].counts && (p.presence_penalty != 0.f || p.frequency_penalty != 0.f || p.repetition_penalty != 1.f))
+            for (auto [tok, cnt] : *in[r].counts) {
+                if (tok < 0 || tok >= V || cnt <= 0) continue;
+                auto& e = a.try_emplace(tok, 1.f, 0.f).first->second;
+                e.first = p.repetition_penalty;
+                e.second -= p.presence_penalty + p.frequency_penalty * cnt;
+            }
+        if (in[r].bias)
+            for (auto [tok, b] : *in[r].bias)
+                if (tok >= 0 && tok < V) a.try_emplace(tok, 1.f, 0.f).first->second.second += b;
+        for (auto& [tok, e] : a) adj.push_back({r, tok, e.first, e.second});
+    }
+    if (!adj.empty()) {
+        if ((int)adj.size() > w.adj_cap) {
+            cudaFree(w.adj);
+            w.adj_cap = std::max<int>(1024, adj.size() * 2);
+            CK(cudaMalloc(&w.adj, w.adj_cap * sizeof(smp::Adjust)));
+        }
+        CK(cudaMemcpy(w.adj, adj.data(), adj.size() * sizeof(smp::Adjust), cudaMemcpyHostToDevice));
+        smp::k_adjust<<<cdiv((int)adj.size(), 256), 256>>>(w.logits, V, w.adj, (int)adj.size());
+    }
+    CK(cudaMemcpy(w.stemp, temp.data(), nout * 4, cudaMemcpyHostToDevice));
+    smp::k_topk1<<<dim3(smp::CHUNKS, nout), 512>>>(w.logits, V, w.stemp, w.ck, w.ci, w.stats);
+    smp::k_topk2<<<nout, 1024, smp::MERGE_N * 8>>>(w.ck, w.ci, w.stats, w.stemp, w.ok, w.oi, w.olse);
+    std::vector<float> hv((size_t)nout * K), hl((size_t)nout * 2);
+    std::vector<int> hi((size_t)nout * K);
+    CK(cudaMemcpy(hv.data(), w.ok, hv.size() * 4, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(hi.data(), w.oi, hi.size() * 4, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(hl.data(), w.olse, hl.size() * 4, cudaMemcpyDeviceToHost));
+    for (int r = 0; r < nout; r++) {
+        const SamplingParams& p = in[r].p;
+        const float* v = hv.data() + (size_t)r * K;
+        const int* id = hi.data() + (size_t)r * K;
+        double lse1 = hl[r * 2], lseT = hl[r * 2 + 1];
+        const int nl = std::min(std::max(p.n_logprobs, 0), 20);
+        SampleOut& o = out[r];
+        o = SampleOut();
+        int k = pick(v, K, false, lse1, lseT, p, in[r].u);
+        if (k >= 0) {
+            o.token = id[k];
+            o.logprob = (float)(v[k] - lse1);
+            for (int j = 0; j < nl; j++) o.top.push_back({id[j], (float)(v[j] - lse1)});
+            continue;
+        }
+        // the pick reaches past the candidates: merge the row's sorted slices (kept by pass 1) on the host, as far as
+        // the decision needs; the list is extended 4x at a time
+        const size_t RN = (size_t)smp::CHUNKS * smp::CHUNK_N;
+        std::vector<float> rk(RN);
+        std::vector<int> ri(RN);
+        CK(cudaMemcpy(rk.data(), w.ck + r * RN, RN * 4, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(ri.data(), w.ci + r * RN, RN * 4, cudaMemcpyDeviceToHost));
+        std::vector<int> head(smp::CHUNKS, 0);
+        auto cmp = [&](int a, int b) { return rk[(size_t)a * smp::CHUNK_N + head[a]] < rk[(size_t)b * smp::CHUNK_N + head[b]]; };
+        std::vector<int> heap;
+        for (int b = 0; b < smp::CHUNKS; b++)
+            if (ri[(size_t)b * smp::CHUNK_N] >= 0) heap.push_back(b);
+        std::make_heap(heap.begin(), heap.end(), cmp);
+        std::vector<float> sv;
+        std::vector<int> sid;
+        size_t want = 4 * K;
+        while (true) {
+            while (sv.size() < want && !heap.empty()) {
+                std::pop_heap(heap.begin(), heap.end(), cmp);
+                const int b = heap.back();
+                const size_t at = (size_t)b * smp::CHUNK_N + head[b];
+                sv.push_back(rk[at]);
+                sid.push_back(ri[at]);
+                if (++head[b] < smp::CHUNK_N && ri[(size_t)b * smp::CHUNK_N + head[b]] >= 0) std::push_heap(heap.begin(), heap.end(), cmp);
+                else heap.pop_back();
+            }
+            const bool complete = heap.empty();
+            k = pick(sv.data(), (int)sv.size(), complete, lse1, lseT, p, in[r].u);
+            if (k >= 0 || complete) break;
+            want *= 4;
+        }
+        if (k < 0) k = (int)sv.size() - 1;
+        o.token = sid[k];
+        o.logprob = (float)(sv[k] - lse1);
+        for (int j = 0; j < nl; j++) o.top.push_back({sid[j], (float)(sv[j] - lse1)});
+        o.full_copy = true;
+    }
+}
+
+std::vector<SampleOut> Engine::step(const std::vector<Row>& rows, const std::vector<SampleIn>& in) {
+    std::vector<SampleOut> out(in.size());
+    size_t used = 0;
+    for (size_t b0 = 0; b0 < rows.size();) {
+        int n = (int)std::min<size_t>(rmax_, rows.size() - b0);
+        for (int i = 1; i < n; i++)
+            if (rows[b0 + i].slot != rows[b0].slot) { n = std::min(n, rdec_); break; }
+        run_chunk(rows.data() + b0, n);
+        g_prof.calls++;
+        int nout = 0;
+        for (int i = 0; i < n; i++) nout += rows[b0 + i].logits;
+        if (nout) {
+            if (used + nout > in.size()) throw std::runtime_error("step: fewer SampleIn than rows with logits");
+            sample_chunk(in.data() + used, nout, out.data() + used);
+            used += nout;
+        }
+        b0 += n;
+    }
+    CK(cudaStreamSynchronize(cudaStreamPerThread));   // the work is done when step returns (schedulers time it)
     CK(cudaGetLastError());
     return out;
 }
