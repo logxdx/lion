@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render the hyperplexed brand assets from brand/hyperplexed-mark.svg into brand/webui/ (committed; `make webui` copies
+"""Render the Lion brand assets from brand/lion-mark.svg into brand/webui/ (committed; `make webui` copies
 them into the web UI). Needs rsvg-convert and ImageMagick (magick). Re-run after changing the mark.
 
 usage: brand/build_assets.py [splash_name_source_dir]   (default build/webui: which apple-splash files to make)
@@ -13,7 +13,7 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, "webui")
 SRC = sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, "..", "build", "webui")
-mark = open(os.path.join(HERE, "hyperplexed-mark.svg")).read()
+mark = open(os.path.join(HERE, "lion-mark.svg")).read()
 paths = re.findall(r"<path[^>]*/>", mark)  # the mark's shapes, viewBox 0 0 600 600 (content centre (300, 309))
 INK, PAPER = "#111111", "#fafafa"  # monochrome brand
 # favicon.svg follows the system theme (dark ink on light tabs, light ink on dark ones)

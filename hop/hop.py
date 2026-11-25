@@ -6,7 +6,7 @@ demand, one at a time since they share the GPU: a request for a model whose serv
 running server has no request in flight, stops it, starts the other and is then forwarded (streams pass through as
 they arrive). A server with nothing to do for `idle_unload_s` is stopped.
 
-The web UI is llama.cpp's (rebranded hyperplexed, `make webui`) in llama-server's router mode: a model picker over every model of
+The web UI is llama.cpp's (rebranded Lion, `make webui`) in llama-server's router mode: a model picker over every model of
 every server. The server tools (web_search, web_fetch, pdf) run here, so using them never loads a model.
 
 Standard library only.   usage: hop.py [--config backends.json] [--listen 127.0.0.1:11434] [--idle S] [--no-tools]

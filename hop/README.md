@@ -12,7 +12,7 @@ when a request needs one of its models and stops after 10 minutes idle. Only one
   | `d1` | liquid-engine | decisions, at `/v1/systemone` |
   | `raon-1-nano` | raon-engine | text |
 
-- **Web UI:** llama.cpp's chat UI (MIT), branded **hyperplexed**. It runs in llama-server's router mode, so it shows a
+- **Web UI:** llama.cpp's chat UI (MIT), branded **Lion**. It runs in llama-server's router mode, so it shows a
   model picker over all models.
 - **Server tools** (`web_search`, `web_fetch`, `pdf`) run in hop itself, so using one never loads a model.
 
@@ -36,7 +36,7 @@ time the model's server ran, or built from `backends.json`. Server logs are in `
 ## Run
 
 ```sh
-make webui                 # the hyperplexed web UI bundle (pinned llama.cpp release, checksum-verified)
+make webui                 # the Lion web UI bundle (pinned llama.cpp release, checksum-verified)
 make webtools              # node dependencies of the tools (in ../liquid-engine/tools/webtools)
 ./serve.sh                 # or: python3 hop.py --config backends.json [--listen host:port] [--idle S] [--no-tools]
 ```
@@ -70,6 +70,6 @@ server you start yourself (for example raon-serve on :11435) holds GPU memory th
 
 `brand/` holds:
 
-- `hyperplexed-mark.svg`;
+- `lion-mark.svg`;
 - `build_assets.py` (icons and splash screens, `make assets`);
 - `rebrand.py` (names, help texts, logo, icons; renames each content-hashed file it changes).

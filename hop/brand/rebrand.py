@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Rebrand the prebuilt web UI bundle (llama.cpp's, MIT) as hyperplexed: name, titles, logo, icons, splash screens,
+"""Rebrand the prebuilt web UI bundle (llama.cpp's, MIT) as Lion: name, titles, logo, icons, splash screens,
 and the help texts that point at llama-server. Run by `make webui` on the extracted bundle.
 
 Each text replacement must match (a different bundle version fails loudly instead of half-patching). Files under
@@ -20,13 +20,13 @@ TEXT_EXT = (".js", ".css", ".html", ".json", ".webmanifest")
 
 # (file glob: "main" = the big shared chunk, "*" = any JS/CSS/HTML file), old, new, expected count (None = >= 1)
 REPLACEMENTS = [
-    ("*", "`llama-ui`", "`hyperplexed`", None),                       # app name constant, chat page title
-    ("*", " - llama-ui`", " - hyperplexed`", None),                   # page titles
-    ("*", "`Search · llama.cpp`", "`Search · hyperplexed`", 1),
-    ("*", "`llama-ui-mcp`", "`hyperplexed-mcp`", 1),                  # MCP client name
-    ("*", "LlamaUI-MCP-Server", "Hyperplexed-MCP-Server", 2),         # default id of an added MCP server
-    ("*", "llama_settings_", "hyperplexed_settings_", 1),             # settings export file name
-    ("*", "HARNESS:`llama.app`", "HARNESS:`hyperplexed`", 1),
+    ("*", "`llama-ui`", "`Lion`", None),                       # app name constant, chat page title
+    ("*", " - llama-ui`", " - Lion`", None),                   # page titles
+    ("*", "`Search · llama.cpp`", "`Search · Lion`", 1),
+    ("*", "`llama-ui-mcp`", "`lion-mcp`", 1),                  # MCP client name
+    ("*", "LlamaUI-MCP-Server", "Lion-MCP-Server", 2),         # default id of an added MCP server
+    ("*", "llama_settings_", "lion_settings_", 1),             # settings export file name
+    ("*", "HARNESS:`llama.app`", "HARNESS:`lion`", 1),
     ("*", "`https://llama.app/v1/catalog.json`", "`./v1/catalog.json`", 1),  # served (empty) by hop
     ("*", "TOOLS:`--tools`", "TOOLS:`--no-tools`", 1),
     ("*", "`To enable Server Tools you need to run llama-server with ${ay.TOOLS} all or ${ay.TOOLS} <name> flag.${e}`",
@@ -42,9 +42,9 @@ REPLACEMENTS = [
      "<p class=\"mt-1\">hop/serve.sh (servers in hop/backends.json)</p>", 1),
     ("*", " To get local file access, tell user to launch llama-server with the ${ay.AGENT} argument.`", "`", 1),
     ("*", "ggml-org/GLM-4.7-Flash-GGUF:Q8_0", "raon-1-nano", 1),
-    ("*", "Llama Sans", "Hyperplexed Sans", None),                    # font-family names (the files keep their names)
-    ("*", "Llama Mono", "Hyperplexed Mono", None),
-    ("service-worker.js", "`llama-ui-${a}`", "`hyperplexed-${a}`", 1),  # cache name
+    ("*", "Llama Sans", "Lion Sans", None),                    # font-family names (the files keep their names)
+    ("*", "Llama Mono", "Lion Mono", None),
+    ("service-worker.js", "`llama-ui-${a}`", "`lion-${a}`", 1),  # cache name
     # a new service worker takes over at once (upstream waits for the "Update available -> Reload" click, and until
     # then serves the old cached index.html, headers included): one plain reload picks up a new UI version
     ("service-worker.js", "e.addAll(u.map(e=>new Request(e,{cache:`reload`})))))})",
@@ -64,7 +64,7 @@ def files():
 
 
 def main():
-    if os.path.exists(os.path.join(UI, ".hyperplexed")):
+    if os.path.exists(os.path.join(UI, ".lion")):
         print("already rebranded")
         return
     content = {p: open(p, encoding="utf-8").read() for p in files()}
@@ -81,7 +81,7 @@ def main():
         if (want is None and n == 0) or (want is not None and n != want):
             sys.exit(f"rebrand: expected {want or '>= 1'} of {old[:70]!r}, found {n} (UI bundle changed?)")
     # in-app logo (an SVG string; the UI recolours its fills to currentColor)
-    mark = open(os.path.join(HERE, "hyperplexed-mark.svg")).read().strip()
+    mark = open(os.path.join(HERE, "lion-mark.svg")).read().strip()
     n = 0
     for p in content:
         content[p], k = LOGO_OLD.subn(lambda _: "`" + mark + "\n`", content[p])
@@ -93,8 +93,8 @@ def main():
     content[ip] = re.sub(r"\A<!--.*?-->\s*", "", content[ip], flags=re.S)
     # manifest
     mp = os.path.join(UI, "manifest.webmanifest")
-    content[mp] = (content[mp].replace('"name":"llama-ui"', '"name":"hyperplexed"')
-                   .replace('"short_name":"llama-ui"', '"short_name":"hyperplexed"')
+    content[mp] = (content[mp].replace('"name":"llama-ui"', '"name":"Lion"')
+                   .replace('"short_name":"llama-ui"', '"short_name":"Lion"')
                    .replace("Local AI chat interface powered by llama.cpp", "Local models on your own GPU, loaded on demand"))
     for p, c in content.items():
         if c != orig[p]:
@@ -108,7 +108,7 @@ def main():
         for p in sorted(changed - done):
             data = open(p, "rb").read()
             base, ext = os.path.splitext(os.path.basename(p))
-            new = f"{base}.hp{hashlib.sha256(data).hexdigest()[:8]}{ext}"
+            new = f"{base}.li{hashlib.sha256(data).hexdigest()[:8]}{ext}"
             newp = os.path.join(os.path.dirname(p), new)
             os.rename(p, newp)
             done.add(newp)
@@ -129,8 +129,8 @@ def main():
         shutil.copyfile(os.path.join(assets, fn), os.path.join(UI, fn))
     open(os.path.join(UI, "NOTICE.txt"), "w").write(
         "This web UI is llama.cpp's (https://github.com/ggml-org/llama.cpp, ui/apps/chat), MIT License,\n"
-        "Copyright (c) 2023-2026 The ggml authors. Rebranded for hyperplexed by brand/rebrand.py.\n")
-    open(os.path.join(UI, ".hyperplexed"), "w").write("rebranded\n")
+        "Copyright (c) 2023-2026 The ggml authors. Rebranded for Lion by brand/rebrand.py.\n")
+    open(os.path.join(UI, ".lion"), "w").write("rebranded\n")
     left = [m for p in files() for m in re.findall(r"llama-ui|llama\.cpp|llama-server|ggml-org", open(p).read())]
     print(f"rebranded: {len(done)} files renamed, {len(os.listdir(assets))} icons/splashes, "
           f"remaining mentions: {sorted(set(left))}")

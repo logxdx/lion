@@ -1,4 +1,4 @@
-# hop: the gateway (hop.py, stdlib Python: nothing to build) and its web UI (llama.cpp's, branded hyperplexed)
+# hop: the gateway (hop.py, stdlib Python: nothing to build) and its web UI (llama.cpp's, branded Lion)
 BUILD := build
 
 # Web UI: llama.cpp's prebuilt chat UI (MIT), pinned and checksum-verified, rebranded by brand/rebrand.py
@@ -20,7 +20,7 @@ webui: $(UI_TAR)
 	rm -rf $(BUILD)/webui && mkdir -p $(BUILD)/webui && tar -xzf $(UI_TAR) -C $(BUILD)/webui
 	python3 brand/rebrand.py $(BUILD)/webui
 
-# brand/webui/ (icons, splash screens) from brand/hyperplexed-mark.svg; needs rsvg-convert + ImageMagick
+# brand/webui/ (icons, splash screens) from brand/lion-mark.svg; needs rsvg-convert + ImageMagick
 assets: $(UI_TAR)
 	rm -rf $(BUILD)/webui-src && mkdir -p $(BUILD)/webui-src && tar -xzf $(UI_TAR) -C $(BUILD)/webui-src
 	python3 brand/build_assets.py $(BUILD)/webui-src
