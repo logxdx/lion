@@ -46,12 +46,16 @@ Synthetic caches (`--bench --slots N --depth D`):
 
 ### Prefill, one stream
 
-The chunk size is chosen automatically from free VRAM (2048 rows here):
+`build/raon -m M --bench --prefill N`, 1 slot. The chunk size is chosen automatically from free VRAM: 4,096 rows here,
+1,366 MiB of workspace. Device memory used is 3,758 MiB (Q8_0) / 3,538 MiB (Q6_K) at 150k.
 
 | | 2048 tokens | 8192 tokens | 150k prompt |
 |---|---|---|---|
-| Q8_0 | **8,315 tok/s** (llama.cpp 6,970) | **7,465** (5,830) | **75.4 s, 2,037 tok/s** (llama.cpp ~235 s, ~640) |
-| Q6_K | 6,105 (llama.cpp 6,670) | 5,618 (5,620) | **82.3 s, 1,867 tok/s** |
+| Q8_0 | **8,352 tok/s** (llama.cpp 6,970) | **7,515** (5,830) | **67.8 s, 2,265 tok/s** (llama.cpp ~235 s, ~640) |
+| Q6_K | 6,420 (llama.cpp 6,670) | **5,826** (5,620) | **73.9 s, 2,079 tok/s** |
+
+With 4 × 128k slots resident (`raon-server --slots 4 --ctx 131072`, 4 checkpoints per slot), Q6_K still gets
+4,096-row chunks: 5,134 of 5,822 MiB used.
 
 ### Correctness
 
@@ -110,12 +114,17 @@ One CUDA graph per batch size.
 
 ### Prefill
 
-**Chunks:** sized to free VRAM, like llama.cpp's `-ub`.
+**Chunks:** the largest multiple of 128 rows, up to 4,096, that fits the free VRAM with a 256 MB margin, like
+llama.cpp's `-ub`. Bigger chunks re-expand the cached keys less often. 4,096 instead of 2,048 rows makes a 128k
+prefill 8% faster.
 
 **GEMMs on tensor cores:**
 
 - **Q8_0:** int8 `m16n8k32`, 64-deep stages, ~37 TOPS.
-- **Q6_K:** two int8 `m16n8k16` per 32, sub-scales folded into float factors, ~22 TOPS.
+- **Q6_K:** two int8 `m16n8k16` per 32, with sub-scales folded into float factors prefetched one k-step ahead; ~24 TOPS.
+  - Each partial converts to float exactly with the magic-number trick. The mma adds the magic number through its
+    accumulator input, which leaves 5 instructions per element.
+  - The kernel is instruction-bound: each output element needs two exact per-16 sub-scale terms per 32-wide step.
 - **F16:** `m16n8k16`, including grouped per-head.
 
 **MLA in expanded form**, per 4096-key block:
@@ -168,7 +177,8 @@ Cost: +0.36 ms per step at 4 × 128k, instead of copying 4 MB of logits per step
   - `logprobs`, `stop`, `seed`, `logit_bias`, `max_tokens`;
   - `chat_template_kwargs.enable_thinking`;
   - `stream_options.include_usage`, plus `timings`.
-- `/v1/models`, `/health`, `/slots`, `/tokenize`, `/detokenize`, `/apply-template`.
+- `/v1/models`, `/health`, `/slots`, `/props` (flags and VRAM breakdown), `/tokenize`, `/detokenize`,
+  `/apply-template`.
 
 **Scheduling:**
 

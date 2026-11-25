@@ -79,7 +79,12 @@ int main(int argc, char** argv) {
         std::vector<int> toks(prefill_n);
         uint32_t x = 12345;
         for (auto& t : toks) { x = x * 1664525u + 1013904223u; t = 1000 + (int)(x % 200000u); }
-        eng.prefill(0, std::vector<int>(toks.begin(), toks.begin() + std::min(prefill_n, 2048)));  // warm-up
+        // warm-up: >= 1.5 s of prefill chunks (GPU clocks ramp up from idle)
+        const auto w0 = std::chrono::steady_clock::now();
+        while (std::chrono::duration<double>(std::chrono::steady_clock::now() - w0).count() < 1.5) {
+            eng.reset(0);
+            eng.prefill(0, std::vector<int>(toks.begin(), toks.begin() + std::min(prefill_n, 2048)));
+        }
         eng.reset(0);
         const int SEG = 16384;
         double total = 0;
