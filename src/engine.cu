@@ -7,9 +7,13 @@
 
 #include "engine.h"
 #include "kernels.cuh"
+#include "attn.cuh"
+#include "prof.h"
 #include "util.cuh"
 
 namespace raon {
+
+static Prof g_prof;
 
 struct Engine::Ws {
     int R = 0;
@@ -20,8 +24,10 @@ struct Engine::Ws {
     float *ple_rows, *ple_proj, *ple;
     float *conv, *fab, *fb, *qn, *kn, *vs, *gl, *beta, *ro;
     float *qa, *qan, *q, *kv, *qlat, *olat, *o, *gate;
-    float* scratch = nullptr;  // attention scores [R][H][max_keys]
-    int max_keys = 0;
+    int8_t* qi = nullptr;        // attention queries, int8 [R][H][576]
+    float* qsc = nullptr;        // their scales [R][H][18]
+    float *opart = nullptr, *ml = nullptr;
+    size_t opart_n = 0;          // capacity in (row, split) pairs
     int8_t* xq = nullptr;
     float* xs = nullptr;
     float *hn, *hsel, *logits;
@@ -39,13 +45,14 @@ Engine::Engine(const std::string& gguf, int n_slots, int max_ctx, bool verbose)
     const Config& c = m_.cfg;
     const size_t conv_n = (size_t)n_slots * m_.n_rda * 3 * 3 * c.rda_heads * c.rda_dim;
     const size_t rda_n = (size_t)n_slots * m_.n_rda * c.rda_heads * c.rda_dim * c.rda_dim;
-    const size_t kv_n = (size_t)n_slots * m_.n_mla * max_ctx * c.latent();
+    const size_t kv_rows = (size_t)n_slots * m_.n_mla * max_ctx;
     CK(cudaMalloc(&conv_state_, conv_n * 4));
     CK(cudaMalloc(&rda_state_, rda_n * 4));
-    CK(cudaMalloc(&kv_cache_, kv_n * 2));
+    CK(cudaMalloc(&kv_q_, kv_rows * c.latent()));
+    CK(cudaMalloc(&kv_s_, kv_rows * (c.latent() / 32) * 2));
     CK(cudaMemset(conv_state_, 0, conv_n * 4));
     CK(cudaMemset(rda_state_, 0, rda_n * 4));
-    CK(cudaMemset(kv_cache_, 0, kv_n * 2));
+    state_bytes_ = conv_n * 4 + rda_n * 4 + kv_rows * (c.latent() + c.latent() / 32 * 2);
 
     ws_ = new Ws;
     Ws& w = *ws_;
@@ -87,8 +94,12 @@ Engine::Engine(const std::string& gguf, int n_slots, int max_ctx, bool verbose)
     w.olat = falloc((size_t)R * H * c.kv_lora);
     w.o = falloc((size_t)R * H * c.v_mla);
     w.gate = falloc((size_t)R * H * c.v_mla);
-    w.max_keys = std::min(max_ctx, 16384);
-    w.scratch = falloc((size_t)R * H * w.max_keys);
+    CK(cudaMalloc(&w.qi, (size_t)R * H * c.latent()));
+    w.qsc = falloc((size_t)R * H * (c.latent() / 32));
+    w.opart_n = 256;
+    w.opart = falloc(w.opart_n * H * c.kv_lora);
+    w.ml = falloc(w.opart_n * H * 2);
+    CK(cudaFuncSetAttribute(k_mla_decode<RowMeta>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sizeof(attn::Smem)));
     CK(cudaMalloc(&w.xq, (size_t)R * 2 * c.n_ff));
     w.xs = falloc((size_t)R * 2 * c.n_ff / 32);
     w.hn = falloc((size_t)R * E);
@@ -97,8 +108,9 @@ Engine::Engine(const std::string& gguf, int n_slots, int max_ctx, bool verbose)
 }
 
 Engine::~Engine() {
+    g_prof.report();
     free_model(m_);
-    cudaFree(conv_state_); cudaFree(rda_state_); cudaFree(kv_cache_);
+    cudaFree(conv_state_); cudaFree(rda_state_); cudaFree(kv_q_); cudaFree(kv_s_);
     // workspace is freed with the process (v1)
     delete ws_;
 }
@@ -149,6 +161,8 @@ static void mm(const Mat& W, const float* x, int ldx, int R, float* y, int ldy, 
 
 static inline int cdiv(int a, int b) { return (a + b - 1) / b; }
 
+#define PROF(name) g_prof.mark(name)
+
 // ---------------------------------------------------------------- forward over one chunk of rows
 void Engine::run_chunk(const Row* rows, int R) {
     const Config& c = m_.cfg;
@@ -162,7 +176,6 @@ void Engine::run_chunk(const Row* rows, int R) {
     for (int i = 0; i < R; i++) {
         if (rows[i].slot < 0 || rows[i].slot >= n_slots_) throw std::runtime_error("bad slot");
         if (rows[i].pos >= max_ctx_) throw std::runtime_error("position beyond the slot context");
-        if (rows[i].pos >= w.max_keys) throw std::runtime_error("v1 attention supports at most 16384 positions");
         if (i == 0 || rows[i].slot != rows[i - 1].slot) segs.push_back({rows[i].slot, i, 0});
         segs.back().n++;
         meta[i] = {rows[i].slot, rows[i].pos, rows[i].tok, segs.back().row0};
@@ -175,21 +188,33 @@ void Engine::run_chunk(const Row* rows, int R) {
     CK(cudaMemcpy(w.toks, toks.data(), R * 4, cudaMemcpyHostToDevice));
 
     // embeddings
+    g_prof.start();
     const Mat& te = m_.tok_embd;
     k_embed<<<R, 256>>>(te.type, te.q, te.qh, te.sc, te.d, E, w.toks, w.e, w.X, HC);
     k_ple_rows<<<R, 256>>>(m_.ple_table, m_.ple_type, m_.ple_row_bytes, G * NL, w.toks, sqrtf((float)G), w.ple_rows);
     mm(m_.ple_model_proj, w.e, E, R, w.ple_proj, G * NL, w.xq, w.xs);
     k_ple_combine<<<dim3(R, NL), G>>>(w.ple_proj, w.ple_rows, m_.ple_proj_norm, G, c.eps, w.ple);
+    PROF("embed+ple");
 
     const size_t conv_slot = (size_t)m_.n_rda * 3 * 3 * C, rda_slot = (size_t)m_.n_rda * RH * D * D;
-    const size_t kv_slot = (size_t)m_.n_mla * max_ctx_ * L;
+    const size_t kv_slot_rows = (size_t)m_.n_mla * max_ctx_;
+    int maxkeys = 0;
+    for (int i = 0; i < R; i++) maxkeys = std::max(maxkeys, rows[i].pos + 1);
+    // split keys so that R * nsplit <= opart capacity, at least 2048 keys per split
+    int split = std::max(2048, cdiv(maxkeys, std::max(1, (int)w.opart_n / R)));
+    split = cdiv(split, attn::KT) * attn::KT;
+    const int nsplit = cdiv(maxkeys, split);
 
     auto hc_pre = [&](const Mat& fn, const float* base, const float* chart, const float* norm_w) {
         k_rmsnorm<<<dim3(R, 1), 256>>>(w.X, HC * E, w.flat, HC * E, nullptr, HC * E, c.hc_eps);
         mm(fn, w.flat, HC * E, R, w.mixes, c.hc_mix(), w.xq, w.xs);
         k_hc_pre<<<R, 256>>>(w.mixes, base, chart, w.X, norm_w, E, c.eps, c.hc_mag, w.h, w.post, w.comb);
+        PROF("mhc_pre");
     };
-    auto hc_post = [&]() { k_hc_post<<<cdiv(R * E, 256), 256>>>(w.X, w.y, w.post, w.comb, E, R); };
+    auto hc_post = [&]() {
+        k_hc_post<<<cdiv(R * E, 256), 256>>>(w.X, w.y, w.post, w.comb, E, R);
+        PROF("mhc_post");
+    };
 
     for (int il = 0; il < NL; il++) {
         const Layer& Ly = m_.layers[il];
@@ -198,6 +223,7 @@ void Engine::run_chunk(const Row* rows, int R) {
             float* cst = conv_state_ + (size_t)Ly.rda_idx * 3 * 3 * C;
             float* rst = rda_state_ + (size_t)Ly.rda_idx * RH * D * D;
             mm(Ly.wqkv, w.h, E, R, w.big, 4 * C, w.xq, w.xs);
+            PROF("rda_qkv");
             k_rda_conv<<<cdiv(R * 3 * C, 256), 256>>>(w.big, 4 * C, w.rows, cst, conv_slot, Ly.conv_w, 3 * C, R, w.conv);
             k_rda_conv_state<<<cdiv(nseg * 3 * C, 256), 256>>>(w.big, 4 * C, w.segs, nseg, cst, conv_slot, 3 * C);
             const int nfab = c.dt_rank + 2 * RH;
@@ -205,30 +231,44 @@ void Engine::run_chunk(const Row* rows, int R) {
             mm(Ly.ssm_f_b, w.fab, nfab, R, w.fb, C, w.xq, w.xs);
             k_rda_prep<<<dim3(R, RH), D>>>(w.conv, w.fab, nfab, w.fb, Ly.dt_b, c.gate_lb, RH, D, c.dt_rank, w.qn, w.kn,
                                            w.vs, w.gl, w.beta);
+            PROF("rda_conv+gates");
             k_rda_scan<<<dim3(nseg, RH), D>>>(w.segs, w.qn, w.kn, w.vs, w.gl, w.beta, rst, rda_slot, RH, w.ro);
+            PROF("rda_scan");
             k_rda_out<<<dim3(R, RH), D>>>(w.ro, w.big, 4 * C, Ly.ssm_norm, RH, c.eps, w.s);
             mm(Ly.rda_out, w.s, C, R, w.y, E, w.xq, w.xs);
+            PROF("rda_out");
         } else {
-            half* kc = kv_cache_ + (size_t)Ly.mla_idx * max_ctx_ * L;
+            int8_t* kq = kv_q_ + (size_t)Ly.mla_idx * max_ctx_ * L;
+            half* ks = kv_s_ + (size_t)Ly.mla_idx * max_ctx_ * (L / 32);
             mm(Ly.q_a, w.h, E, R, w.qa, c.q_lora, w.xq, w.xs);
             k_rmsnorm<<<dim3(R, 1), 256>>>(w.qa, c.q_lora, w.qan, c.q_lora, Ly.q_a_norm, c.q_lora, c.eps_latent);
             mm(Ly.q_b, w.qan, c.q_lora, R, w.q, H * c.k_mla, w.xq, w.xs);
             mm(Ly.kv_a, w.h, E, R, w.kv, L, w.xq, w.xs);
-            k_mla_cache_write<<<R, 256>>>(w.kv, Ly.kv_a_norm, c.eps_latent, w.rows, kc, kv_slot, L, c.kv_lora);
+            k_mla_cache_write_q8<<<R, 256>>>(w.kv, Ly.kv_a_norm, c.eps_latent, w.rows, kq, ks, kv_slot_rows);
+            PROF("mla_proj");
             mm(Ly.k_b, w.q, H * c.k_mla, R, w.qlat, H * c.kv_lora, w.xq, w.xs, c.kv_lora, c.k_mla);
-            k_mla_attn_simple<<<dim3(R, H), 128>>>(w.qlat, w.q, kc, kv_slot, w.rows, H, 1.f / sqrtf((float)c.k_mla),
-                                                    w.scratch, w.max_keys, w.olat);
+            k_mla_qprep<<<cdiv(R * H * L, 256), 256>>>(w.qlat, w.q, c.k_mla, 1.f / sqrtf((float)c.k_mla), R, w.qi,
+                                                        w.qsc);
+            PROF("mla_kb+qprep");
+            k_mla_decode<RowMeta><<<dim3(R, nsplit), attn::THREADS, sizeof(attn::Smem)>>>(
+                w.qi, w.qsc, kq, ks, kv_slot_rows, w.rows, split, nsplit, w.opart, w.ml);
+            PROF("mla_attn");
+            k_mla_combine<<<dim3(R, H), 128>>>(w.opart, w.ml, nsplit, w.olat);
+            PROF("mla_combine");
             mm(Ly.v_b, w.olat, H * c.kv_lora, R, w.o, H * c.v_mla, w.xq, w.xs, c.v_mla, c.kv_lora);
             mm(Ly.attn_gate, w.h, E, R, w.gate, H * c.v_mla, w.xq, w.xs);
             k_sigmul<<<cdiv(R * H * c.v_mla, 256), 256>>>(w.o, w.gate, R * H * c.v_mla);
             mm(Ly.mla_out, w.o, H * c.v_mla, R, w.y, E, w.xq, w.xs);
+            PROF("mla_vb+gate+out");
         }
         hc_post();
         // FFN
         hc_pre(Ly.hc_ffn_fn, Ly.hc_ffn_base, Ly.hc_ffn_chart, Ly.ffn_norm);
         mm(Ly.ffn_up, w.h, E, R, w.big, 2 * c.n_ff, w.xq, w.xs);
+        PROF("ffn_up");
         k_swiglu<<<cdiv(R * c.n_ff, 256), 256>>>(w.big, w.act, c.n_ff, R);
         mm(Ly.ffn_down, w.act, c.n_ff, R, w.y, E, w.xq, w.xs);
+        PROF("ffn_down");
         hc_post();
         // per-layer input
         k_stream_sum<<<cdiv(R * E, 256), 256>>>(w.X, w.s, E, R, 1.f);
@@ -237,6 +277,7 @@ void Engine::run_chunk(const Row* rows, int R) {
         mm(Ly.ple_proj, w.qan, G, R, w.y, E, w.xq, w.xs);
         k_rmsnorm<<<dim3(R, 1), 256>>>(w.y, E, w.y2, E, Ly.ple_post_norm, E, c.eps);
         k_add_streams<<<cdiv(R * E, 256), 256>>>(w.X, w.y2, E, R);
+        PROF("ple_layer");
     }
     if (sel.empty()) return;
     const int nout = (int)sel.size();
@@ -245,6 +286,7 @@ void Engine::run_chunk(const Row* rows, int R) {
     CK(cudaMemcpy(w.sel, sel.data(), nout * 4, cudaMemcpyHostToDevice));
     k_gather<<<nout, 256>>>(w.hn, w.sel, nout, E, w.hsel);
     mm(m_.tok_embd, w.hsel, E, nout, w.logits, c.n_vocab, w.xq, w.xs);
+    PROF("lm_head");
 }
 
 std::vector<float> Engine::forward(const std::vector<Row>& rows) {
@@ -253,6 +295,7 @@ std::vector<float> Engine::forward(const std::vector<Row>& rows) {
     for (size_t b0 = 0; b0 < rows.size(); b0 += rmax_) {
         const int n = (int)std::min<size_t>(rmax_, rows.size() - b0);
         run_chunk(rows.data() + b0, n);
+        g_prof.calls++;
         int nout = 0;
         for (int i = 0; i < n; i++) nout += rows[b0 + i].logits;
         if (nout) {
@@ -270,5 +313,31 @@ std::vector<float> Engine::prefill(int slot, const std::vector<int>& toks, int p
     for (size_t i = 0; i < toks.size(); i++) rows[i] = {slot, pos0 + (int)i, toks[i], i + 1 == toks.size()};
     return forward(rows);
 }
+
+__global__ void k_fill_rand(int8_t* q, size_t n, uint32_t seed) {
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) {
+        uint32_t x = (uint32_t)i * 2654435761u ^ seed;
+        x ^= x >> 13; x *= 0x5bd1e995u; x ^= x >> 15;
+        q[i] = (int8_t)((int)(x & 0xff) - 128);
+    }
+}
+__global__ void k_fill_half(half* p, size_t n, float v) {
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x)
+        p[i] = __float2half(v);
+}
+
+void Engine::bench_fill(int slot, int depth) {
+    const Config& c = m_.cfg;
+    const int L = c.latent();
+    reset(slot);
+    for (int l = 0; l < m_.n_mla; l++) {
+        const size_t row0 = ((size_t)slot * m_.n_mla + l) * max_ctx_;
+        k_fill_rand<<<1024, 256>>>(kv_q_ + row0 * L, (size_t)depth * L, 1234u + l);
+        k_fill_half<<<1024, 256>>>(kv_s_ + row0 * (L / 32), (size_t)depth * (L / 32), 0.02f);
+    }
+    CK(cudaDeviceSynchronize());
+}
+
+size_t Engine::gpu_bytes() const { return m_.gpu_bytes + state_bytes_; }
 
 }  // namespace raon

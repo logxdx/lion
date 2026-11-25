@@ -1,5 +1,6 @@
 // raon CLI (v1): run token ids through the engine, greedy decode, print JSON lines with top-k log-probs.
 //   raon -m model.gguf --tokens 1,2,3 [-n 32] [--top 5] [--ctx 8192]
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -50,7 +51,8 @@ static void emit(int step, const float* lg, int V, int top, int chosen) {
 
 int main(int argc, char** argv) {
     std::string model, toks_s;
-    int n = 16, top = 5, ctx = 8192;
+    int n = 16, top = 5, ctx = 8192, slots = 1, depth = 0, steps = 32;
+    bool bench = false;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&]() { return std::string(argv[++i]); };
@@ -60,7 +62,31 @@ int main(int argc, char** argv) {
         else if (a == "-n") n = atoi(next().c_str());
         else if (a == "--top") top = atoi(next().c_str());
         else if (a == "--ctx") ctx = atoi(next().c_str());
+        else if (a == "--bench") bench = true;
+        else if (a == "--slots") slots = atoi(next().c_str());
+        else if (a == "--depth") depth = atoi(next().c_str());
+        else if (a == "--steps") steps = atoi(next().c_str());
         else { fprintf(stderr, "unknown argument %s\n", a.c_str()); return 1; }
+    }
+    if (bench && !model.empty()) {
+        // decode benchmark: `slots` streams at context `depth` (synthetic cache), `steps` batched decode steps
+        raon::Engine eng(model, slots, depth + steps + 64);
+        fprintf(stderr, "GPU memory: %.0f MiB (weights + states + caches)\n", eng.gpu_bytes() / 1048576.0);
+        for (int s = 0; s < slots; s++) eng.bench_fill(s, depth);
+        std::vector<double> ms;
+        for (int i = 0; i < steps + 3; i++) {
+            std::vector<raon::Row> rows;
+            for (int s = 0; s < slots; s++) rows.push_back({s, depth + i, 1000 + 37 * s + i, true});
+            auto a = std::chrono::steady_clock::now();
+            eng.forward(rows);
+            const double t = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count();
+            if (i >= 3) ms.push_back(t);  // skip warm-up steps
+        }
+        std::sort(ms.begin(), ms.end());
+        const double med = ms[ms.size() / 2];
+        printf("bench slots=%d depth=%d: step %.2f ms (median of %d), %.1f tok/s per stream, %.1f tok/s total\n", slots,
+               depth, med, (int)ms.size(), 1000.0 / med, slots * 1000.0 / med);
+        return 0;
     }
     if (model.empty() || toks_s.empty()) {
         fprintf(stderr, "usage: raon -m model.gguf --tokens 1,2,3 [-n 16] [--top 5] [--ctx 8192]\n");

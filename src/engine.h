@@ -88,6 +88,9 @@ public:
     std::vector<float> forward(const std::vector<Row>& rows);
     // Feed a prompt into a slot (chunked); returns logits of its last token.
     std::vector<float> prefill(int slot, const std::vector<int>& toks, int pos0 = 0);
+    // Benchmarking: fill a slot's latent cache [0, depth) and recurrent state with synthetic values.
+    void bench_fill(int slot, int depth);
+    size_t gpu_bytes() const;
 
 private:
     void run_chunk(const Row* rows, int n);
@@ -96,7 +99,9 @@ private:
     // per-slot state
     float* conv_state_ = nullptr;   // [slot][n_rda][3][6144]
     float* rda_state_ = nullptr;    // [slot][n_rda][16][128][128]
-    half* kv_cache_ = nullptr;      // [slot][n_mla][max_ctx][576]
+    int8_t* kv_q_ = nullptr;        // latent cache values [slot][n_mla][max_ctx][576]
+    half* kv_s_ = nullptr;          // q8 scales            [slot][n_mla][max_ctx][18]
+    size_t state_bytes_ = 0;
     // workspace
     struct Ws;
     Ws* ws_ = nullptr;
