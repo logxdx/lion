@@ -325,7 +325,7 @@ void Engine::launch_chunk(int R, int nseg, int nout, int nsplit, int pf_slot, in
             k_rda_prep<<<dim3(R, RH), D>>>(w.conv, w.fab, nfab, w.fb, Ly.dt_b, c.gate_lb, RH, D, c.dt_rank, w.qn, w.kn,
                                            w.vs, w.gl, w.beta);
             PROF("rda_conv+gates");
-            k_rda_scan<<<dim3(nseg, RH), 2 * D>>>(w.segs, w.qn, w.kn, w.vs, w.gl, w.beta, rst, rda_slot, RH, w.ro);
+            k_rda_scan<<<dim3(nseg, RH, 4), 128>>>(w.segs, w.qn, w.kn, w.vs, w.gl, w.beta, rst, rda_slot, RH, w.ro);
             PROF("rda_scan");
             k_rda_out<<<dim3(R, RH), D>>>(w.ro, w.big, 4 * C, Ly.ssm_norm, RH, c.eps, w.s);
             mm(Ly.rda_out, w.s, C, R, w.y, E, w.xq, w.xs);

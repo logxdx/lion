@@ -517,49 +517,60 @@ __global__ void k_rda_prep(const float* __restrict__ conv, const float* __restri
     gl[o] = lb * sigmoidf_(fb[o] + dt_b[h * D + j]);
     if (j == 0) beta[r * H + h] = b;
 }
-// gated delta rule, sequential over the rows of a segment. grid (nseg, H), block 256: column j of S is held by two
-// threads (j, half), each owning 64 of its 128 rows in registers; partial dot products meet in shared memory.
+// gated delta rule, sequential over the rows of a segment. Value columns of S evolve independently (delta_j and the
+// update of column j only involve column j), so a head is split over 4 blocks of 32 columns:
+// grid (nseg, H, 4), block 128 = 4 warps; warp w holds rows [32w, 32w+32) of the block's 32 columns (lane = column).
 // state layout per (slot, head): S[i][j] at i*D + j (i = key dim, j = value dim)
-__global__ void __launch_bounds__(256) k_rda_scan(const Seg* __restrict__ segs, const float* __restrict__ qn,
+__global__ void __launch_bounds__(128) k_rda_scan(const Seg* __restrict__ segs, const float* __restrict__ qn,
                                                   const float* __restrict__ kn, const float* __restrict__ vs,
                                                   const float* __restrict__ gl, const float* __restrict__ beta,
                                                   float* __restrict__ state, size_t state_slot_stride, int H,
                                                   float* __restrict__ out) {
-    constexpr int D = 128, HR = D / 2;
-    __shared__ float sq[D], sk[D], sg[D], red[2][D];
+    constexpr int D = 128, CG = 32, RQ = 4, HR = D / RQ;
+    __shared__ float sq[2][D], sk[2][D], sg[2][D], red[RQ][CG];
     const Seg g = segs[blockIdx.x];
-    const int h = blockIdx.y, j = threadIdx.x & (D - 1), half = threadIdx.x >> 7, C = H * D;
-    const int i0 = half * HR;
+    const int h = blockIdx.y, tid = threadIdx.x, lane = tid & 31, rq = tid >> 5, C = H * D;
+    const int j = blockIdx.z * CG + lane;  // this thread's column
+    const int i0 = rq * HR;
     float* S = state + (size_t)g.slot * state_slot_stride + (size_t)h * D * D;
     float s[HR];
 #pragma unroll
     for (int i = 0; i < HR; i++) s[i] = S[(i0 + i) * D + j];
     const float scale = rsqrtf((float)D);
-    for (int t = 0; t < g.n; t++) {
+    // the next token's inputs are loaded into registers one iteration ahead (the loop is latency-bound)
+    float pq = 0.f, pk = 0.f, pg = 0.f, pv = 0.f, pb = 0.f;
+    auto fetch = [&](int t) {
         const int r = g.row0 + t;
         const size_t o = (size_t)r * C + h * D;
+        pq = qn[o + tid];
+        pk = kn[o + tid];
+        pg = gl[o + tid];
+        pv = vs[o + j];
+        pb = beta[r * H + h];
+    };
+    if (g.n > 0) fetch(0);
+    for (int t = 0; t < g.n; t++) {
+        const int r = g.row0 + t, bu = t & 1;
+        const size_t o = (size_t)r * C + h * D;
+        sq[bu][tid] = pq;
+        sk[bu][tid] = pk;
+        sg[bu][tid] = __expf(pg);
+        const float v = pv, b = pb;
+        if (t + 1 < g.n) fetch(t + 1);
         __syncthreads();
-        if (half == 0) {
-            sq[j] = qn[o + j];
-            sk[j] = kn[o + j];
-        } else {
-            sg[j] = __expf(gl[o + j]);
-        }
-        __syncthreads();
-        const float v = vs[o + j], b = beta[r * H + h];
         float kv = 0.f;
 #pragma unroll
-        for (int i = 0; i < HR; i++) { s[i] *= sg[i0 + i]; kv += s[i] * sk[i0 + i]; }
-        red[half][j] = kv;
+        for (int i = 0; i < HR; i++) { s[i] *= sg[bu][i0 + i]; kv += s[i] * sk[bu][i0 + i]; }
+        red[rq][lane] = kv;
         __syncthreads();
-        const float delta = b * (v - (red[0][j] + red[1][j]));
+        const float delta = b * (v - (red[0][lane] + red[1][lane] + red[2][lane] + red[3][lane]));
         float acc = 0.f;
 #pragma unroll
-        for (int i = 0; i < HR; i++) { s[i] += sk[i0 + i] * delta; acc += s[i] * sq[i0 + i]; }
-        __syncthreads();  // both halves have read red[.][j] before it is reused
-        red[half][j] = acc;
+        for (int i = 0; i < HR; i++) { s[i] += sk[bu][i0 + i] * delta; acc += s[i] * sq[bu][i0 + i]; }
+        __syncthreads();  // every warp has read red before it is reused
+        red[rq][lane] = acc;
         __syncthreads();
-        if (half == 0) out[o + j] = (red[0][j] + red[1][j]) * scale;
+        if (rq == 0) out[o + j] = (red[0][lane] + red[1][lane] + red[2][lane] + red[3][lane]) * scale;
     }
 #pragma unroll
     for (int i = 0; i < HR; i++) S[(i0 + i) * D + j] = s[i];
