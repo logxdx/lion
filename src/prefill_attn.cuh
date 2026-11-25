@@ -330,6 +330,15 @@ struct Smem {
 };
 }  // namespace fa8
 
+#ifndef FA_PV_F32ACC
+#define FA_PV_F32ACC 0
+#endif
+__device__ __forceinline__ void fa_mma_h(uint32_t* c, const uint32_t* a, uint32_t b0, uint32_t b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
+        : "+r"(c[0]), "+r"(c[1])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
 __device__ __forceinline__ void fa_mma_s8(int* c, const uint32_t* a, uint32_t b0, uint32_t b1) {
     asm volatile(
         "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
@@ -525,6 +534,7 @@ k_fa8(const int8_t* __restrict__ Q8, const float* __restrict__ qs, int n, int qp
             l1 = l1 * a1 + ps1;
             m0 = mn0;
             m1 = mn1;
+#if FA_PV_F32ACC
 #pragma unroll
             for (int i = 0; i < DV / 8; i++) { o[i][0] *= a0; o[i][1] *= a0; o[i][2] *= a1; o[i][3] *= a1; }
 #pragma unroll
@@ -538,6 +548,36 @@ k_fa8(const int8_t* __restrict__ Q8, const float* __restrict__ qs, int n, int qp
                     fa_mma(o[i + 1], pa[kk], b2, b3);
                 }
             }
+#else
+            // the tile's P V (64 keys) accumulates in f16 (full-rate mma on GeForce), then folds into the f32 output;
+            // done in two halves of the 128 dims to bound registers
+#pragma unroll
+            for (int hd = 0; hd < 2; hd++) {
+                uint32_t th[DV / 16][2];
+#pragma unroll
+                for (int i = 0; i < DV / 16; i++) th[i][0] = th[i][1] = 0u;
+#pragma unroll
+                for (int kk = 0; kk < BKEY / 16; kk++) {
+#pragma unroll
+                    for (int i = 0; i < DV / 16; i += 2) {
+                        uint32_t b0, b1, b2, b3;
+                        const int mi = lane >> 3, rr = lane & 7;
+                        fa_ldsm_x4_t(b0, b1, b2, b3,
+                                     &S.v[st][(kk * 16 + rr + 8 * (mi & 1)) * VP + (hd * 8 + i + (mi >> 1)) * 8]);
+                        fa_mma_h(th[i], pa[kk], b0, b1);
+                        fa_mma_h(th[i + 1], pa[kk], b2, b3);
+                    }
+                }
+#pragma unroll
+                for (int i = 0; i < DV / 16; i++) {
+                    float* oo = o[hd * 8 + i];
+                    const float2 lo = __half22float2(*(const half2*)&th[i][0]);
+                    const float2 hi = __half22float2(*(const half2*)&th[i][1]);
+                    oo[0] = oo[0] * a0 + lo.x; oo[1] = oo[1] * a0 + lo.y;
+                    oo[2] = oo[2] * a1 + hi.x; oo[3] = oo[3] * a1 + hi.y;
+                }
+            }
+#endif
         }
         __syncthreads();
     }
