@@ -442,6 +442,20 @@ __global__ void k_add_streams(float* __restrict__ X, const float* __restrict__ y
 }
 
 // ---------------------------------------------------------------- elementwise
+// SwiGLU fused with int8 quantization (per 32) for the next GEMM: gu row = [gate | up], one warp per 32-block
+__global__ void k_swiglu_quantize(const float* __restrict__ gu, int F, int R, int8_t* __restrict__ xq,
+                                  float* __restrict__ xs) {
+    const int gw = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+    const int nb = F / 32;
+    if (gw >= R * nb) return;
+    const int r = gw / nb, b = gw % nb, i = b * 32 + lane;
+    const float v = siluf_(gu[(size_t)r * 2 * F + i]) * gu[(size_t)r * 2 * F + F + i];
+    const float amax = warp_max(fabsf(v));
+    const float d = amax / 127.f;
+    const float id = d > 0.f ? 1.f / d : 0.f;
+    xq[(size_t)r * F + i] = (int8_t)roundf(v * id);
+    if (lane == 0) xs[(size_t)r * nb + b] = d;
+}
 __global__ void k_swiglu(const float* __restrict__ gu, float* __restrict__ out, int F, int R) {  // gu row = [gate|up]
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= R * F) return;

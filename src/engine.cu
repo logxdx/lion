@@ -159,9 +159,10 @@ static void launch_gemv(const Mat& W, const float* x, int ldx, const int8_t* xq,
     else k_gemv_f16<B><<<blocks, threads>>>(W.d, W.N, W.K, x, ldx, rpg ? rpg : W.N, gstride, y, ldy);
 }
 
+// prequant: xq/xs already hold the int8 activations (x is not read for Q8/Q6 weights)
 static void mm(const Mat& W, const float* x, int ldx, int R, float* y, int ldy, int8_t* xq, float* xs, int rpg = 0,
-               int gstride = 0) {
-    if (W.type != W_F16) {
+               int gstride = 0, bool prequant = false) {
+    if (W.type != W_F16 && !prequant) {
         const int nb = W.K / 32;
         const int warps = R * nb;
         k_quantize<<<(warps * 32 + 255) / 256, 256>>>(x, ldx, W.K, R, xq, xs);
@@ -384,8 +385,13 @@ void Engine::launch_chunk(int R, int nseg, int nout, int nsplit, int pf_slot, in
         }
         mm(Ly.ffn_up, w.h, E, R, w.big, 2 * c.n_ff, w.xq, w.xs);
         PROF("ffn_up");
-        k_swiglu<<<cdiv(R * c.n_ff, 256), 256>>>(w.big, w.act, c.n_ff, R);
-        mm(Ly.ffn_down, w.act, c.n_ff, R, w.y, E, w.xq, w.xs);
+        if (Ly.ffn_down.type != W_F16) {
+            k_swiglu_quantize<<<cdiv(R * c.n_ff, 256), 256>>>(w.big, c.n_ff, R, w.xq, w.xs);
+            mm(Ly.ffn_down, nullptr, c.n_ff, R, w.y, E, w.xq, w.xs, 0, 0, true);
+        } else {
+            k_swiglu<<<cdiv(R * c.n_ff, 256), 256>>>(w.big, w.act, c.n_ff, R);
+            mm(Ly.ffn_down, w.act, c.n_ff, R, w.y, E, w.xq, w.xs);
+        }
         PROF("ffn_down");
         // per-layer input; the fused path adds RMSNorm(proj) to the streams at the next mHC step
         if (old_mhc) {
