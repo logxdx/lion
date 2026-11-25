@@ -263,7 +263,8 @@ k_gemm_q8v(const int8_t* __restrict__ xq, const float* __restrict__ xs, const in
 // ---------------------------------------------------------------- Q6_K weights
 // Q6_K: 6-bit values with an int8 scale per 16 and a half scale per 256. A 32-wide k-step (one activation block) is
 // one (half, r) slice of a 256-block: 32 contiguous low-nibble bytes + 32 contiguous high-bit bytes, two sub-scales.
-// Per k-step: two int8 mma m16n8k16 (one per sub-block), combined in int32 with the sub-scales, then one float FMA.
+// Per k-step: two int8 mma m16n8k16 (one per sub-block); each partial is converted exactly (magic number added by the
+// mma itself) and scaled by its float factor (sub-scale x d, prefetched one k-step ahead).
 namespace gq6 {
 constexpr int BM = 128, BN = 128, BK = 32, ST = 2, THREADS = 256;
 constexpr int P = BK + 16;
@@ -277,12 +278,17 @@ struct Smem {
 };
 }  // namespace gq6
 
-__device__ __forceinline__ void g_mma_s8k16(int* c, uint32_t a0, uint32_t a1, uint32_t b0) {
+__device__ __forceinline__ void g_mma_s8k16(int* c, uint32_t a0, uint32_t a1, uint32_t b0, int c0 = 0) {
     asm volatile(
         "mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%7,%7,%7};\n"
         : "=r"(c[0]), "=r"(c[1]), "=r"(c[2]), "=r"(c[3])
-        : "r"(a0), "r"(a1), "r"(b0), "r"(0));
+        : "r"(a0), "r"(a1), "r"(b0), "r"(c0));
 }
+
+// Exact int -> float of a tensor-core partial |c| < 2^22: the mma adds the magic 0x4B400000 (its accumulator input), so
+// __int_as_float(result) = 12582912 + c exactly and one float subtraction finishes the conversion (no integer add).
+constexpr int kMagicI = 0x4B400000;
+constexpr float kMagicF = 12582912.f;
 
 // grid (ceil(T/128), N/128), block 256. W planes as repacked by the loader: ql [N][K/2], qh [N][K/4], sc [N][K/16],
 // d [N][K/256], GGUF block order. Requires N % 128 == 0, K % 256 == 0.
@@ -310,13 +316,6 @@ k_gemm_q6(const int8_t* __restrict__ xq, const float* __restrict__ xs, const uin
             if (tid < BM) {
                 const int tt = m0 + tid;
                 g_cp4(&S.as[st][tid], xs + (size_t)(tt < T ? tt : 0) * (K / 32) + kb, tt < T);
-            } else {
-                const int nn = tid - BM;
-                const size_t rn = (size_t)(n0 + nn);
-                const float dd = __half2float(wd[rn * (K / 256) + blk]);
-                const int si = blk * 16 + hf * 8 + 2 * r;
-                S.bf[st][0][nn] = (float)wsc[rn * (K / 16) + si] * dd;
-                S.bf[st][1][nn] = (float)wsc[rn * (K / 16) + si + 1] * dd;
             }
         }
         g_commit();
@@ -330,13 +329,28 @@ k_gemm_q6(const int8_t* __restrict__ xq, const float* __restrict__ xs, const uin
 #pragma unroll
             for (int k = 0; k < 4; k++) acc[i][j][k] = 0.f;
 
+    // per-column factors (sub-scale x d) of a k-step: thread -> (column tid / 2, half tid % 2), loaded one k-step
+    // ahead into a register and stored to smem after the compute of the current one
+    float fpre = 0.f;
+    auto load_f = [&](int kb) {
+        if (kb < nkb) {
+            const int blk = kb >> 3, mm = kb & 7, hf = mm >> 2, r = mm & 3;
+            const size_t rn = (size_t)(n0 + (tid >> 1));
+            fpre = (float)wsc[rn * (K / 16) + blk * 16 + hf * 8 + 2 * r + (tid & 1)] * __half2float(wd[rn * (K / 256) + blk]);
+        }
+    };
+    auto store_f = [&](int st) { S.bf[st][tid & 1][tid >> 1] = fpre; };
+
     issue(0, 0);
+    load_f(0);
+    store_f(0);
     const int g = lane >> 2, t4 = lane & 3;
     for (int kb = 0; kb < nkb; kb++) {
         const int st = kb & 1;
         g_wait<0>();
         __syncthreads();
         issue(kb + 1, st ^ 1);
+        load_f(kb + 1);
         // unpack this k-step's weights: 128 rows x 32 values; thread: row tid/2, 16 values
         {
             const int r = (kb & 7) & 3;
@@ -381,15 +395,16 @@ k_gemm_q6(const int8_t* __restrict__ xq, const float* __restrict__ xs, const uin
 #pragma unroll
             for (int j = 0; j < 8; j++) {
                 int cl[4], ch[4];
-                g_mma_s8k16(cl, a[i][0], a[i][1], b[j][0]);
-                g_mma_s8k16(ch, a[i][2], a[i][3], b[j][1]);
+                g_mma_s8k16(cl, a[i][0], a[i][1], b[j][0], kMagicI);
+                g_mma_s8k16(ch, a[i][2], a[i][3], b[j][1], kMagicI);
 #pragma unroll
                 for (int e = 0; e < 4; e++) {
                     const int q = e & 1;
                     const float rr = ra[i][e >> 1];
-                    acc[i][j][e] += (i2f_exact(cl[e]) * f0[j][q] + i2f_exact(ch[e]) * f1[j][q]) * rr;
+                    acc[i][j][e] += ((__int_as_float(cl[e]) - kMagicF) * f0[j][q] + (__int_as_float(ch[e]) - kMagicF) * f1[j][q]) * rr;
                 }
             }
+        store_f(st ^ 1);  // read in the next k-step, after its first barrier
     }
 #pragma unroll
     for (int i = 0; i < 2; i++)
