@@ -105,14 +105,13 @@ Engine::Engine(const std::string& gguf, int n_slots, int max_ctx, bool verbose, 
     w.lmax = std::max(n_slots, 16);  // rows that can request logits per chunk
     w.logits = falloc((size_t)w.lmax * c.n_vocab);
     w.stemp = falloc(w.lmax);
-    w.ck = falloc((size_t)w.lmax * smp::CHUNKS * smp::CHUNK_N);
-    CK(cudaMalloc(&w.ci, (size_t)w.lmax * smp::CHUNKS * smp::CHUNK_N * 4));
+    w.ck = falloc((size_t)w.lmax * smp::CK_PER_ROW);
+    CK(cudaMalloc(&w.ci, (size_t)w.lmax * smp::CK_PER_ROW * 4));
     w.stats = falloc((size_t)w.lmax * smp::CHUNKS * 3);
     w.ok = falloc((size_t)w.lmax * smp::SAMPLE_K);
     CK(cudaMalloc(&w.oi, (size_t)w.lmax * smp::SAMPLE_K * 4));
     w.olse = falloc((size_t)w.lmax * 2);
-    CK(cudaFuncSetAttribute(smp::k_topk2, cudaFuncAttributeMaxDynamicSharedMemorySize, smp::MERGE_N * 8));
-    if (c.n_vocab > smp::CHUNKS * smp::CHUNK_N) throw std::runtime_error("vocab too large for the sampler");
+    if (c.n_vocab > smp::CHUNKS * smp::K1_THREADS * smp::K1_PER) throw std::runtime_error("vocab too large for the sampler");
     if (getenv("RAON_EXPAND16") || getenv("RAON_FA16")) {   // f16 expansion path (A/B only)
         CK(cudaMalloc(&w.cf, (size_t)FA_KB * c.latent() * 2));
         CK(cudaMalloc(&w.E, (size_t)FA_KB * fa::EW * 2));
@@ -639,8 +638,8 @@ void Engine::sample_chunk(const SampleIn* in, int nout, SampleOut* out) {
         smp::k_adjust<<<cdiv((int)adj.size(), 256), 256>>>(w.logits, V, w.adj, (int)adj.size());
     }
     CK(cudaMemcpy(w.stemp, temp.data(), nout * 4, cudaMemcpyHostToDevice));
-    smp::k_topk1<<<dim3(smp::CHUNKS, nout), 512>>>(w.logits, V, w.stemp, w.ck, w.ci, w.stats);
-    smp::k_topk2<<<nout, 1024, smp::MERGE_N * 8>>>(w.ck, w.ci, w.stats, w.stemp, w.ok, w.oi, w.olse);
+    smp::k_topk1<<<dim3(smp::CHUNKS, nout), smp::K1_THREADS>>>(w.logits, V, w.stemp, w.ck, w.ci, w.stats);
+    smp::k_topk2<<<nout, smp::K2_THREADS>>>(w.ck, w.ci, w.stats, w.stemp, w.ok, w.oi, w.olse);
     std::vector<float> hv((size_t)nout * K), hl((size_t)nout * 2);
     std::vector<int> hi((size_t)nout * K);
     CK(cudaMemcpy(hv.data(), w.ok, hv.size() * 4, cudaMemcpyDeviceToHost));
@@ -661,36 +660,25 @@ void Engine::sample_chunk(const SampleIn* in, int nout, SampleOut* out) {
             for (int j = 0; j < nl; j++) o.top.push_back({id[j], (float)(v[j] - lse1)});
             continue;
         }
-        // the pick reaches past the candidates: merge the row's sorted slices (kept by pass 1) on the host, as far as
-        // the decision needs; the list is extended 4x at a time
-        const size_t RN = (size_t)smp::CHUNKS * smp::CHUNK_N;
-        std::vector<float> rk(RN);
-        std::vector<int> ri(RN);
-        CK(cudaMemcpy(rk.data(), w.ck + r * RN, RN * 4, cudaMemcpyDeviceToHost));
-        CK(cudaMemcpy(ri.data(), w.ci + r * RN, RN * 4, cudaMemcpyDeviceToHost));
-        std::vector<int> head(smp::CHUNKS, 0);
-        auto cmp = [&](int a, int b) { return rk[(size_t)a * smp::CHUNK_N + head[a]] < rk[(size_t)b * smp::CHUNK_N + head[b]]; };
-        std::vector<int> heap;
-        for (int b = 0; b < smp::CHUNKS; b++)
-            if (ri[(size_t)b * smp::CHUNK_N] >= 0) heap.push_back(b);
-        std::make_heap(heap.begin(), heap.end(), cmp);
+        // the pick reaches past the candidates: copy the (penalised) row and select on the host, the top m entries in
+        // order (value descending, index ascending), m growing 4x until the decision is made
+        std::vector<float> row(V);
+        CK(cudaMemcpy(row.data(), w.logits + (size_t)r * V, (size_t)V * 4, cudaMemcpyDeviceToHost));
+        std::vector<int> ord(V);
+        std::iota(ord.begin(), ord.end(), 0);
+        auto before = [&](int a, int b) { return row[a] > row[b] || (row[a] == row[b] && a < b); };
         std::vector<float> sv;
         std::vector<int> sid;
-        size_t want = 4 * K;
-        while (true) {
-            while (sv.size() < want && !heap.empty()) {
-                std::pop_heap(heap.begin(), heap.end(), cmp);
-                const int b = heap.back();
-                const size_t at = (size_t)b * smp::CHUNK_N + head[b];
-                sv.push_back(rk[at]);
-                sid.push_back(ri[at]);
-                if (++head[b] < smp::CHUNK_N && ri[(size_t)b * smp::CHUNK_N + head[b]] >= 0) std::push_heap(heap.begin(), heap.end(), cmp);
-                else heap.pop_back();
-            }
-            const bool complete = heap.empty();
-            k = pick(sv.data(), (int)sv.size(), complete, lse1, lseT, p, in[r].u);
+        for (size_t want = 4 * K;; want *= 4) {
+            const size_t m = std::min<size_t>(want, V);
+            if (m < (size_t)V) std::nth_element(ord.begin(), ord.begin() + m, ord.end(), before);
+            std::sort(ord.begin(), ord.begin() + m, before);
+            sv.resize(m);
+            sid.assign(ord.begin(), ord.begin() + m);
+            for (size_t i = 0; i < m; i++) sv[i] = row[sid[i]];
+            const bool complete = m == (size_t)V;
+            k = pick(sv.data(), (int)m, complete, lse1, lseT, p, in[r].u);
             if (k >= 0 || complete) break;
-            want *= 4;
         }
         if (k < 0) k = (int)sv.size() - 1;
         o.token = sid[k];

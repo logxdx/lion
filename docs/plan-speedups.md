@@ -1,6 +1,6 @@
 # raon-engine: plan for further speed-ups
 
-Status: 2026-11-25, after `1d2664e`.
+Status: 2026-11-25, after the sampler radix select.
 
 Done:
 
@@ -190,7 +190,27 @@ The original plan follows.
 
 **Effort:** large; do it incrementally, fusing one boundary at a time with an A/B each.
 
-### 7. Sampler first pass: radix select instead of full bitonic sort
+### 7. Sampler first pass: radix select instead of full bitonic sort: DONE (`HEAD`)
+
+**Measured:**
+
+- The bitonic passes took much more than the +0.36 ms net estimate: 0.38-0.63 ms per step at 1 row and 0.87-0.98 ms
+  at 4 rows (`tests/sample_bench.cu`).
+- With the radix select they take 68-79 / 100-128 µs.
+
+**Decode with `--sample` (400 steps, ×2):**
+
+- 4 × 128k: 17.03 → 16.27 ms (−4.5 %);
+- 1 × 1k: 7.35 → 7.03 ms.
+
+**Also:**
+
+- The exact host fallback now copies the logits row and selects with `nth_element`.
+- `build/sampling_check` 289/289.
+- −30 MiB VRAM (candidate buffers 2 MB → 32 KB per row).
+
+The original plan follows.
+
 
 **Basis:**
 - GPU sampling costs +0.36 ms per step at 4 × 128k (*measured*, `--sample`).

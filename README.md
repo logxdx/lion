@@ -183,9 +183,11 @@ The host then runs llama.cpp's chain on those ~1 KB: top-k → top-p → min-p o
 the temperature, with the caller's uniform number (seedable).
 
 When the decision reaches past the 128 candidates (a flat distribution with top-p, or the draw falls in the tail),
-the host merges the row's 64 sorted slices only as far as needed, so the result is exact.
+the host copies the row and selects with `nth_element` only as far as needed, so the result is exact.
 
-Cost: +0.36 ms per step at 4 × 128k, instead of copying 4 MB of logits per step.
+Both passes are radix selects: an exact 128th-largest value by 8-bit histograms, then a sort of only the final 128.
+They cost 0.10-0.13 ms per step for 4 rows (`tests/sample_bench.cu`). At 4 × 128k, decode with sampling runs at
+16.27 ms per step, 61.5 tok/s per stream.
 
 ### Server
 
