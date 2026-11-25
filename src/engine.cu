@@ -39,7 +39,7 @@ struct Engine::Ws {
     std::map<int, cudaGraphExec_t> graphs;  // decode step graphs by batch size
     int lmax = 0;
     // prefill attention (expanded form)
-    half *qf = nullptr, *cf = nullptr, *E = nullptr;
+    half *qf = nullptr, *cf = nullptr, *E = nullptr, *vf = nullptr;
     int8_t *q8 = nullptr, *k8 = nullptr, *hq = nullptr;
     float* hs = nullptr;
     float *qs8 = nullptr, *ks8 = nullptr;
@@ -109,8 +109,13 @@ Engine::Engine(const std::string& gguf, int n_slots, int max_ctx, bool verbose, 
     w.olse = falloc((size_t)w.lmax * 2);
     CK(cudaFuncSetAttribute(smp::k_topk2, cudaFuncAttributeMaxDynamicSharedMemorySize, smp::MERGE_N * 8));
     if (c.n_vocab > smp::CHUNKS * smp::CHUNK_N) throw std::runtime_error("vocab too large for the sampler");
-    CK(cudaMalloc(&w.cf, (size_t)FA_KB * c.latent() * 2));
-    CK(cudaMalloc(&w.E, (size_t)FA_KB * fa::EW * 2));
+    if (getenv("RAON_EXPAND16") || getenv("RAON_FA16")) {   // f16 expansion path (A/B only)
+        CK(cudaMalloc(&w.cf, (size_t)FA_KB * c.latent() * 2));
+        CK(cudaMalloc(&w.E, (size_t)FA_KB * fa::EW * 2));
+    } else {
+        if (!KV_ROWSCALE) throw std::runtime_error("int8 expansion needs KV_ROWSCALE=1 (set RAON_EXPAND16 otherwise)");
+        CK(cudaMalloc(&w.vf, (size_t)FA_KB * H * c.v_mla * 2));
+    }
     CK(cudaMalloc(&w.k8, (size_t)FA_KB * H * c.k_mla));
     w.ks8 = falloc((size_t)FA_KB * H * 2);
 
@@ -421,6 +426,7 @@ void Engine::launch_chunk(int R, int nseg, int nout, int nsplit, int pf_slot, in
                 // prefill segment: expanded attention, key blocks of up to FA_KB keys
                 const float scale = 1.f / sqrtf((float)c.k_mla);
                 static const bool fa16 = getenv("RAON_FA16") != nullptr;  // f16 QK^T (A/B)
+                static const bool ex16 = fa16 || getenv("RAON_EXPAND16") != nullptr;  // f16 expansion (A/B)
                 if (fa16) k_fa_qprep<<<cdiv(R * H * c.k_mla, 256), 256>>>(w.q, R, scale, w.qf);
                 else k_fa_qprep8<<<cdiv(R * H * 32, 256), 256>>>(w.q, R, scale, w.q8, w.qs8);
                 k_fa_init<<<cdiv(H * R * c.v_mla, 256), 256>>>(w.ofa, w.mlfa, H * R);
@@ -428,17 +434,23 @@ void Engine::launch_chunk(int R, int nseg, int nout, int nsplit, int pf_slot, in
                 const int kmax = pf_pos0 + R;
                 for (int kb0 = 0; kb0 < kmax; kb0 += FA_KB) {
                     const int nk = std::min(FA_KB, kmax - kb0);
-                    k_cache_dequant<<<cdiv(nk * (L / 8), 256), 256>>>(kq, ks, slot_row0 + kb0, nk, w.cf);
-                    k_gemm_hh<<<dim3(cdiv(nk, 64), fa::EW / 64), 128>>>(w.cf, L, Ly.wexp, nk, fa::EW, c.kv_lora, w.E,
-                                                                         fa::EW);
-                    if (!fa16) k_fa_kquant<<<cdiv(nk * H * 32, 256), 256>>>(w.E, w.cf, nk, w.k8, w.ks8);
+                    if (ex16) {
+                        k_cache_dequant<<<cdiv(nk * (L / 8), 256), 256>>>(kq, ks, slot_row0 + kb0, nk, w.cf);
+                        k_gemm_hh<<<dim3(cdiv(nk, 64), fa::EW / 64), 128>>>(w.cf, L, Ly.wexp, nk, fa::EW, c.kv_lora, w.E,
+                                                                             fa::EW);
+                        if (!fa16) k_fa_kquant<<<cdiv(nk * H * 32, 256), 256>>>(w.E, w.cf, nk, w.k8, w.ks8);
+                    } else {
+                        k_expand8<<<dim3(cdiv(nk, ex8::BM), 2 * H), ex8::THREADS>>>(kq, ks, slot_row0 + kb0, nk, Ly.wexp8,
+                                                                                   Ly.wexp8s, w.k8, w.ks8, w.vf);
+                    }
                     PROF("pf_expand");
                     if (fa16)
                         k_fa<<<dim3(cdiv(R, fa::BQ), H), fa::THREADS, sizeof(fa::Smem)>>>(w.qf, R, pf_pos0, w.E, w.cf, nk,
                                                                                            kb0, w.ofa, w.mlfa);
                     else
                         k_fa8<<<dim3(cdiv(R, fa::BQ), H), fa::THREADS, sizeof(fa8::Smem)>>>(
-                            w.q8, w.qs8, R, pf_pos0, w.k8, w.ks8, w.E, nk, kb0, w.ofa, w.mlfa);
+                            w.q8, w.qs8, R, pf_pos0, w.k8, w.ks8, ex16 ? w.E + H * fa::NOPE : w.vf,
+                            ex16 ? fa::EW : H * fa::DV, nk, kb0, w.ofa, w.mlfa);
                     PROF("pf_flashattn");
                 }
                 k_fa_final<<<cdiv(R * H * c.v_mla, 256), 256>>>(w.ofa, w.mlfa, R, w.o);

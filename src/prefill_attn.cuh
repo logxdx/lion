@@ -373,6 +373,127 @@ __global__ void k_fa_kquant(const half* __restrict__ E, const half* __restrict__
     *(char2*)&dst[NOPE + lane * 2] = qp;
     if (lane == 0) { ks[((size_t)key * H + h) * 2] = d; ks[((size_t)key * H + h) * 2 + 1] = dp; }
 }
+// ---------------------------------------------------------------- int8 expansion (replaces dequant + f16 GEMM + kquant)
+// For a block of nk cached keys of one slot/layer, on int8 tensor cores (4x the rate of the f16 / f32-accumulate GEMM):
+//   acc[key][c] = sum_r cache_q[key][r] * W8[c][r]      int32 over the 512 latent values, exact (|acc| < 2^24)
+//   value       = acc * latent_scale[key] * wsc[c]      (W8: k_b^T / v_b quantized per output channel at load)
+// Column tiles 0..31 are K_nope of head h: quantized to int8 with one scale per (key, head) in the epilogue (the tile is
+// the head's 128 columns), and the pe part is copied from the cache (already int8 with its row scale):
+//   K8 [nk][H][192], ks8 [nk][H][2] (nope, pe), as k_fa_kquant wrote them.
+// Column tiles 32..63 are V of head h - 32: f16 V [nk][H * 128].
+// Requires the per-row latent cache scales (KV_ROWSCALE).
+namespace ex8 {
+constexpr int BM = 128, BN = 128, BK = 64, P = BK + 16, THREADS = 256, KD = 512;
+}
+__global__ void __launch_bounds__(ex8::THREADS, 2)
+k_expand8(const int8_t* __restrict__ cq, const half* __restrict__ cs, size_t row0, int nk, const int8_t* __restrict__ w8,
+          const float* __restrict__ wsc, int8_t* __restrict__ K8, float* __restrict__ ks8, half* __restrict__ V) {
+    using namespace ex8;
+    __shared__ __align__(16) int8_t sa[2][BM * P], sb[2][BN * P];
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t4 = lane & 3;
+    const int m0 = blockIdx.x * BM, ct = blockIdx.y, n0 = ct * BN;
+    auto issue = [&](int kb, int st) {
+        if (kb < KD / BK) {
+#pragma unroll
+            for (int i = 0; i < 2; i++) {
+                const int c = tid + i * THREADS, row = c >> 2, part = c & 3;
+                const int key = m0 + row;
+                const bool ok = key < nk;
+                fa_cp16(&sa[st][row * P + part * 16], cq + (row0 + (ok ? key : 0)) * fa::L + kb * BK + part * 16, ok);
+                fa_cp16(&sb[st][row * P + part * 16], w8 + (size_t)(n0 + row) * KD + kb * BK + part * 16, true);
+            }
+        }
+        asm volatile("cp.async.commit_group;\n");
+    };
+    int acc[BN / 8][4];
+#pragma unroll
+    for (int j = 0; j < BN / 8; j++) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0;
+    issue(0, 0);
+    for (int kb = 0; kb < KD / BK; kb++) {
+        const int st = kb & 1;
+        issue(kb + 1, st ^ 1);
+        asm volatile("cp.async.wait_group 1;\n");
+        __syncthreads();
+#pragma unroll
+        for (int u = 0; u < BK / 32; u++) {
+            uint32_t a[4];
+            fa_ldsm_x4(a[0], a[1], a[2], a[3], &sa[st][(warp * 16 + (lane & 15)) * P + u * 32 + (lane >> 4) * 16]);
+#pragma unroll
+            for (int j = 0; j < BN / 8; j += 2) {
+                uint32_t b0, b1, b2, b3;
+                fa_ldsm_x4(b0, b1, b2, b3, &sb[st][(j * 8 + (lane & 7) + ((lane >> 4) & 1) * 8) * P + u * 32 + ((lane >> 3) & 1) * 16]);
+                fa_mma_s8(acc[j], a, b0, b1);
+                fa_mma_s8(acc[j + 1], a, b2, b3);
+            }
+        }
+        __syncthreads();
+    }
+    const int r0 = m0 + warp * 16 + g, r1 = r0 + 8;
+    const float sa0 = r0 < nk ? __half2float(cs[(row0 + r0) * attn::KVS]) : 0.f;
+    const float sa1 = r1 < nk ? __half2float(cs[(row0 + r1) * attn::KVS]) : 0.f;
+    float v[BN / 8][4];
+#pragma unroll
+    for (int j = 0; j < BN / 8; j++) {
+        const int c = n0 + j * 8 + 2 * t4;
+        const float w0 = wsc[c], w1 = wsc[c + 1];
+        v[j][0] = __int2float_rn(acc[j][0]) * (sa0 * w0);
+        v[j][1] = __int2float_rn(acc[j][1]) * (sa0 * w1);
+        v[j][2] = __int2float_rn(acc[j][2]) * (sa1 * w0);
+        v[j][3] = __int2float_rn(acc[j][3]) * (sa1 * w1);
+    }
+    if (ct < fa::H) {  // K_nope of head ct: int8 per (key, head)
+        const int h = ct;
+        float mx0 = 0.f, mx1 = 0.f;
+#pragma unroll
+        for (int j = 0; j < BN / 8; j++) {
+            mx0 = fmaxf(mx0, fmaxf(fabsf(v[j][0]), fabsf(v[j][1])));
+            mx1 = fmaxf(mx1, fmaxf(fabsf(v[j][2]), fabsf(v[j][3])));
+        }
+        mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 1));
+        mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 2));
+        mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 1));
+        mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 2));
+        const float d0 = mx0 / 127.f, i0 = d0 > 0.f ? 1.f / d0 : 0.f;
+        const float d1 = mx1 / 127.f, i1 = d1 > 0.f ? 1.f / d1 : 0.f;
+#pragma unroll
+        for (int j = 0; j < BN / 8; j++) {
+            const int c = j * 8 + 2 * t4;
+            if (r0 < nk) {
+                char2 q;
+                q.x = (int8_t)__float2int_rn(v[j][0] * i0); q.y = (int8_t)__float2int_rn(v[j][1] * i0);
+                *(char2*)&K8[((size_t)r0 * fa::H + h) * fa::DK + c] = q;
+            }
+            if (r1 < nk) {
+                char2 q;
+                q.x = (int8_t)__float2int_rn(v[j][2] * i1); q.y = (int8_t)__float2int_rn(v[j][3] * i1);
+                *(char2*)&K8[((size_t)r1 * fa::H + h) * fa::DK + c] = q;
+            }
+        }
+        if (t4 == 0) {
+            if (r0 < nk) ks8[((size_t)r0 * fa::H + h) * 2] = d0;
+            if (r1 < nk) ks8[((size_t)r1 * fa::H + h) * 2] = d1;
+        }
+        // pe: 64 int8 per key from the cache, and its scale
+#pragma unroll
+        for (int i = 0; i < 2; i++) {
+            const int c = tid + i * THREADS, row = c >> 2, part = c & 3, key = m0 + row;
+            if (key < nk) {
+                *(uint4*)&K8[((size_t)key * fa::H + h) * fa::DK + fa::NOPE + part * 16] =
+                    *(const uint4*)&cq[(row0 + key) * fa::L + fa::RK + part * 16];
+                if (part == 0) ks8[((size_t)key * fa::H + h) * 2 + 1] = __half2float(cs[(row0 + key) * attn::KVS + 1]);
+            }
+        }
+    } else {  // V of head ct - 32: f16
+        const int h = ct - fa::H;
+#pragma unroll
+        for (int j = 0; j < BN / 8; j++) {
+            const int c = h * fa::DV + j * 8 + 2 * t4;
+            if (r0 < nk) *(uint32_t*)&V[(size_t)r0 * (fa::H * fa::DV) + c] = pack_h2(v[j][0], v[j][1]);
+            if (r1 < nk) *(uint32_t*)&V[(size_t)r1 * (fa::H * fa::DV) + c] = pack_h2(v[j][2], v[j][3]);
+        }
+    }
+}
+
 // queries: q [n][H][192] f32 -> Q8 [H][n][192] int8, qs [H][n][2] (scale for nope, pe; softmax scale folded in)
 __global__ void k_fa_qprep8(const float* __restrict__ q, int n, float scale, int8_t* __restrict__ Q8,
                             float* __restrict__ qs) {
@@ -399,7 +520,7 @@ __global__ void k_fa_qprep8(const float* __restrict__ q, int n, float scale, int
 
 __global__ void __launch_bounds__(fa::THREADS, 1)
 k_fa8(const int8_t* __restrict__ Q8, const float* __restrict__ qs, int n, int qpos0, const int8_t* __restrict__ K8,
-      const float* __restrict__ ks, const half* __restrict__ E, int nk, int kpos0, float* __restrict__ O,
+      const float* __restrict__ ks, const half* __restrict__ Vb, int vstride, int nk, int kpos0, float* __restrict__ O,
       float* __restrict__ ml) {
     using namespace fa;
     constexpr int KP8 = fa8::KP;
@@ -443,7 +564,7 @@ k_fa8(const int8_t* __restrict__ Q8, const float* __restrict__ qs, int n, int qp
                 if (part < 12) {
                     fa_cp16(&S.k[st][key * KP8 + part * 16], K8 + ((size_t)jj * H + h) * DK + part * 16, ok);
                 } else {
-                    fa_cp16(&S.v[st][key * VP + (part - 12) * 8], E + (size_t)jj * EW + H * NOPE + h * DV + (part - 12) * 8, ok);
+                    fa_cp16(&S.v[st][key * VP + (part - 12) * 8], Vb + (size_t)jj * vstride + h * DV + (part - 12) * 8, ok);
                 }
             }
             if (tid < BKEY) {

@@ -173,7 +173,20 @@ Model load_model(const std::string& path, bool verbose) {
                     for (int i = 0; i < NP; i++)
                         for (int r = 0; r < R; r++) wx[((size_t)h * NP + i) * R + r] = kbd[((size_t)h * R + r) * NP + i];
                 memcpy(&wx[(size_t)H * NP * R], vb.data, (size_t)H * DV * R * 2);  // [h][d][r]
-                L.wexp = (half*)dupload(wx.data(), wx.size() * 2, tot);
+                if (getenv("RAON_EXPAND16") || getenv("RAON_FA16")) L.wexp = (half*)dupload(wx.data(), wx.size() * 2, tot);
+                // int8 copy, one scale per output channel (512 inputs), for k_expand8
+                const int NR = 2 * H * NP;
+                std::vector<int8_t> w8((size_t)NR * R);
+                std::vector<float> ws(NR);
+                for (int o = 0; o < NR; o++) {
+                    float mx = 0.f;
+                    for (int r = 0; r < R; r++) mx = std::max(mx, fabsf(__half2float(wx[(size_t)o * R + r])));
+                    const float d = mx / 127.f, id = d > 0.f ? 1.f / d : 0.f;
+                    ws[o] = d;
+                    for (int r = 0; r < R; r++) w8[(size_t)o * R + r] = (int8_t)lrintf(__half2float(wx[(size_t)o * R + r]) * id);
+                }
+                L.wexp8 = (int8_t*)dupload(w8.data(), w8.size(), tot);
+                L.wexp8s = (float*)dupload(ws.data(), ws.size() * 4, tot);
             }
             L.attn_gate = upload_mat(g, p + "attn_gate.weight", tot, E, H * c.v_mla);
             L.mla_out = upload_mat(g, p + "attn_output.weight", tot, H * c.v_mla, E);
@@ -207,7 +220,7 @@ void free_model(Model& m) {
         for (Mat* x : {&L.hc_attn_fn, &L.hc_ffn_fn, &L.wqkv, &L.ssm_f_a, &L.ssm_f_b, &L.rda_out, &L.q_a, &L.q_b, &L.kv_a,
                        &L.k_b, &L.v_b, &L.attn_gate, &L.mla_out, &L.ffn_up, &L.ffn_down, &L.ple_gate, &L.ple_proj})
             free_mat(*x);
-        cudaFree(L.wexp);
+        cudaFree(L.wexp); cudaFree(L.wexp8); cudaFree(L.wexp8s);
         for (float* p : {L.attn_norm, L.ffn_norm, L.hc_attn_base, L.hc_attn_chart, L.hc_ffn_base, L.hc_ffn_chart,
                          L.conv_w, L.dt_b, L.ssm_norm, L.q_a_norm, L.kv_a_norm, L.ple_post_norm})
             cudaFree(p);

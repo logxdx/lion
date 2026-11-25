@@ -48,6 +48,9 @@ struct Layer {
     Mat q_a, q_b, kv_a, k_b, v_b, attn_gate, mla_out;
     float *q_a_norm = nullptr, *kv_a_norm = nullptr;
     half* wexp = nullptr;  // prefill expansion weights [32*128 K_nope rows (k_b^T) | 32*128 V rows (v_b)][512] f16
+                           // (only with RAON_EXPAND16 / RAON_FA16)
+    int8_t* wexp8 = nullptr;   // the same, int8 with one scale per row (output channel): k_expand8
+    float* wexp8s = nullptr;
     // FFN + per-layer input
     Mat ffn_up, ffn_down, ple_gate, ple_proj;
     float* ple_post_norm = nullptr;
