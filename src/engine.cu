@@ -37,6 +37,8 @@ struct Engine::Ws {
     int lmax = 0;
     // prefill attention (expanded form)
     half *qf = nullptr, *cf = nullptr, *E = nullptr;
+    int8_t *q8 = nullptr, *k8 = nullptr;
+    float *qs8 = nullptr, *ks8 = nullptr;
     float *ofa = nullptr, *mlfa = nullptr;
 };
 static constexpr int FA_KB = 4096;  // keys per expansion block
@@ -123,6 +125,11 @@ Engine::Engine(const std::string& gguf, int n_slots, int max_ctx, bool verbose)
     w.ofa = falloc((size_t)H * R * c.v_mla);
     w.mlfa = falloc((size_t)H * R * 2);
     CK(cudaFuncSetAttribute(k_fa, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sizeof(fa::Smem)));
+    CK(cudaFuncSetAttribute(k_fa8, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sizeof(fa8::Smem)));
+    CK(cudaMalloc(&w.q8, (size_t)R * H * c.k_mla));
+    CK(cudaMalloc(&w.k8, (size_t)FA_KB * H * c.k_mla));
+    w.qs8 = falloc((size_t)R * H * 2);
+    w.ks8 = falloc((size_t)FA_KB * H * 2);
 }
 
 Engine::~Engine() {
@@ -343,7 +350,9 @@ void Engine::launch_chunk(int R, int nseg, int nout, int nsplit, int pf_slot, in
             if (pf_slot >= 0) {
                 // prefill segment: expanded attention, key blocks of up to FA_KB keys
                 const float scale = 1.f / sqrtf((float)c.k_mla);
-                k_fa_qprep<<<cdiv(R * H * c.k_mla, 256), 256>>>(w.q, R, scale, w.qf);
+                static const bool fa16 = getenv("RAON_FA16") != nullptr;  // f16 QK^T (A/B)
+                if (fa16) k_fa_qprep<<<cdiv(R * H * c.k_mla, 256), 256>>>(w.q, R, scale, w.qf);
+                else k_fa_qprep8<<<cdiv(R * H * 32, 256), 256>>>(w.q, R, scale, w.q8, w.qs8);
                 k_fa_init<<<cdiv(H * R * c.v_mla, 256), 256>>>(w.ofa, w.mlfa, H * R);
                 const size_t slot_row0 = (size_t)pf_slot * kv_slot_rows;
                 const int kmax = pf_pos0 + R;
@@ -352,9 +361,14 @@ void Engine::launch_chunk(int R, int nseg, int nout, int nsplit, int pf_slot, in
                     k_cache_dequant<<<cdiv(nk * (L / 8), 256), 256>>>(kq, ks, slot_row0 + kb0, nk, w.cf);
                     k_gemm_hh<<<dim3(cdiv(nk, 64), fa::EW / 64), 128>>>(w.cf, L, Ly.wexp, nk, fa::EW, c.kv_lora, w.E,
                                                                          fa::EW);
+                    if (!fa16) k_fa_kquant<<<cdiv(nk * H * 32, 256), 256>>>(w.E, w.cf, nk, w.k8, w.ks8);
                     PROF("pf_expand");
-                    k_fa<<<dim3(cdiv(R, fa::BQ), H), fa::THREADS, sizeof(fa::Smem)>>>(w.qf, R, pf_pos0, w.E, w.cf, nk,
-                                                                                       kb0, w.ofa, w.mlfa);
+                    if (fa16)
+                        k_fa<<<dim3(cdiv(R, fa::BQ), H), fa::THREADS, sizeof(fa::Smem)>>>(w.qf, R, pf_pos0, w.E, w.cf, nk,
+                                                                                           kb0, w.ofa, w.mlfa);
+                    else
+                        k_fa8<<<dim3(cdiv(R, fa::BQ), H), fa::THREADS, sizeof(fa8::Smem)>>>(
+                            w.q8, w.qs8, R, pf_pos0, w.k8, w.ks8, w.E, nk, kb0, w.ofa, w.mlfa);
                     PROF("pf_flashattn");
                 }
                 k_fa_final<<<cdiv(R * H * c.v_mla, 256), 256>>>(w.ofa, w.mlfa, R, w.o);
