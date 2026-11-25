@@ -14,6 +14,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <csignal>
+#include <filesystem>
 #include <cstdio>
 #include <deque>
 #include <memory>
@@ -39,9 +40,11 @@ struct Options {
     int port = 8080, slots = 4, ctx = 131072, threads = 32;
     int chunk_busy = 2048;    // prefill tokens per iteration while other requests are generating
     float prefill_share = 0.5f;   // share of GPU time given to prefill while other requests are generating
-    int chunk_idle = 8192;    // ... while none is (the engine splits it into its own chunks)
+    int chunk_idle = 4096;    // ... while none is (= the engine chunk: one progress update per chunk)
     int checkpoints = 4;      // recurrent-state checkpoints per slot (~19 MB each); 0 disables
     SamplingParams defaults;  // generation_config.json of Raon-1 nano: temperature 0.1, presence_penalty 1.5
+    std::string ui_dir;       // web UI bundle (default: <binary dir>/webui, built by `make webui`)
+    bool ui = true;
 };
 
 struct TokEvent {
@@ -69,6 +72,9 @@ struct Req {
     std::string finish, error;
     int n_reused = 0, n_gen = 0, slot = -1;
     double prompt_ms = 0, gen_ms = 0, queue_ms = 0;
+    std::atomic<int> n_done{0};           // prompt tokens in the slot state so far (reused + prefilled)
+    std::atomic<bool> admitted{false}, generating{false};
+    Clock::time_point t_admit, t_gen0;    // set before admitted / generating become true
 };
 using ReqP = std::shared_ptr<Req>;
 
@@ -240,6 +246,9 @@ private:
             r->n_reused = reuse;
             r->slot = s.id;
             r->queue_ms = ms_since(r->t_arrive);
+            r->t_admit = Clock::now();
+            r->n_done = reuse;
+            r->admitted = true;
         }
     }
 
@@ -319,6 +328,7 @@ private:
             if (end == P) in.push_back(sample_in(s));
             const auto out = eng_->step(rows, in);
             s.cached.insert(s.cached.end(), r.prompt.begin() + n0, r.prompt.begin() + end);
+            r.n_done = end;
             if (ck && end == r.ckpt_pos) {   // into a free or the least recently used checkpoint
                 int k = 0;
                 for (int j = 0; j < (int)s.ck.size(); j++) {
@@ -332,9 +342,15 @@ private:
             }
             if (end == P) {
                 r.prompt_ms = ms_since(s.t0);
-                s.t1 = Clock::now();
-                s.st = DECODE;
-                emit(s, out[0]);
+                if (r.max_tokens == 0) {   // prefill only (n_predict = 0): the prompt is in the state and checkpoints
+                    finish(s, "length");
+                } else {
+                    s.t1 = Clock::now();
+                    r.t_gen0 = s.t1;
+                    r.generating = true;
+                    s.st = DECODE;
+                    emit(s, out[0]);
+                }
             }
             const float sh = std::min(1.f, std::max(0.05f, opt_.prefill_share));
             next_prefill_ = Clock::now() + std::chrono::duration_cast<Clock::duration>((Clock::now() - tp0) * ((1.f - sh) / sh));
@@ -455,6 +471,10 @@ public:
             fin = r_->finish;
             err = r_->error;
         }
+        if (!lead_.empty() && !ev.empty()) {
+            held_out(o, lead_);
+            lead_.clear();
+        }
         for (const TokEvent& e : ev) {
             if (stopped_) break;
             o.toks.push_back(e);
@@ -485,6 +505,8 @@ public:
     }
     const std::string& error() const { return error_; }
     const chat::OutputParser& parser() const { return parser_; }
+    // text placed before the generated output (e.g. "<think>\n" when reasoning stays inline); shown with the next delta
+    void lead(const std::string& text) { lead_ += text; }
 
 private:
     void feed(const std::string& text, Out& o) {
@@ -528,7 +550,7 @@ private:
     bool chat_;
     chat::OutputParser parser_;
     Utf8Stream u8_;
-    std::string held_, error_;
+    std::string held_, error_, lead_;
     bool stopped_ = false, finished_ = false;
 };
 
@@ -567,12 +589,15 @@ static json usage_json(const Req& r) {
     return {{"prompt_tokens", r.prompt.size()}, {"completion_tokens", r.n_gen}, {"total_tokens", r.prompt.size() + r.n_gen},
             {"prompt_tokens_details", {{"cached_tokens", r.n_reused}}}};
 }
-static json timings_json(const Req& r) {
+// live: while generating, predicted_ms runs from the first token (the scheduler fills gen_ms only at the end)
+static json timings_json(const Req& r, bool live = false, int n_gen = -1) {
     const int pn = (int)r.prompt.size() - r.n_reused;
+    const int ng = n_gen >= 0 ? n_gen : r.n_gen;
+    const double gms = live && r.generating ? ms_since(r.t_gen0) : r.gen_ms;
     return {{"queue_ms", r.queue_ms}, {"prompt_n", pn}, {"prompt_ms", r.prompt_ms},
-            {"prompt_per_second", r.prompt_ms > 0 ? pn / (r.prompt_ms / 1000) : 0.0}, {"cached_n", r.n_reused},
-            {"predicted_n", r.n_gen}, {"predicted_ms", r.gen_ms},
-            {"predicted_per_second", r.gen_ms > 0 ? r.n_gen / (r.gen_ms / 1000) : 0.0}, {"slot", r.slot}};
+            {"prompt_per_second", r.prompt_ms > 0 ? pn / (r.prompt_ms / 1000) : 0.0}, {"cache_n", r.n_reused},
+            {"cached_n", r.n_reused}, {"predicted_n", ng}, {"predicted_ms", gms},
+            {"predicted_per_second", gms > 0 ? ng / (gms / 1000) : 0.0}, {"slot", r.slot}};
 }
 
 // ---------------------------------------------------------------- main
@@ -591,7 +616,9 @@ static void usage() {
             "  --checkpoints N      recurrent-state checkpoints per slot for prompt reuse (default 4, ~19 MB each; 0 = off)\n"
             "  --temp T --top-p P --top-k K --min-p M --presence-penalty X --frequency-penalty X --repeat-penalty X\n"
             "                       default sampling (default: temp 0.1, presence 1.5 from generation_config.json)\n"
-            "  --threads N          HTTP worker threads (default 32)\n");
+            "  --threads N          HTTP worker threads (default 32)\n"
+            "  --ui-dir DIR         web UI served at / (default <binary dir>/webui; build it with: make webui)\n"
+            "  --no-ui              serve the API only\n");
 }
 
 int main(int argc, char** argv) {
@@ -614,6 +641,8 @@ int main(int argc, char** argv) {
         else if (a == "--prefill-share") opt.prefill_share = std::stof(next());
         else if (a == "--checkpoints") opt.checkpoints = std::max(0, std::stoi(next()));
         else if (a == "--threads") opt.threads = std::stoi(next());
+        else if (a == "--ui-dir") opt.ui_dir = next();
+        else if (a == "--no-ui") opt.ui = false;
         else if (a == "--temp") opt.defaults.temperature = std::stof(next());
         else if (a == "--top-p") opt.defaults.top_p = std::stof(next());
         else if (a == "--top-k") opt.defaults.top_k = std::stoi(next());
@@ -645,7 +674,22 @@ int main(int argc, char** argv) {
     svr.Get("/health", [&](const httplib::Request&, httplib::Response& res) { send_json(res, {{"status", "ok"}}); });
     // the configuration this server runs with, and its VRAM use
     svr.Get("/props", [&](const httplib::Request&, httplib::Response& res) {
-        send_json(res, {{"model", opt.model}, {"alias", opt.alias}, {"slots", opt.slots}, {"ctx", opt.ctx},
+        auto r6 = [](float x) { return std::round((double)x * 1e6) / 1e6; };   // 0.1f -> 0.1
+        const SamplingParams& d = opt.defaults;
+        json params = {{"temperature", r6(d.temperature)}, {"top_k", d.top_k}, {"top_p", r6(d.top_p)}, {"min_p", r6(d.min_p)},
+                       {"presence_penalty", r6(d.presence_penalty)}, {"frequency_penalty", r6(d.frequency_penalty)},
+                       {"repeat_penalty", r6(d.repetition_penalty)}, {"max_tokens", -1}};
+        json dgs = params;
+        dgs["n_ctx"] = opt.ctx;
+        dgs["params"] = params;
+        send_json(res, {// llama-server /props fields used by the web UI
+                        {"default_generation_settings", dgs}, {"model_alias", opt.alias}, {"model_path", opt.model},
+                        {"total_slots", opt.slots}, {"n_ctx", opt.ctx},
+                        {"modalities", {{"vision", false}, {"audio", false}, {"video", false}}},
+                        {"chat_template", tok.chat_template()}, {"build_info", "raon-engine"},
+                        {"cors_proxy_enabled", false}, {"ui_settings", json::object()},
+                        // raon-server's own
+                        {"model", opt.alias}, {"alias", opt.alias}, {"slots", opt.slots}, {"ctx", opt.ctx},
                         {"chunk_busy", opt.chunk_busy}, {"prefill_share", opt.prefill_share}, {"checkpoints", opt.checkpoints},
                         {"defaults", {{"temperature", opt.defaults.temperature}, {"top_p", opt.defaults.top_p},
                                       {"top_k", opt.defaults.top_k}, {"min_p", opt.defaults.min_p},
@@ -658,6 +702,7 @@ int main(int argc, char** argv) {
     auto models = [&](const httplib::Request&, httplib::Response& res) {
         send_json(res, {{"object", "list"},
                         {"data", json::array({{{"id", opt.alias}, {"object", "model"}, {"created", created}, {"owned_by", "raon-engine"},
+                                               {"status", {{"value", "loaded"}}},
                                                {"meta", {{"n_ctx", opt.ctx}, {"n_slots", opt.slots}, {"n_vocab", tok.n_vocab()}}}}})}});
     };
     svr.Get("/v1/models", models);
@@ -679,6 +724,9 @@ int main(int argc, char** argv) {
         ReqP r;
         std::vector<std::string> stops;
         bool stream = false, include_usage = false, thinking = true, chat = true;
+        bool parse_reasoning = true;      // reasoning_format "none": thinking stays inline in content
+        bool progress = false, timings_per_token = false;
+        double ping_s = 0;                // sse_ping_interval: SSE comment while nothing else is sent
         int n_top = 0;
         bool logprobs = false;
         json tools;
@@ -728,10 +776,18 @@ int main(int argc, char** argv) {
         if (r.prompt.empty()) throw BadRequest("empty prompt");
         if ((int)r.prompt.size() >= sched.ctx()) throw BadRequest("prompt of " + std::to_string(r.prompt.size()) + " tokens does not fit the context of " + std::to_string(sched.ctx()));
         parse_sampling(b, opt, r);
+        // the first of these that is given: >= 0 caps the completion (0 = prefill only), < 0 = up to the context
         int mt = sched.ctx() - (int)r.prompt.size();
         for (const char* k : {"max_completion_tokens", "max_tokens", "n_predict"})
-            if (b.contains(k) && b[k].is_number_integer() && b[k].get<int>() > 0) { mt = std::min(mt, b[k].get<int>()); break; }
+            if (b.contains(k) && b[k].is_number_integer()) {
+                if (b[k].get<int>() >= 0) mt = std::min(mt, b[k].get<int>());
+                break;
+            }
         r.max_tokens = mt;
+        p.parse_reasoning = !(b.contains("reasoning_format") && b["reasoning_format"] == "none");
+        p.progress = b.value("return_progress", false);
+        p.timings_per_token = b.value("timings_per_token", false);
+        if (b.contains("sse_ping_interval") && b["sse_ping_interval"].is_number()) p.ping_s = b["sse_ping_interval"].get<double>();
         p.stops = parse_stop(b);
         p.stream = b.value("stream", false);
         p.include_usage = b.contains("stream_options") && b["stream_options"].is_object() && b["stream_options"].value("include_usage", false);
@@ -757,7 +813,8 @@ int main(int argc, char** argv) {
         }
         ReqP r = p.r;
         sched.submit(r);
-        auto col = std::make_shared<Collector>(tok, r, p.stops, chat_ep, p.thinking, p.tools);
+        auto col = std::make_shared<Collector>(tok, r, p.stops, chat_ep, p.thinking && p.parse_reasoning, p.tools);
+        if (chat_ep && p.thinking && !p.parse_reasoning) col->lead("<think>\n");   // the prompt opened the block
         const std::string model = opt.alias;
         const std::string object = chat_ep ? "chat.completion" : "text_completion";
 
@@ -795,9 +852,12 @@ int main(int argc, char** argv) {
 
         res.set_header("Cache-Control", "no-cache");
         auto state = std::make_shared<std::pair<bool, int>>(false, 0);   // (role sent, tool calls sent)
+        struct Live { int progress = -1; bool tokens = false; Clock::time_point last = Clock::now(); };
+        auto live = std::make_shared<Live>();
         res.set_chunked_content_provider("text/event-stream", [=, &tok, &sched](size_t, httplib::DataSink& sink) {
             auto send = [&](const json& j) {
                 const std::string s = "data: " + dump(j) + "\n\n";
+                live->last = Clock::now();
                 return sink.write(s.data(), s.size());
             };
             auto chunk = [&](const json& delta_or_text, const json& finish, const json& lp) {
@@ -814,6 +874,20 @@ int main(int argc, char** argv) {
                 if (!send(chunk({{"role", "assistant"}, {"content", nullptr}}, nullptr, nullptr))) { r->cancel_reason = "cancelled"; r->cancel = true; return false; }
             }
             auto o = col->next(std::chrono::milliseconds(200));
+            live->tokens |= !o.toks.empty();
+            // prompt progress (llama-server's prompt_progress) until the first token
+            if (p.progress && !live->tokens && r->admitted && r->n_done != live->progress) {
+                live->progress = r->n_done;
+                json pp = {{"total", (int)r->prompt.size()}, {"cache", r->n_reused}, {"processed", live->progress},
+                           {"time_ms", ms_since(r->t_admit)}};
+                if (!send({{"id", r->id}, {"object", chat_ep ? "chat.completion.chunk" : "text_completion"},
+                           {"created", (long)time(nullptr)}, {"model", model}, {"choices", json::array()}, {"prompt_progress", pp}})) {
+                    r->cancel_reason = "cancelled";
+                    r->cancel = true;
+                    sched.wake();
+                    return false;
+                }
+            }
             const json lp = p.logprobs && !o.toks.empty() ? (chat_ep ? logprobs_json(tok, o.toks, p.n_top) : json()) : json();
             bool ok = true;
             if (chat_ep) {
@@ -825,9 +899,20 @@ int main(int argc, char** argv) {
                     delta["tool_calls"] = tool_calls_json(o.d.calls, state->second, ids, true);
                     state->second += (int)o.d.calls.size();
                 }
-                if (!delta.empty() || !lp.is_null()) ok = send(chunk(delta, nullptr, lp));
+                if (!delta.empty() || !lp.is_null()) {
+                    json c = chunk(delta, nullptr, lp);
+                    if (p.timings_per_token) c["timings"] = timings_json(*r, true, r->n_gen);
+                    ok = send(c);
+                }
             } else if (!o.text.empty()) {
-                ok = send(chunk(o.text, nullptr, nullptr));
+                json c = chunk(o.text, nullptr, nullptr);
+                if (p.timings_per_token) c["timings"] = timings_json(*r, true, r->n_gen);
+                ok = send(c);
+            }
+            if (ok && !o.done && p.ping_s > 0 &&
+                std::chrono::duration<double>(Clock::now() - live->last).count() >= p.ping_s) {
+                live->last = Clock::now();
+                ok = sink.write(": ping\n\n", 8);
             }
             if (ok && o.done) {
                 if (o.finish == "error") {
@@ -835,7 +920,9 @@ int main(int argc, char** argv) {
                 } else {
                     std::string fin = o.finish;
                     if (chat_ep && fin == "stop" && state->second > 0) fin = "tool_calls";
-                    send(chunk(chat_ep ? json::object() : json(""), fin, nullptr));
+                    json last = chunk(chat_ep ? json::object() : json(""), fin, nullptr);
+                    last["timings"] = timings_json(*r);   // as llama-server: the web UI shows speed from it
+                    send(last);
                     if (p.include_usage)
                         send({{"id", r->id}, {"object", chat_ep ? "chat.completion.chunk" : "text_completion"}, {"created", (long)time(nullptr)},
                               {"model", model}, {"choices", json::array()}, {"usage", usage_json(*r)}, {"timings", timings_json(*r)}});
@@ -874,6 +961,49 @@ int main(int argc, char** argv) {
         }
     });
 
+    // llama-server endpoints the web UI calls: no model catalog / downloads, nothing to load or unload, no stream
+    // resumption; answering keeps its console clean
+    auto ok_json = [&](const httplib::Request&, httplib::Response& res) { send_json(res, {{"success", true}}); };
+    svr.Get("/v1/catalog.json", [&](const httplib::Request&, httplib::Response& res) { send_json(res, json::array()); });
+    svr.Post("/v1/streams/lookup", [&](const httplib::Request&, httplib::Response& res) { send_json(res, json::array()); });
+    svr.Get("/tools", [&](const httplib::Request&, httplib::Response& res) { send_json(res, json::array()); });   // no server tools
+    svr.Post("/models/load", ok_json);
+    svr.Post("/models/unload", ok_json);
+    svr.Get("/models/sse", [](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Cache-Control", "no-cache");
+        res.set_chunked_content_provider("text/event-stream", [](size_t, httplib::DataSink& sink) {
+            for (int i = 0; i < 6; i++) {   // ~60 s of keep-alives, then the UI reconnects
+                if (!sink.write(":\n\n", 3)) return false;
+                std::this_thread::sleep_for(std::chrono::seconds(10));
+            }
+            sink.done();
+            return true;
+        });
+    });
+
+    // Web UI: llama.cpp's chat UI (prebuilt bundle, rebranded; `make webui`). Hash routing and relative asset paths, so
+    // serving the directory at / is all it needs; GET requests for files it does not contain fall through to the API.
+    std::string ui_state = "off (--no-ui)";
+    if (opt.ui) {
+        std::string dir = opt.ui_dir;
+        if (dir.empty()) {
+            std::error_code ec;
+            dir = (std::filesystem::read_symlink("/proc/self/exe", ec).parent_path() / "webui").string();
+        }
+        if (std::filesystem::exists(std::filesystem::path(dir) / "index.html") && svr.set_mount_point("/", dir)) {
+            svr.set_file_extension_and_mimetype_mapping("webmanifest", "application/manifest+json");
+            svr.set_file_extension_and_mimetype_mapping("mjs", "application/javascript");
+            // content-named bundle files are cached for good; index, icons, manifest and service worker revalidate
+            svr.set_file_request_handler([](const httplib::Request& q, httplib::Response& r) {
+                const bool immutable = q.path.rfind("/_app/immutable/", 0) == 0;
+                r.set_header("Cache-Control", immutable ? "public, max-age=31536000, immutable" : "no-cache");
+            });
+            ui_state = dir;
+        } else {
+            ui_state = "not found in " + dir + " (run: make webui); API only";
+        }
+    }
+
     signal(SIGINT, [](int) { if (g_svr) g_svr->stop(); });
     signal(SIGTERM, [](int) { if (g_svr) g_svr->stop(); });
     fprintf(stderr, "raon-server: %d slots x %d tokens, chunk-busy %d, prefill-share %.2f, checkpoints %d, defaults: temp %.2f "
@@ -881,6 +1011,7 @@ int main(int argc, char** argv) {
             opt.slots, opt.ctx, opt.chunk_busy, opt.prefill_share, opt.checkpoints, opt.defaults.temperature, opt.defaults.top_p,
             opt.defaults.top_k, opt.defaults.min_p, opt.defaults.presence_penalty, opt.defaults.frequency_penalty,
             opt.defaults.repetition_penalty, opt.host.c_str(), opt.port);
+    fprintf(stderr, "raon-server: web UI: %s\n", ui_state.c_str());
     if (!svr.listen(opt.host, opt.port)) {
         fprintf(stderr, "raon-server: cannot listen on %s:%d\n", opt.host.c_str(), opt.port);
         sched.stop();

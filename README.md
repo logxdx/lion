@@ -224,6 +224,32 @@ They cost 0.10-0.13 ms per step for 4 rows (`tests/sample_bench.cu`). At 4 × 12
 **Defaults:** sampling defaults follow the model's `generation_config.json` (temperature 0.1, presence_penalty 1.5),
 as vLLM applies them. Request fields and CLI flags override them.
 
+### Web UI
+
+`raon-server` serves llama.cpp's chat web UI at `/`, ported from liquid-engine:
+
+- **The bundle:** a prebuilt release (`b12569`, MIT), pinned and SHA-256-checked.
+- **Branding:** rebranded "raon" by `brand/rebrand.py`, which changes names, help texts, the logo, icons and splash
+  screens, and renames every content-hashed file it changes.
+- **Icons:** `brand/build_assets.py` renders them from `brand/raon-mark.svg` (it needs `rsvg-convert` and
+  ImageMagick; the rendered files are committed in `brand/webui/`).
+
+Server support for the UI, in llama-server's formats:
+
+- `/props`, including `default_generation_settings`, `modalities` and `total_slots`;
+- `prompt_progress` chunks while a prompt prefills (`return_progress`), and SSE pings (`sse_ping_interval`);
+- `timings` in the last chunk (or every chunk with `timings_per_token`);
+- `reasoning_format: none` (thinking inline);
+- `n_predict: 0` (prefill only, used by the UI's "Pre-fill KV cache after response": the next turn then starts from
+  the saved state);
+- empty answers for what raon-server does not have: `/tools`, `/v1/catalog.json`, `/v1/streams/lookup`, and the
+  `/models/*` router calls.
+
+```
+make webui                         # downloads the pinned bundle (once), verifies it, rebrands into build/webui
+build/raon-server -m model.gguf    # UI on http://127.0.0.1:8080/ ; --ui-dir DIR, --no-ui
+```
+
 ## Build and run
 
 ```

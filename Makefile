@@ -52,4 +52,19 @@ $(BUILD):
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all clean tests
+# Web UI: llama.cpp's prebuilt chat UI (MIT), pinned and checksum-verified, rebranded by brand/rebrand.py.
+# raon-server serves build/webui at / (next to the binary; --ui-dir to override).
+UI_VERSION ?= b12569
+UI_URL     := https://huggingface.co/buckets/ggml-org/llama-ui/resolve/$(UI_VERSION)
+UI_TAR     := $(BUILD)/webui-$(UI_VERSION).tar.gz
+
+$(UI_TAR): | $(BUILD)
+	curl -fsSL -o $@ $(UI_URL)/dist.tar.gz
+	curl -fsSL -o $@.sha256 $(UI_URL)/dist.tar.gz.sha256
+
+webui: $(UI_TAR)
+	cd $(BUILD) && echo "$$(cut -d' ' -f1 webui-$(UI_VERSION).tar.gz.sha256)  webui-$(UI_VERSION).tar.gz" | sha256sum -c -
+	rm -rf $(BUILD)/webui && mkdir -p $(BUILD)/webui && tar -xzf $(UI_TAR) -C $(BUILD)/webui
+	python3 brand/rebrand.py $(BUILD)/webui
+
+.PHONY: all clean tests webui
