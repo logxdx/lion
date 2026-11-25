@@ -8,6 +8,7 @@
 #include "engine.h"
 #include "kernels.cuh"
 #include "attn.cuh"
+#include "gemm.cuh"
 #include "prof.h"
 #include "util.cuh"
 
@@ -32,6 +33,7 @@ struct Engine::Ws {
     float* xs = nullptr;
     float *hn, *hsel, *logits;
     std::map<int, cudaGraphExec_t> graphs;  // decode step graphs by batch size
+    int lmax = 0;
 };
 
 static float* falloc(size_t n) {
@@ -41,7 +43,7 @@ static float* falloc(size_t n) {
 }
 
 Engine::Engine(const std::string& gguf, int n_slots, int max_ctx, bool verbose)
-    : n_slots_(n_slots), max_ctx_(max_ctx), rmax_(64) {
+    : n_slots_(n_slots), max_ctx_(max_ctx), rmax_(getenv("RAON_CHUNK") ? atoi(getenv("RAON_CHUNK")) : 256) {
     m_ = load_model(gguf, verbose);
     const Config& c = m_.cfg;
     const size_t conv_n = (size_t)n_slots * m_.n_rda * 3 * 3 * c.rda_heads * c.rda_dim;
@@ -101,11 +103,13 @@ Engine::Engine(const std::string& gguf, int n_slots, int max_ctx, bool verbose)
     w.opart = falloc(w.opart_n * H * c.kv_lora);
     w.ml = falloc(w.opart_n * H * 2);
     CK(cudaFuncSetAttribute(k_mla_decode<RowMeta>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sizeof(attn::Smem)));
+    CK(cudaFuncSetAttribute(k_gemm_q8, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sizeof(gq8::Smem)));
     CK(cudaMalloc(&w.xq, (size_t)R * 2 * c.n_ff));
     w.xs = falloc((size_t)R * 2 * c.n_ff / 32);
     w.hn = falloc((size_t)R * E);
     w.hsel = falloc((size_t)R * E);
-    w.logits = falloc((size_t)R * c.n_vocab);
+    w.lmax = std::max(n_slots, 16);  // rows that can request logits per chunk
+    w.logits = falloc((size_t)w.lmax * c.n_vocab);
 }
 
 Engine::~Engine() {
@@ -125,6 +129,14 @@ void Engine::reset(int slot) {
 }
 
 // ---------------------------------------------------------------- matmul dispatch
+__global__ void k_perturb(float* y, int ldy, int N, int R) {  // y *= 1 + 1e-6 * (pseudo-random sign)
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= R * N) return;
+    const int r = i / N, n = i % N;
+    const float s = ((r * 7919 + n * 104729) & 1) ? 1e-6f : -1e-6f;
+    y[(size_t)r * ldy + n] *= 1.f + s;
+}
+
 template <int B>
 static void launch_gemv(const Mat& W, const float* x, int ldx, const int8_t* xq, const float* xs, float* y, int ldy,
                         int rpg, int gstride) {
@@ -140,6 +152,18 @@ static void mm(const Mat& W, const float* x, int ldx, int R, float* y, int ldy, 
         const int nb = W.K / 32;
         const int warps = R * nb;
         k_quantize<<<(warps * 32 + 255) / 256, 256>>>(x, ldx, W.K, R, xq, xs);
+    }
+    // prefill-sized batches: tensor-core GEMM (Q8_0 weights, N a multiple of 128)
+    static const bool no_gemm = getenv("RAON_NOGEMM") != nullptr;
+    if (!no_gemm && R > 8 && W.type == W_F16 && W.K % gf16::BK == 0 && (rpg == 0 || rpg % gf16::BN == 0)) {
+        dim3 grid((R + gf16::BM - 1) / gf16::BM, (W.N + gf16::BN - 1) / gf16::BN);
+        k_gemm_f16<<<grid, gf16::THREADS>>>(x, ldx, rpg ? rpg : W.N, gstride, W.d, R, W.N, W.K, y, ldy);
+        return;
+    }
+    if (!no_gemm && R > 8 && W.type == W_Q8 && W.N % gq8::BN == 0) {
+        dim3 grid((R + gq8::BM - 1) / gq8::BM, W.N / gq8::BN);
+        k_gemm_q8<<<grid, gq8::THREADS, sizeof(gq8::Smem)>>>(xq, xs, W.q, W.d, R, W.N, W.K, y, ldy);
+        return;
     }
     for (int b0 = 0; b0 < R; b0 += 8) {
         const int nb = std::min(8, R - b0);
@@ -158,6 +182,8 @@ static void mm(const Mat& W, const float* x, int ldx, int R, float* y, int ldy, 
             default: launch_gemv<8>(W, xb, ldx, qb, sb, yb, ldy, rpg, gstride); break;
         }
     }
+    static const bool perturb = getenv("RAON_PERTURB") != nullptr;  // debugging: noise sensitivity
+    if (perturb && R > 8) k_perturb<<<(R * W.N + 255) / 256, 256>>>(y, ldy, W.N, R);
 }
 
 static inline int cdiv(int a, int b) { return (a + b - 1) / b; }
@@ -184,6 +210,7 @@ void Engine::run_chunk(const Row* rows, int R) {
     CK(cudaMemcpy(w.segs, segs.data(), nseg * sizeof(Seg), cudaMemcpyHostToDevice));
     CK(cudaMemcpy(w.toks, toks.data(), R * 4, cudaMemcpyHostToDevice));
     const int nout = (int)sel.size();
+    if (nout > w.lmax) throw std::runtime_error("too many rows with logits in one chunk");
     if (nout) CK(cudaMemcpy(w.sel, sel.data(), nout * 4, cudaMemcpyHostToDevice));
     // attention splits per row: ~60 blocks in total (3 waves at 1 block/SM), within the partials buffer
     static const int nsplit_env = getenv("RAON_NSPLIT") ? atoi(getenv("RAON_NSPLIT")) : 0;  // experiments
@@ -301,6 +328,14 @@ void Engine::launch_chunk(int R, int nseg, int nout, int nsplit) {
         k_rmsnorm<<<dim3(R, 1), 256>>>(w.y, E, w.y2, E, Ly.ple_post_norm, E, c.eps);
         k_add_streams<<<cdiv(R * E, 256), 256>>>(w.X, w.y2, E, R);
         PROF("ple_layer");
+        static const bool dump = getenv("RAON_DUMP") != nullptr;  // debugging: per-layer stream checksums
+        if (dump) {
+            std::vector<float> hx((size_t)R * HC * E);
+            CK(cudaMemcpy(hx.data(), w.X, hx.size() * 4, cudaMemcpyDeviceToHost));
+            double s0 = 0, sl = 0;
+            for (int i = 0; i < HC * E; i++) { s0 += hx[i]; sl += hx[(size_t)(R - 1) * HC * E + i]; }
+            fprintf(stderr, "dump layer %2d (%s) row0 sum %.6f  row%d sum %.6f\n", il, Ly.rda ? "rda" : "mla", s0, R - 1, sl);
+        }
     }
     if (nout == 0) return;
     k_stream_sum<<<cdiv(R * E, 256), 256>>>(w.X, w.s, E, R, 1.f / HC);
