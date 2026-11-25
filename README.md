@@ -263,6 +263,17 @@ make webtools                      # node dependencies of the server tools (npm 
 build/raon-server -m model.gguf    # UI on http://127.0.0.1:8080/ ; --ui-dir DIR, --no-ui
 ```
 
+## Run
+
+```sh
+make && make webui webtools   # engine + server, web UI bundle (raon branding), the tools' node deps
+./serve.sh                    # Raon-1 nano Q6_K, 4 slots x 128k context, web UI + tools on http://127.0.0.1:11435/
+```
+
+`serve.sh` takes `MODEL=`, `PORT=`, `SLOTS=` and `CTX=`, and passes extra arguments to `raon-server`. It finds `build/`
+and `tools/` next to itself even when started through a symlink. The installed copy lives in `~/raon`, started as
+`raon-serve` (`~/.local/bin/raon-serve` → `~/raon/serve.sh`), like liquid-engine's `liquid-serve`.
+
 ## Build and run
 
 ```
