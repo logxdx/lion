@@ -51,7 +51,7 @@ static void emit(int step, const float* lg, int V, int top, int chosen) {
 
 int main(int argc, char** argv) {
     std::string model, toks_s;
-    int n = 16, top = 5, ctx = 8192, slots = 1, depth = 0, steps = 32;
+    int n = 16, top = 5, ctx = 8192, slots = 1, depth = 0, steps = 32, prefill_n = 0;
     bool bench = false;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -66,7 +66,30 @@ int main(int argc, char** argv) {
         else if (a == "--slots") slots = atoi(next().c_str());
         else if (a == "--depth") depth = atoi(next().c_str());
         else if (a == "--steps") steps = atoi(next().c_str());
+        else if (a == "--prefill") prefill_n = atoi(next().c_str());
         else { fprintf(stderr, "unknown argument %s\n", a.c_str()); return 1; }
+    }
+    if (bench && prefill_n > 0 && !model.empty()) {
+        // prefill benchmark: prefill_n synthetic tokens into slot 0, timed per 16k-token segment
+        raon::Engine eng(model, 1, prefill_n + 64);
+        std::vector<int> toks(prefill_n);
+        uint32_t x = 12345;
+        for (auto& t : toks) { x = x * 1664525u + 1013904223u; t = 1000 + (int)(x % 200000u); }
+        eng.prefill(0, std::vector<int>(toks.begin(), toks.begin() + std::min(prefill_n, 2048)));  // warm-up
+        eng.reset(0);
+        const int SEG = 16384;
+        double total = 0;
+        for (int p0 = 0; p0 < prefill_n; p0 += SEG) {
+            const int n = std::min(SEG, prefill_n - p0);
+            auto a = std::chrono::steady_clock::now();
+            eng.prefill(0, std::vector<int>(toks.begin() + p0, toks.begin() + p0 + n), p0);
+            const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - a).count();
+            total += s;
+            printf("prefill [%6d, %6d): %.2f s, %.0f tok/s\n", p0, p0 + n, s, n / s);
+            fflush(stdout);
+        }
+        printf("prefill %d tokens: %.1f s, %.0f tok/s average\n", prefill_n, total, prefill_n / total);
+        return 0;
     }
     if (bench && !model.empty()) {
         // decode benchmark: `slots` streams at context `depth` (synthetic cache), `steps` batched decode steps

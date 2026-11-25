@@ -9,6 +9,7 @@
 #include "kernels.cuh"
 #include "attn.cuh"
 #include "gemm.cuh"
+#include "prefill_attn.cuh"
 #include "prof.h"
 #include "util.cuh"
 
@@ -34,7 +35,11 @@ struct Engine::Ws {
     float *hn, *hsel, *logits;
     std::map<int, cudaGraphExec_t> graphs;  // decode step graphs by batch size
     int lmax = 0;
+    // prefill attention (expanded form)
+    half *qf = nullptr, *cf = nullptr, *E = nullptr;
+    float *ofa = nullptr, *mlfa = nullptr;
 };
+static constexpr int FA_KB = 4096;  // keys per expansion block
 
 static float* falloc(size_t n) {
     float* p = nullptr;
@@ -76,7 +81,7 @@ Engine::Engine(const std::string& gguf, int n_slots, int max_ctx, bool verbose)
     w.y2 = falloc((size_t)R * E);
     w.big = falloc((size_t)R * 2 * c.n_ff);
     w.act = falloc((size_t)R * c.n_ff);
-    w.s = falloc((size_t)R * E);
+    w.s = falloc((size_t)R * std::max(E, C));  // stream sum (E wide) and the RDA gated output (C = 2048 wide)
     w.ple_rows = falloc((size_t)R * c.n_ple * c.n_layer);
     w.ple_proj = falloc((size_t)R * c.n_ple * c.n_layer);
     w.ple = falloc((size_t)R * c.n_ple * c.n_layer);
@@ -104,12 +109,19 @@ Engine::Engine(const std::string& gguf, int n_slots, int max_ctx, bool verbose)
     w.ml = falloc(w.opart_n * H * 2);
     CK(cudaFuncSetAttribute(k_mla_decode<RowMeta>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sizeof(attn::Smem)));
     CK(cudaFuncSetAttribute(k_gemm_q8, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sizeof(gq8::Smem)));
+    CK(cudaFuncSetAttribute(k_gemm_q6, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sizeof(gq6::Smem)));
     CK(cudaMalloc(&w.xq, (size_t)R * 2 * c.n_ff));
     w.xs = falloc((size_t)R * 2 * c.n_ff / 32);
     w.hn = falloc((size_t)R * E);
     w.hsel = falloc((size_t)R * E);
     w.lmax = std::max(n_slots, 16);  // rows that can request logits per chunk
     w.logits = falloc((size_t)w.lmax * c.n_vocab);
+    CK(cudaMalloc(&w.qf, (size_t)R * H * c.k_mla * 2));
+    CK(cudaMalloc(&w.cf, (size_t)FA_KB * c.latent() * 2));
+    CK(cudaMalloc(&w.E, (size_t)FA_KB * fa::EW * 2));
+    w.ofa = falloc((size_t)H * R * c.v_mla);
+    w.mlfa = falloc((size_t)H * R * 2);
+    CK(cudaFuncSetAttribute(k_fa, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sizeof(fa::Smem)));
 }
 
 Engine::~Engine() {
@@ -158,6 +170,12 @@ static void mm(const Mat& W, const float* x, int ldx, int R, float* y, int ldy, 
     if (!no_gemm && R > 8 && W.type == W_F16 && W.K % gf16::BK == 0 && (rpg == 0 || rpg % gf16::BN == 0)) {
         dim3 grid((R + gf16::BM - 1) / gf16::BM, (W.N + gf16::BN - 1) / gf16::BN);
         k_gemm_f16<<<grid, gf16::THREADS>>>(x, ldx, rpg ? rpg : W.N, gstride, W.d, R, W.N, W.K, y, ldy);
+        return;
+    }
+    if (!no_gemm && R > 8 && W.type == W_Q6 && W.N % gq6::BN == 0 && W.K % 256 == 0) {
+        dim3 grid((R + gq6::BM - 1) / gq6::BM, W.N / gq6::BN);
+        k_gemm_q6<<<grid, gq6::THREADS, sizeof(gq6::Smem)>>>(xq, xs, (const uint8_t*)W.q, W.qh, W.sc, W.d, R, W.N, W.K, y,
+                                                             ldy);
         return;
     }
     if (!no_gemm && R > 8 && W.type == W_Q8 && W.N % gq8::BN == 0) {
@@ -215,19 +233,23 @@ void Engine::run_chunk(const Row* rows, int R) {
     // attention splits per row: ~60 blocks in total (3 waves at 1 block/SM), within the partials buffer
     static const int nsplit_env = getenv("RAON_NSPLIT") ? atoi(getenv("RAON_NSPLIT")) : 0;  // experiments
     const int nsplit = std::max(1, std::min(nsplit_env ? nsplit_env : 60 / R, (int)w.opart_n / R));
+    // a single segment of more than 16 rows is a prefill chunk: expanded attention (RAON_NOFA: decode kernel per row)
+    static const bool no_fa = getenv("RAON_NOFA") != nullptr;
+    const bool pf = !no_fa && nseg == 1 && R > 16;
+    const int pf_slot = pf ? segs[0].slot : -1, pf_pos0 = pf ? rows[0].pos : 0;
 
     // decode batches (one row per slot, all with logits) replay a CUDA graph captured once per batch size; the
     // kernels read positions/tokens from device memory, so the graph is valid for every step and context length
     const bool graph = nseg == R && nout == R && !g_prof.on && !getenv("RAON_NOGRAPH");
     if (!graph) {
-        launch_chunk(R, nseg, nout, nsplit);
+        launch_chunk(R, nseg, nout, nsplit, pf_slot, pf_pos0);
         return;
     }
     auto it = w.graphs.find(R);
     if (it == w.graphs.end()) {
         cudaGraph_t gr;
         CK(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
-        launch_chunk(R, nseg, nout, nsplit);
+        launch_chunk(R, nseg, nout, nsplit, pf_slot, pf_pos0);
         CK(cudaStreamEndCapture(cudaStreamPerThread, &gr));
         cudaGraphExec_t ex;
         CK(cudaGraphInstantiate(&ex, gr, 0));
@@ -237,7 +259,7 @@ void Engine::run_chunk(const Row* rows, int R) {
     CK(cudaGraphLaunch(it->second, cudaStreamPerThread));
 }
 
-void Engine::launch_chunk(int R, int nseg, int nout, int nsplit) {
+void Engine::launch_chunk(int R, int nseg, int nout, int nsplit, int pf_slot, int pf_pos0) {
     const Config& c = m_.cfg;
     Ws& w = *ws_;
     const int E = c.n_embd, HC = c.hc, H = c.mla_heads, RH = c.rda_heads, D = c.rda_dim, C = RH * D;
@@ -296,6 +318,26 @@ void Engine::launch_chunk(int R, int nseg, int nout, int nsplit) {
             mm(Ly.kv_a, w.h, E, R, w.kv, L, w.xq, w.xs);
             k_mla_cache_write_q8<<<R, 256>>>(w.kv, Ly.kv_a_norm, c.eps_latent, w.rows, kq, ks, kv_slot_rows);
             PROF("mla_proj");
+            if (pf_slot >= 0) {
+                // prefill segment: expanded attention, key blocks of up to FA_KB keys
+                const float scale = 1.f / sqrtf((float)c.k_mla);
+                k_fa_qprep<<<cdiv(R * H * c.k_mla, 256), 256>>>(w.q, R, scale, w.qf);
+                k_fa_init<<<cdiv(H * R * c.v_mla, 256), 256>>>(w.ofa, w.mlfa, H * R);
+                const size_t slot_row0 = (size_t)pf_slot * kv_slot_rows;
+                const int kmax = pf_pos0 + R;
+                for (int kb0 = 0; kb0 < kmax; kb0 += FA_KB) {
+                    const int nk = std::min(FA_KB, kmax - kb0);
+                    k_cache_dequant<<<cdiv(nk * (L / 8), 256), 256>>>(kq, ks, slot_row0 + kb0, nk, w.cf);
+                    k_gemm_hh<<<dim3(cdiv(nk, 64), fa::EW / 64), 128>>>(w.cf, L, Ly.wexp, nk, fa::EW, c.kv_lora, w.E,
+                                                                         fa::EW);
+                    PROF("pf_expand");
+                    k_fa<<<dim3(cdiv(R, fa::BQ), H), fa::THREADS, sizeof(fa::Smem)>>>(w.qf, R, pf_pos0, w.E, w.cf, nk,
+                                                                                       kb0, w.ofa, w.mlfa);
+                    PROF("pf_flashattn");
+                }
+                k_fa_final<<<cdiv(R * H * c.v_mla, 256), 256>>>(w.ofa, w.mlfa, R, w.o);
+                PROF("mla_prefill_attn");
+            } else {
             mm(Ly.k_b, w.q, H * c.k_mla, R, w.qlat, H * c.kv_lora, w.xq, w.xs, c.kv_lora, c.k_mla);
             k_mla_qprep<<<cdiv(R * H * L, 256), 256>>>(w.qlat, w.q, c.k_mla, 1.f / sqrtf((float)c.k_mla), R, w.qi,
                                                         w.qsc);
@@ -306,6 +348,7 @@ void Engine::launch_chunk(int R, int nseg, int nout, int nsplit) {
             k_mla_combine<<<dim3(R, H), 128>>>(w.opart, w.ml, nsplit, w.olat);
             PROF("mla_combine");
             mm(Ly.v_b, w.olat, H * c.kv_lora, R, w.o, H * c.v_mla, w.xq, w.xs, c.v_mla, c.kv_lora);
+            }
             mm(Ly.attn_gate, w.h, E, R, w.gate, H * c.v_mla, w.xq, w.xs);
             k_sigmul<<<cdiv(R * H * c.v_mla, 256), 256>>>(w.o, w.gate, R * H * c.v_mla);
             mm(Ly.mla_out, w.o, H * c.v_mla, R, w.y, E, w.xq, w.xs);

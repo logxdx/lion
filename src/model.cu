@@ -162,6 +162,19 @@ Model load_model(const std::string& path, bool verbose) {
             L.kv_a_norm = upload_f32(g, p + "attn_kv_a_norm.weight", tot, c.kv_lora);
             L.k_b = upload_mat(g, p + "attn_k_b.weight", tot, c.nope(), (int64_t)c.kv_lora * H);
             L.v_b = upload_mat(g, p + "attn_v_b.weight", tot, c.kv_lora, (int64_t)c.v_mla * H);
+            {  // expansion weights for prefill: rows h*128+i = k_b[h][:][i] (transposed), then rows of v_b as stored
+                const GTensor& kb = g.t(p + "attn_k_b.weight");
+                const GTensor& vb = g.t(p + "attn_v_b.weight");
+                if (kb.type != G_F16 || vb.type != G_F16) throw std::runtime_error("attn_k_b/v_b: expected F16");
+                const int R = c.kv_lora, NP = c.nope(), DV = c.v_mla;
+                std::vector<half> wx((size_t)2 * H * NP * R);
+                const half* kbd = (const half*)kb.data;  // [h][r][i]
+                for (int h = 0; h < H; h++)
+                    for (int i = 0; i < NP; i++)
+                        for (int r = 0; r < R; r++) wx[((size_t)h * NP + i) * R + r] = kbd[((size_t)h * R + r) * NP + i];
+                memcpy(&wx[(size_t)H * NP * R], vb.data, (size_t)H * DV * R * 2);  // [h][d][r]
+                L.wexp = (half*)dupload(wx.data(), wx.size() * 2, tot);
+            }
             L.attn_gate = upload_mat(g, p + "attn_gate.weight", tot, E, H * c.v_mla);
             L.mla_out = upload_mat(g, p + "attn_output.weight", tot, H * c.v_mla, E);
         }
@@ -194,6 +207,7 @@ void free_model(Model& m) {
         for (Mat* x : {&L.hc_attn_fn, &L.hc_ffn_fn, &L.wqkv, &L.ssm_f_a, &L.ssm_f_b, &L.rda_out, &L.q_a, &L.q_b, &L.kv_a,
                        &L.k_b, &L.v_b, &L.attn_gate, &L.mla_out, &L.ffn_up, &L.ffn_down, &L.ple_gate, &L.ple_proj})
             free_mat(*x);
+        cudaFree(L.wexp);
         for (float* p : {L.attn_norm, L.ffn_norm, L.hc_attn_base, L.hc_attn_chart, L.hc_ffn_base, L.hc_ffn_chart,
                          L.conv_w, L.dt_b, L.ssm_norm, L.q_a_norm, L.kv_a_norm, L.ple_post_norm})
             cudaFree(p);

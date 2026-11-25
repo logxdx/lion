@@ -47,6 +47,7 @@ struct Layer {
     // MLA
     Mat q_a, q_b, kv_a, k_b, v_b, attn_gate, mla_out;
     float *q_a_norm = nullptr, *kv_a_norm = nullptr;
+    half* wexp = nullptr;  // prefill expansion weights [32*128 K_nope rows (k_b^T) | 32*128 V rows (v_b)][512] f16
     // FFN + per-layer input
     Mat ffn_up, ffn_down, ple_gate, ple_proj;
     float* ple_post_norm = nullptr;
@@ -94,7 +95,7 @@ public:
 
 private:
     void run_chunk(const Row* rows, int n);
-    void launch_chunk(int R, int nseg, int nout, int nsplit);
+    void launch_chunk(int R, int nseg, int nout, int nsplit, int pf_slot, int pf_pos0);
     Model m_;
     int n_slots_, max_ctx_, rmax_;
     // per-slot state

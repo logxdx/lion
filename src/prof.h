@@ -25,7 +25,11 @@ struct Prof {
     void mark(const char* name) {
         if (!on) return;
         cudaEventRecord(cur);
-        cudaEventSynchronize(cur);
+        const cudaError_t e = cudaEventSynchronize(cur);
+        if (e != cudaSuccess) {
+            fprintf(stderr, "profile: CUDA error %s surfaced after group '%s'\n", cudaGetErrorString(e), name);
+            abort();
+        }
         float t = 0;
         cudaEventElapsedTime(&t, last, cur);
         ms[name] += t;
