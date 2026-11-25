@@ -74,13 +74,19 @@ int main(int argc, char** argv) {
         fprintf(stderr, "GPU memory: %.0f MiB (weights + states + caches)\n", eng.gpu_bytes() / 1048576.0);
         for (int s = 0; s < slots; s++) eng.bench_fill(s, depth);
         std::vector<double> ms;
-        for (int i = 0; i < steps + 3; i++) {
+        // warm-up: >= 1.5 s of steps at the same positions (GPU clocks ramp up; graphs get captured)
+        const auto w0 = std::chrono::steady_clock::now();
+        while (std::chrono::duration<double>(std::chrono::steady_clock::now() - w0).count() < 1.5) {
+            std::vector<raon::Row> rows;
+            for (int s = 0; s < slots; s++) rows.push_back({s, depth, 1000 + 37 * s, true});
+            eng.forward(rows);
+        }
+        for (int i = 0; i < steps; i++) {
             std::vector<raon::Row> rows;
             for (int s = 0; s < slots; s++) rows.push_back({s, depth + i, 1000 + 37 * s + i, true});
             auto a = std::chrono::steady_clock::now();
             eng.forward(rows);
-            const double t = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count();
-            if (i >= 3) ms.push_back(t);  // skip warm-up steps
+            ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count());
         }
         std::sort(ms.begin(), ms.end());
         const double med = ms[ms.size() / 2];
