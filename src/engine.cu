@@ -46,6 +46,7 @@ struct Engine::Ws {
     float* hs = nullptr;
     float *qs8 = nullptr, *ks8 = nullptr;
     float *ofa = nullptr, *mlfa = nullptr;
+    float* mhcp = nullptr;   // k_mhc_a partials [rdec][MHC_NB][18]
     // sampling
     float *stemp = nullptr, *ck = nullptr, *stats = nullptr, *ok = nullptr, *olse = nullptr;
     int *ci = nullptr, *oi = nullptr;
@@ -100,6 +101,7 @@ Engine::Engine(const std::string& gguf, int n_slots, int max_ctx, bool verbose, 
     w.opart_n = 256;
     w.opart = falloc(w.opart_n * H * c.kv_lora);
     w.ml = falloc(w.opart_n * H * 2);
+    w.mhcp = falloc((size_t)RD * MHC_NB * 18);
     w.lmax = std::max(n_slots, 16);  // rows that can request logits per chunk
     w.logits = falloc((size_t)w.lmax * c.n_vocab);
     w.stemp = falloc(w.lmax);
@@ -396,7 +398,15 @@ void Engine::launch_chunk(int R, int nseg, int nout, int nsplit, int pf_slot, in
             a.Hq = w.hq; a.Hs = w.hs;
         }
         a.hc_eps = c.hc_eps; a.eps = c.eps; a.mag = c.hc_mag;
-        k_mhc<<<R, 192>>>(a);
+        // small batches (decode): the 17 x 6144 selector matrix is read in slices by 8 blocks per row, then one block
+        // per row combines the partial dots (RAON_MHC_SPLIT=n: largest batch for this path, 0 = always k_mhc)
+        static const int split_max = getenv("RAON_MHC_SPLIT") ? atoi(getenv("RAON_MHC_SPLIT")) : 16;
+        if (R <= split_max) {
+            k_mhc_a<<<dim3(R, MHC_NB), 192>>>(a, w.mhcp);
+            if (pre) k_mhc_b<<<R, 192>>>(a, w.mhcp);
+        } else {
+            k_mhc<<<R, 192>>>(a);
+        }
         PROF("mhc");
     };
     // int8-activation matmuls whose activations were already quantized by the producing kernel

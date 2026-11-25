@@ -504,6 +504,130 @@ __device__ __forceinline__ void quant32_store(float v, int8_t* q, float* s, int 
     *q = (int8_t)roundf(v * id);
     if (lane == 0) *s = d;
 }
+// ---- mHC for small batches (decode): k_mhc's work split over 8 blocks per row (the 17 x 6144 selector matrix is read
+// in slices instead of whole by one SM per row), then one block per row combines the partial dots.
+constexpr int MHC_NB = 8;   // e-slices of 192 per row
+// part 1: grid (R, MHC_NB), block 192 (one e per thread, all 4 streams): add, post-mix, X, stream sum (+ int8),
+// partial selector dots and sum of squares -> part [R][MHC_NB][18]
+__global__ void __launch_bounds__(192) k_mhc_a(MhcArgs a, float* __restrict__ part) {
+    constexpr int E = 1536, HC = 4, MIX = 17, HC2 = 16, T = 192;
+    __shared__ float red[T / 32][MIX + 1];
+    __shared__ float sb;
+    const int r = blockIdx.x, b = blockIdx.y, t = threadIdx.x, lane = t & 31, warp = t >> 5, e = b * T + t;
+    float* Xr = a.X + (size_t)r * HC * E;
+    float x[HC];
+#pragma unroll
+    for (int s2 = 0; s2 < HC; s2++) x[s2] = Xr[s2 * E + e];
+    bool changed = false;
+    if (a.A) {
+        float inv = 1.f;
+        if (a.aw) {   // RMS of the whole A row (each slice recomputes it)
+            float ss = 0.f;
+            for (int i = t; i < E; i += T) { const float v = a.A[(size_t)r * E + i]; ss += v * v; }
+            ss = warp_sum(ss);
+            if (lane == 0) red[warp][0] = ss;
+            __syncthreads();
+            if (t == 0) { float z = 0.f; for (int w = 0; w < T / 32; w++) z += red[w][0]; sb = z; }
+            __syncthreads();
+            inv = rsqrtf(sb / E + a.eps);
+        }
+        const float v = a.A[(size_t)r * E + e] * inv * (a.aw ? a.aw[e] : 1.f);
+#pragma unroll
+        for (int s2 = 0; s2 < HC; s2++) x[s2] += v;
+        changed = true;
+    }
+    if (a.Y) {
+        const float* cm = a.comb + r * HC2;
+        const float* pp = a.post + r * HC;
+        const float yv = a.Y[(size_t)r * E + e];
+        const float x0 = x[0], x1 = x[1], x2 = x[2], x3 = x[3];
+#pragma unroll
+        for (int d = 0; d < HC; d++) x[d] = cm[d] * x0 + cm[4 + d] * x1 + cm[8 + d] * x2 + cm[12 + d] * x3 + pp[d] * yv;
+        changed = true;
+    }
+    if (changed)
+#pragma unroll
+        for (int s2 = 0; s2 < HC; s2++) Xr[s2 * E + e] = x[s2];
+    if (a.S) {
+        const float sv = (x[0] + x[1] + x[2] + x[3]) * a.sscale;
+        a.S[(size_t)r * E + e] = sv;
+        if (a.Sq) quant32_store(sv, a.Sq + (size_t)r * E + e, a.Ss + (size_t)r * (E / 32) + (e >> 5), lane);
+    }
+    if (!a.fn) return;
+    float v[MIX + 1];
+#pragma unroll
+    for (int m = 0; m < MIX; m++) {
+        float acc = 0.f;
+#pragma unroll
+        for (int s2 = 0; s2 < HC; s2++) acc += __half2float(a.fn[(size_t)m * HC * E + s2 * E + e]) * x[s2];
+        v[m] = acc;
+    }
+    v[MIX] = x[0] * x[0] + x[1] * x[1] + x[2] * x[2] + x[3] * x[3];
+#pragma unroll
+    for (int m = 0; m <= MIX; m++) v[m] = warp_sum(v[m]);
+    if (lane == 0)
+#pragma unroll
+        for (int m = 0; m <= MIX; m++) red[warp][m] = v[m];
+    __syncthreads();
+    if (t <= MIX) {
+        float z = 0.f;
+        for (int w = 0; w < T / 32; w++) z += red[w][t];
+        part[((size_t)r * MHC_NB + b) * (MIX + 1) + t] = z;
+    }
+}
+// part 2: grid R, block 192 (8 e per thread): mixes from the partials, pre / post / comb, h = RMSNorm(sum pre_s X_s)
+__global__ void __launch_bounds__(192) k_mhc_b(MhcArgs a, const float* __restrict__ part) {
+    constexpr int E = 1536, HC = 4, MIX = 17, HC2 = 16, T = 192, V = 8;
+    __shared__ float red[T / 32];
+    __shared__ float sm_m[MIX], sm_pre[HC], sm_cb[HC2], sm_v[MIX + 1], sm_h;
+    const int r = blockIdx.x, t = threadIdx.x, lane = t & 31, warp = t >> 5, e0 = t * V;
+    if (t <= MIX) {
+        float z = 0.f;
+        for (int b = 0; b < MHC_NB; b++) z += part[((size_t)r * MHC_NB + b) * (MIX + 1) + t];
+        sm_v[t] = z;
+    }
+    __syncthreads();
+    const float inv = rsqrtf(sm_v[MIX] / (HC * E) + a.hc_eps);
+    if (t < MIX) sm_m[t] = sm_v[t] * inv + a.base[t];
+    __syncthreads();
+    if (t < 2 * HC) {
+        const float sg = sigmoidf_(sm_m[t]);
+        if (t < HC) sm_pre[t] = sg;
+        else a.post[r * HC + t - HC] = sg * a.mag;
+    }
+    if (t < HC2) {
+        float e = 0.f;
+        for (int k = 0; k < MIX; k++) e += a.chart[t * MIX + k] * sm_m[k];
+        sm_cb[t] = e;
+    }
+    __syncthreads();
+    if (t < HC2) {
+        float mx = -INFINITY;
+        for (int j = 0; j < HC2; j++) mx = fmaxf(mx, sm_cb[j] * a.chart[MIX * HC2 + j]);
+        a.comb[r * HC2 + t] = sm_cb[t] / (1.f + mx) + a.chart[MIX * HC2 + HC2 + t];
+    }
+    const float* Xr = a.X + (size_t)r * HC * E;
+    float hv[V], hs = 0.f;
+#pragma unroll
+    for (int i = 0; i < V; i++) {
+        hv[i] = sm_pre[0] * Xr[e0 + i] + sm_pre[1] * Xr[E + e0 + i] + sm_pre[2] * Xr[2 * E + e0 + i] + sm_pre[3] * Xr[3 * E + e0 + i];
+        hs += hv[i] * hv[i];
+    }
+    hs = warp_sum(hs);
+    if (lane == 0) red[warp] = hs;
+    __syncthreads();
+    if (t == 0) { float z = 0.f; for (int w = 0; w < T / 32; w++) z += red[w]; sm_h = z; }
+    __syncthreads();
+    const float ih = rsqrtf(sm_h / E + a.eps);
+    float* Hr = a.H + (size_t)r * E;
+    float o[V];
+#pragma unroll
+    for (int i = 0; i < V; i++) o[i] = hv[i] * ih * a.nw[e0 + i];
+    *(float4*)&Hr[e0] = make_float4(o[0], o[1], o[2], o[3]);
+    *(float4*)&Hr[e0 + 4] = make_float4(o[4], o[5], o[6], o[7]);
+    if (a.Hq) quant8_quad(o, a.Hq + (size_t)r * E + e0, a.Hs + (size_t)r * (E / 32) + e0 / 32, lane);
+}
+
 struct RowMeta { int slot, pos, tok, seg_row0; };
 struct Seg { int slot, row0, n; };
 
