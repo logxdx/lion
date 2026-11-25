@@ -267,6 +267,24 @@ __global__ void k_hc_post(float* __restrict__ X, const float* __restrict__ y, co
     for (int d = 0; d < 4; d++) Xr[d * E + i] = c[d] * x0 + c[4 + d] * x1 + c[8 + d] * x2 + c[12 + d] * x3 + p[d] * yv;
 }
 
+// int8 quantization (per 32, like k_quantize) of 8 contiguous values held by each thread; 4 consecutive lanes = 1 block
+__device__ __forceinline__ void quant8_quad(const float* v, int8_t* q, float* s, int lane) {
+    float m = 0.f;
+#pragma unroll
+    for (int i = 0; i < 8; i++) m = fmaxf(m, fabsf(v[i]));
+    m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 1));
+    m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 2));
+    const float d = m / 127.f, id = d > 0.f ? 1.f / d : 0.f;
+    uint32_t w0 = 0, w1 = 0;
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        w0 |= (uint32_t)(uint8_t)(int8_t)roundf(v[i] * id) << (8 * i);
+        w1 |= (uint32_t)(uint8_t)(int8_t)roundf(v[4 + i] * id) << (8 * i);
+    }
+    *(uint2*)q = make_uint2(w0, w1);
+    if ((lane & 3) == 0) *s = d;
+}
+
 // ---------------------------------------------------------------- fused mHC step, one row per block (192 threads x 8)
 // In order, all optional:
 //   add:  X_s += RMSNorm_aw(A)          (per-layer-input output, added to every stream; aw == null: plain add)
@@ -278,7 +296,9 @@ struct MhcArgs {
     const float *A, *aw;                  // add
     const float* Y; float *post, *comb;   // post (read) and pre outputs (written; same buffers)
     float* S; float sscale;               // stream sum
+    int8_t* Sq; float* Ss;                // stream sum, also int8 (for the next GEMM), optional
     const half* fn; const float *base, *chart, *nw; float* H;  // pre
+    int8_t* Hq; float* Hs;                // H, also int8, optional
     float hc_eps, eps, mag;
 };
 __global__ void __launch_bounds__(192) k_mhc(MhcArgs a) {
@@ -363,6 +383,7 @@ __global__ void __launch_bounds__(192) k_mhc(MhcArgs a) {
         for (int i = 0; i < V; i++) sv[i] = (x[0][i] + x[1][i] + x[2][i] + x[3][i]) * a.sscale;
         *(float4*)&a.S[(size_t)r * E + e0] = make_float4(sv[0], sv[1], sv[2], sv[3]);
         *(float4*)&a.S[(size_t)r * E + e0 + 4] = make_float4(sv[4], sv[5], sv[6], sv[7]);
+        if (a.Sq) quant8_quad(sv, a.Sq + (size_t)r * E + e0, a.Ss + (size_t)r * (E / 32) + e0 / 32, lane);
     }
     if (!a.fn) return;
     // ---- pre: rms over the 4 streams, 17 selector dots, then the mix
@@ -422,6 +443,7 @@ __global__ void __launch_bounds__(192) k_mhc(MhcArgs a) {
     for (int i = 0; i < V; i++) o[i] = hv[i] * ih * a.nw[e0 + i];
     *(float4*)&Hr[e0] = make_float4(o[0], o[1], o[2], o[3]);
     *(float4*)&Hr[e0 + 4] = make_float4(o[4], o[5], o[6], o[7]);
+    if (a.Hq) quant8_quad(o, a.Hq + (size_t)r * E + e0, a.Hs + (size_t)r * (E / 32) + e0 / 32, lane);
 }
 
 // sum of streams (per-layer-input gate input) or mean (final)
@@ -475,6 +497,13 @@ __global__ void k_sigmul(float* __restrict__ o, const float* __restrict__ gate, 
 }
 
 // ---------------------------------------------------------------- RDA
+// one warp per 32-value block: quantize like k_quantize
+__device__ __forceinline__ void quant32_store(float v, int8_t* q, float* s, int lane) {
+    const float m = warp_max(fabsf(v));
+    const float d = m / 127.f, id = d > 0.f ? 1.f / d : 0.f;
+    *q = (int8_t)roundf(v * id);
+    if (lane == 0) *s = d;
+}
 struct RowMeta { int slot, pos, tok, seg_row0; };
 struct Seg { int slot, row0, n; };
 
@@ -589,6 +618,56 @@ __global__ void __launch_bounds__(128) k_rda_scan(const Seg* __restrict__ segs, 
 #pragma unroll
     for (int i = 0; i < HR; i++) S[(i0 + i) * D + j] = s[i];
 }
+// conv (4 taps) + SiLU for one head's q, k, v channels, fused with the gates and L2 norms of k_rda_prep.
+// grid (R, H), block 128 (head dim). Reads qkvg / the conv state directly (no conv buffer).
+__device__ __forceinline__ float rda_conv1(const float* __restrict__ qkvg, int ldq, int r, int seg_row0,
+                                           const float* __restrict__ st, const float* __restrict__ w, int c, int C3) {
+    float acc = 0.f;
+#pragma unroll
+    for (int k = 0; k < 4; k++) {
+        const int src = r - 3 + k;
+        const float v = src >= seg_row0 ? qkvg[(size_t)src * ldq + c] : st[(3 + (src - seg_row0)) * C3 + c];
+        acc += v * w[c * 4 + k];
+    }
+    return siluf_(acc);
+}
+__global__ void k_rda_conv_prep(const float* __restrict__ qkvg, int ldq, const RowMeta* __restrict__ rows,
+                                const float* __restrict__ state, size_t state_slot_stride, const float* __restrict__ cw,
+                                const float* __restrict__ fab, int ldfab, const float* __restrict__ fb,
+                                const float* __restrict__ dt_b, float lb, int H, int D, int rank, float* __restrict__ qn,
+                                float* __restrict__ kn, float* __restrict__ vs, float* __restrict__ gl,
+                                float* __restrict__ beta) {
+    __shared__ float red[32];
+    const int r = blockIdx.x, h = blockIdx.y, j = threadIdx.x, C = H * D;
+    const RowMeta m = rows[r];
+    const float* st = state + (size_t)m.slot * state_slot_stride;
+    const float q = rda_conv1(qkvg, ldq, r, m.seg_row0, st, cw, h * D + j, 3 * C);
+    const float k = rda_conv1(qkvg, ldq, r, m.seg_row0, st, cw, C + h * D + j, 3 * C);
+    const float v = rda_conv1(qkvg, ldq, r, m.seg_row0, st, cw, 2 * C + h * D + j, 3 * C);
+    const float qs = block_sum(q * q, red);
+    const float ks = block_sum(k * k, red);
+    const size_t o = (size_t)r * C + h * D + j;
+    qn[o] = q / fmaxf(sqrtf(qs), 1e-6f);
+    kn[o] = k / fmaxf(sqrtf(ks), 1e-6f);
+    const float b = sigmoidf_(fab[(size_t)r * ldfab + rank + h]);
+    const float wr = sigmoidf_(fab[(size_t)r * ldfab + rank + H + h]);
+    vs[o] = v * (wr / b);
+    gl[o] = lb * sigmoidf_(fb[o] + dt_b[h * D + j]);
+    if (j == 0) beta[r * H + h] = b;
+}
+// k_rda_out emitting int8 for the output projection (each warp = one 32-value block)
+__global__ void k_rda_out_quant(const float* __restrict__ o, const float* __restrict__ qkvg, int ldq,
+                                const float* __restrict__ w, int H, float eps, int8_t* __restrict__ xq,
+                                float* __restrict__ xs) {
+    __shared__ float red[32];
+    const int r = blockIdx.x, h = blockIdx.y, j = threadIdx.x, D = blockDim.x, C = H * D;
+    const float v = o[(size_t)r * C + h * D + j];
+    const float ss = block_sum(v * v, red);
+    const float g = qkvg[(size_t)r * ldq + 3 * C + h * D + j];
+    const float y = v * rsqrtf(ss / D + eps) * w[j] * sigmoidf_(g);
+    const int c = h * D + j;
+    quant32_store(y, xq + (size_t)r * C + c, xs + (size_t)r * (C / 32) + (c >> 5), j & 31);
+}
 // RMSNorm per head (w = ssm_norm) * sigmoid(output gate g2 = qkvg[3C + ...]). grid (R, H), block 128
 __global__ void k_rda_out(const float* __restrict__ o, const float* __restrict__ qkvg, int ldq, const float* __restrict__ w,
                           int H, float eps, float* __restrict__ y) {
@@ -598,6 +677,36 @@ __global__ void k_rda_out(const float* __restrict__ o, const float* __restrict__
     const float ss = block_sum(v * v, red);
     const float g = qkvg[(size_t)r * ldq + 3 * C + h * D + j];
     y[(size_t)r * C + h * D + j] = v * rsqrtf(ss / D + eps) * w[j] * sigmoidf_(g);
+}
+
+// ---------------------------------------------------------------- elementwise ops that emit int8 for the next GEMM
+// one warp per 32-value block; v computed by the op, then quantized like k_quantize
+// o *= sigmoid(gate) -> int8   (MLA output gate, n values per row)
+__global__ void k_sigmul_quant(const float* __restrict__ o, const float* __restrict__ gate, int n, int R,
+                               int8_t* __restrict__ xq, float* __restrict__ xs) {
+    const int gw = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+    if (gw >= R * (n / 32)) return;
+    const int r = gw / (n / 32), b = gw % (n / 32), i = b * 32 + lane;
+    const size_t k = (size_t)r * n + i;
+    quant32_store(o[k] * sigmoidf_(gate[k]), xq + k, xs + (size_t)r * (n / 32) + b, lane);
+}
+// gelu(a) * ple[layer] -> int8   (per-layer-input gate, G values per row)
+__global__ void k_gelu_mul_quant(const float* __restrict__ a, const float* __restrict__ ple, int layer, int NL, int G,
+                                 int R, int8_t* __restrict__ xq, float* __restrict__ xs) {
+    const int gw = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+    if (gw >= R * (G / 32)) return;
+    const int r = gw / (G / 32), b = gw % (G / 32), i = b * 32 + lane;
+    const float v = gelu_tanh(a[(size_t)r * G + i]) * ple[((size_t)r * NL + layer) * G + i];
+    quant32_store(v, xq + (size_t)r * G + i, xs + (size_t)r * (G / 32) + b, lane);
+}
+// RMSNorm_w(x) -> int8, one block of n/32 warps per row (n <= 1024)
+__global__ void k_rmsnorm_quant(const float* __restrict__ x, int n, const float* __restrict__ w, float eps,
+                                int8_t* __restrict__ xq, float* __restrict__ xs) {
+    __shared__ float red[32];
+    const int r = blockIdx.x, i = threadIdx.x, lane = i & 31;
+    const float v = x[(size_t)r * n + i];
+    const float ss = block_sum(v * v, red);
+    quant32_store(v * rsqrtf(ss / n + eps) * w[i], xq + (size_t)r * n + i, xs + (size_t)r * (n / 32) + (i >> 5), lane);
 }
 
 // gather rows (for the LM head)

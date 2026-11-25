@@ -37,7 +37,8 @@ struct Engine::Ws {
     int lmax = 0;
     // prefill attention (expanded form)
     half *qf = nullptr, *cf = nullptr, *E = nullptr;
-    int8_t *q8 = nullptr, *k8 = nullptr;
+    int8_t *q8 = nullptr, *k8 = nullptr, *hq = nullptr;
+    float* hs = nullptr;
     float *qs8 = nullptr, *ks8 = nullptr;
     float *ofa = nullptr, *mlfa = nullptr;
 };
@@ -52,6 +53,10 @@ static float* falloc(size_t n) {
 Engine::Engine(const std::string& gguf, int n_slots, int max_ctx, bool verbose)
     : n_slots_(n_slots), max_ctx_(max_ctx), rmax_(getenv("RAON_CHUNK") ? atoi(getenv("RAON_CHUNK")) : 256) {
     m_ = load_model(gguf, verbose);
+    for (const Layer& Ly : m_.layers)  // the fused path feeds these from int8 producers: they must be Q8_0 / Q6_K
+        for (const Mat* M : {&Ly.wqkv, &Ly.rda_out, &Ly.q_a, &Ly.q_b, &Ly.attn_gate, &Ly.mla_out, &Ly.ffn_up, &Ly.ffn_down,
+                             &Ly.ple_gate, &Ly.ple_proj})
+            if (M->valid() && M->type == W_F16) throw std::runtime_error("unsupported: F16 weights on an int8-activation path");
     const Config& c = m_.cfg;
     const size_t conv_n = (size_t)n_slots * m_.n_rda * 3 * 3 * c.rda_heads * c.rda_dim;
     const size_t rda_n = (size_t)n_slots * m_.n_rda * c.rda_heads * c.rda_dim * c.rda_dim;
@@ -127,6 +132,8 @@ Engine::Engine(const std::string& gguf, int n_slots, int max_ctx, bool verbose)
     CK(cudaFuncSetAttribute(k_fa, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sizeof(fa::Smem)));
     CK(cudaFuncSetAttribute(k_fa8, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sizeof(fa8::Smem)));
     CK(cudaMalloc(&w.q8, (size_t)R * H * c.k_mla));
+    CK(cudaMalloc(&w.hq, (size_t)R * E));
+    w.hs = falloc((size_t)R * E / 32);
     CK(cudaMalloc(&w.k8, (size_t)FA_KB * H * c.k_mla));
     w.qs8 = falloc((size_t)R * H * 2);
     w.ks8 = falloc((size_t)FA_KB * H * 2);
@@ -287,63 +294,55 @@ void Engine::launch_chunk(int R, int nseg, int nout, int nsplit, int pf_slot, in
     const size_t conv_slot = (size_t)m_.n_rda * 3 * 3 * C, rda_slot = (size_t)m_.n_rda * RH * D * D;
     const size_t kv_slot_rows = (size_t)m_.n_mla * max_ctx_;
 
-    auto hc_pre = [&](const Mat& fn, const float* base, const float* chart, const float* norm_w) {
-        k_rmsnorm<<<dim3(R, 1), 256>>>(w.X, HC * E, w.flat, HC * E, nullptr, HC * E, c.hc_eps);
-        mm(fn, w.flat, HC * E, R, w.mixes, c.hc_mix(), w.xq, w.xs);
-        k_hc_pre<<<R, 256>>>(w.mixes, base, chart, w.X, norm_w, E, c.eps, c.hc_mag, w.h, w.post, w.comb);
-        PROF("mhc_pre");
-    };
-    auto hc_post = [&]() {
-        k_hc_post<<<cdiv(R * E, 256), 256>>>(w.X, w.y, w.post, w.comb, E, R);
-        PROF("mhc_post");
-    };
-    // fused mHC step (k_mhc); RAON_OLDMHC=1 runs the separate kernels instead (A/B)
-    static const bool old_mhc = getenv("RAON_OLDMHC") != nullptr;
-    auto mhc = [&](const float* addv, const float* aw, bool post, float* S, float sscale, const Layer* pre, bool ffn) {
+    // fused mHC step (k_mhc): optional PLE add, post-mix, stream sum (also int8), pre -> h (also int8 in hq/hs)
+    auto mhc = [&](const float* addv, const float* aw, bool post, float* S, float sscale, bool squant, const Layer* pre,
+                   bool ffn) {
         MhcArgs a{};
         a.X = w.X; a.R = R; a.A = addv; a.aw = aw;
         a.Y = post ? w.y : nullptr; a.post = w.post; a.comb = w.comb;
         a.S = S; a.sscale = sscale;
+        if (squant) { a.Sq = w.xq; a.Ss = w.xs; }
         if (pre) {
             a.fn = (ffn ? pre->hc_ffn_fn : pre->hc_attn_fn).d;
             a.base = ffn ? pre->hc_ffn_base : pre->hc_attn_base;
             a.chart = ffn ? pre->hc_ffn_chart : pre->hc_attn_chart;
             a.nw = ffn ? pre->ffn_norm : pre->attn_norm;
             a.H = w.h;
+            a.Hq = w.hq; a.Hs = w.hs;
         }
         a.hc_eps = c.hc_eps; a.eps = c.eps; a.mag = c.hc_mag;
         k_mhc<<<R, 192>>>(a);
         PROF("mhc");
     };
+    // int8-activation matmuls whose activations were already quantized by the producing kernel
+    auto mmq = [&](const Mat& W, int8_t* q, float* s, float* y, int ldy) { mm(W, nullptr, W.K, R, y, ldy, q, s, 0, 0, true); };
 
     for (int il = 0; il < NL; il++) {
         const Layer& Ly = m_.layers[il];
-        if (old_mhc) hc_pre(Ly.hc_attn_fn, Ly.hc_attn_base, Ly.hc_attn_chart, Ly.attn_norm);
-        else mhc(il ? w.y2 : nullptr, il ? m_.layers[il - 1].ple_post_norm : nullptr, false, nullptr, 0.f, &Ly, false);
+        mhc(il ? w.y2 : nullptr, il ? m_.layers[il - 1].ple_post_norm : nullptr, false, nullptr, 0.f, false, &Ly, false);
         if (Ly.rda) {
             float* cst = conv_state_ + (size_t)Ly.rda_idx * 3 * 3 * C;
             float* rst = rda_state_ + (size_t)Ly.rda_idx * RH * D * D;
-            mm(Ly.wqkv, w.h, E, R, w.big, 4 * C, w.xq, w.xs);
+            mmq(Ly.wqkv, w.hq, w.hs, w.big, 4 * C);
             PROF("rda_qkv");
-            k_rda_conv<<<cdiv(R * 3 * C, 256), 256>>>(w.big, 4 * C, w.rows, cst, conv_slot, Ly.conv_w, 3 * C, R, w.conv);
-            k_rda_conv_state<<<cdiv(nseg * 3 * C, 256), 256>>>(w.big, 4 * C, w.segs, nseg, cst, conv_slot, 3 * C);
             const int nfab = c.dt_rank + 2 * RH;
             mm(Ly.ssm_f_a, w.h, E, R, w.fab, nfab, w.xq, w.xs);
             mm(Ly.ssm_f_b, w.fab, nfab, R, w.fb, C, w.xq, w.xs);
-            k_rda_prep<<<dim3(R, RH), D>>>(w.conv, w.fab, nfab, w.fb, Ly.dt_b, c.gate_lb, RH, D, c.dt_rank, w.qn, w.kn,
-                                           w.vs, w.gl, w.beta);
+            k_rda_conv_prep<<<dim3(R, RH), D>>>(w.big, 4 * C, w.rows, cst, conv_slot, Ly.conv_w, w.fab, nfab, w.fb, Ly.dt_b,
+                                                c.gate_lb, RH, D, c.dt_rank, w.qn, w.kn, w.vs, w.gl, w.beta);
+            k_rda_conv_state<<<cdiv(nseg * 3 * C, 256), 256>>>(w.big, 4 * C, w.segs, nseg, cst, conv_slot, 3 * C);
             PROF("rda_conv+gates");
             k_rda_scan<<<dim3(nseg, RH, 4), 128>>>(w.segs, w.qn, w.kn, w.vs, w.gl, w.beta, rst, rda_slot, RH, w.ro);
             PROF("rda_scan");
-            k_rda_out<<<dim3(R, RH), D>>>(w.ro, w.big, 4 * C, Ly.ssm_norm, RH, c.eps, w.s);
-            mm(Ly.rda_out, w.s, C, R, w.y, E, w.xq, w.xs);
+            k_rda_out_quant<<<dim3(R, RH), D>>>(w.ro, w.big, 4 * C, Ly.ssm_norm, RH, c.eps, w.xq, w.xs);
+            mmq(Ly.rda_out, w.xq, w.xs, w.y, E);
             PROF("rda_out");
         } else {
             int8_t* kq = kv_q_ + (size_t)Ly.mla_idx * max_ctx_ * L;
             half* ks = kv_s_ + (size_t)Ly.mla_idx * max_ctx_ * (L / 32);
-            mm(Ly.q_a, w.h, E, R, w.qa, c.q_lora, w.xq, w.xs);
-            k_rmsnorm<<<dim3(R, 1), 256>>>(w.qa, c.q_lora, w.qan, c.q_lora, Ly.q_a_norm, c.q_lora, c.eps_latent);
-            mm(Ly.q_b, w.qan, c.q_lora, R, w.q, H * c.k_mla, w.xq, w.xs);
+            mmq(Ly.q_a, w.hq, w.hs, w.qa, c.q_lora);
+            k_rmsnorm_quant<<<R, c.q_lora>>>(w.qa, c.q_lora, Ly.q_a_norm, c.eps_latent, w.xq, w.xs);
+            mmq(Ly.q_b, w.xq, w.xs, w.q, H * c.k_mla);
             mm(Ly.kv_a, w.h, E, R, w.kv, L, w.xq, w.xs);
             k_mla_cache_write_q8<<<R, 256>>>(w.kv, Ly.kv_a_norm, c.eps_latent, w.rows, kq, ks, kv_slot_rows);
             PROF("mla_proj");
@@ -374,55 +373,34 @@ void Engine::launch_chunk(int R, int nseg, int nout, int nsplit, int pf_slot, in
                 k_fa_final<<<cdiv(R * H * c.v_mla, 256), 256>>>(w.ofa, w.mlfa, R, w.o);
                 PROF("mla_prefill_attn");
             } else {
-            mm(Ly.k_b, w.q, H * c.k_mla, R, w.qlat, H * c.kv_lora, w.xq, w.xs, c.kv_lora, c.k_mla);
-            k_mla_qprep<<<cdiv(R * H * L, 256), 256>>>(w.qlat, w.q, c.k_mla, 1.f / sqrtf((float)c.k_mla), R, w.qi,
-                                                        w.qsc);
-            PROF("mla_kb+qprep");
-            k_mla_decode<RowMeta><<<dim3(R, nsplit), attn::THREADS, sizeof(attn::Smem)>>>(
-                w.qi, w.qsc, kq, ks, kv_slot_rows, w.rows, nsplit, w.opart, w.ml);
-            PROF("mla_attn");
-            k_mla_combine<<<dim3(R, H), 128>>>(w.opart, w.ml, nsplit, w.olat);
-            PROF("mla_combine");
-            mm(Ly.v_b, w.olat, H * c.kv_lora, R, w.o, H * c.v_mla, w.xq, w.xs, c.v_mla, c.kv_lora);
+                mm(Ly.k_b, w.q, H * c.k_mla, R, w.qlat, H * c.kv_lora, w.xq, w.xs, c.kv_lora, c.k_mla);
+                k_mla_qprep<<<cdiv(R * H * L, 256), 256>>>(w.qlat, w.q, c.k_mla, 1.f / sqrtf((float)c.k_mla), R, w.qi,
+                                                            w.qsc);
+                PROF("mla_kb+qprep");
+                k_mla_decode<RowMeta><<<dim3(R, nsplit), attn::THREADS, sizeof(attn::Smem)>>>(
+                    w.qi, w.qsc, kq, ks, kv_slot_rows, w.rows, nsplit, w.opart, w.ml);
+                PROF("mla_attn");
+                k_mla_combine<<<dim3(R, H), 128>>>(w.opart, w.ml, nsplit, w.olat);
+                PROF("mla_combine");
+                mm(Ly.v_b, w.olat, H * c.kv_lora, R, w.o, H * c.v_mla, w.xq, w.xs, c.v_mla, c.kv_lora);
             }
-            mm(Ly.attn_gate, w.h, E, R, w.gate, H * c.v_mla, w.xq, w.xs);
-            k_sigmul<<<cdiv(R * H * c.v_mla, 256), 256>>>(w.o, w.gate, R * H * c.v_mla);
-            mm(Ly.mla_out, w.o, H * c.v_mla, R, w.y, E, w.xq, w.xs);
+            mmq(Ly.attn_gate, w.hq, w.hs, w.gate, H * c.v_mla);
+            k_sigmul_quant<<<cdiv(R * H * c.v_mla, 256), 256>>>(w.o, w.gate, H * c.v_mla, R, w.xq, w.xs);
+            mmq(Ly.mla_out, w.xq, w.xs, w.y, E);
             PROF("mla_vb+gate+out");
         }
         // FFN
-        if (old_mhc) {
-            hc_post();
-            hc_pre(Ly.hc_ffn_fn, Ly.hc_ffn_base, Ly.hc_ffn_chart, Ly.ffn_norm);
-        } else {
-            mhc(nullptr, nullptr, true, nullptr, 0.f, &Ly, true);
-        }
-        mm(Ly.ffn_up, w.h, E, R, w.big, 2 * c.n_ff, w.xq, w.xs);
+        mhc(nullptr, nullptr, true, nullptr, 0.f, false, &Ly, true);
+        mmq(Ly.ffn_up, w.hq, w.hs, w.big, 2 * c.n_ff);
         PROF("ffn_up");
-        if (Ly.ffn_down.type != W_F16) {
-            k_swiglu_quantize<<<cdiv(R * c.n_ff, 256), 256>>>(w.big, c.n_ff, R, w.xq, w.xs);
-            mm(Ly.ffn_down, nullptr, c.n_ff, R, w.y, E, w.xq, w.xs, 0, 0, true);
-        } else {
-            k_swiglu<<<cdiv(R * c.n_ff, 256), 256>>>(w.big, w.act, c.n_ff, R);
-            mm(Ly.ffn_down, w.act, c.n_ff, R, w.y, E, w.xq, w.xs);
-        }
+        k_swiglu_quantize<<<cdiv(R * c.n_ff, 256), 256>>>(w.big, c.n_ff, R, w.xq, w.xs);
+        mmq(Ly.ffn_down, w.xq, w.xs, w.y, E);
         PROF("ffn_down");
-        // per-layer input; the fused path adds RMSNorm(proj) to the streams at the next mHC step
-        if (old_mhc) {
-            hc_post();
-            k_stream_sum<<<cdiv(R * E, 256), 256>>>(w.X, w.s, E, R, 1.f);
-        } else {
-            mhc(nullptr, nullptr, true, w.s, 1.f, nullptr, false);
-        }
-        mm(Ly.ple_gate, w.s, E, R, w.qa, G, w.xq, w.xs);
-        k_gelu_mul<<<cdiv(R * G, 256), 256>>>(w.qa, w.ple, il, NL, G, w.qan, R);
-        if (old_mhc) {
-            mm(Ly.ple_proj, w.qan, G, R, w.y, E, w.xq, w.xs);
-            k_rmsnorm<<<dim3(R, 1), 256>>>(w.y, E, w.y2, E, Ly.ple_post_norm, E, c.eps);
-            k_add_streams<<<cdiv(R * E, 256), 256>>>(w.X, w.y2, E, R);
-        } else {
-            mm(Ly.ple_proj, w.qan, G, R, w.y2, E, w.xq, w.xs);
-        }
+        // per-layer input: gate(stream sum) -> gelu x ple -> proj; RMSNorm + add to the streams at the next mHC step
+        mhc(nullptr, nullptr, true, w.s, 1.f, true, nullptr, false);
+        mmq(Ly.ple_gate, w.xq, w.xs, w.qa, G);
+        k_gelu_mul_quant<<<cdiv(R * G, 256), 256>>>(w.qa, w.ple, il, NL, G, R, w.xq, w.xs);
+        mmq(Ly.ple_proj, w.xq, w.xs, w.y2, E);
         PROF("ple_layer");
         static const bool dump = getenv("RAON_DUMP") != nullptr;  // debugging: per-layer stream checksums
         if (dump) {
@@ -434,8 +412,7 @@ void Engine::launch_chunk(int R, int nseg, int nout, int nsplit, int pf_slot, in
         }
     }
     if (nout == 0) return;
-    if (old_mhc) k_stream_sum<<<cdiv(R * E, 256), 256>>>(w.X, w.s, E, R, 1.f / HC);
-    else mhc(w.y2, m_.layers[NL - 1].ple_post_norm, false, w.s, 1.f / HC, nullptr, false);
+    mhc(w.y2, m_.layers[NL - 1].ple_post_norm, false, w.s, 1.f / HC, false, nullptr, false);
     k_rmsnorm<<<dim3(R, 1), 256>>>(w.s, E, w.hn, E, m_.output_norm, E, c.eps);
     k_gather<<<nout, 256>>>(w.hn, w.sel, nout, E, w.hsel);
     mm(m_.tok_embd, w.hsel, E, nout, w.logits, c.n_vocab, w.xq, w.xs);
