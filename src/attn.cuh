@@ -57,6 +57,17 @@ __device__ __forceinline__ void mma16816(float* c, uint32_t a0, uint32_t a1, uin
         : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
+// f16 accumulate: c = 2 x half2 (rows g and g+8)
+__device__ __forceinline__ void mma16816_h(uint32_t* c, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0,
+                                           uint32_t b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
+        : "+r"(c[0]), "+r"(c[1])
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+#ifndef ATTN_PV_F32ACC
+#define ATTN_PV_F32ACC 1  // f16 accumulation (0) is 8% faster at 6x150k but flipped a 0.27-nat near-tie at 9.8k context
+#endif
 __device__ __forceinline__ void mma_s8(int* c, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0,
                                        uint32_t b1) {
     asm volatile(
@@ -297,11 +308,13 @@ k_mla_decode(const int8_t* __restrict__ qi, const float* __restrict__ qsc, const
         __syncthreads();
         issue(t0 + 2 * KT, st);  // this stage's raw data is consumed (scores + V tile)
 
-        // ---- O^T = alpha * O^T + V^T P^T on f16 tensor cores
+        // ---- O^T = alpha * O^T + V^T P^T on f16 tensor cores. Default: the tile's product (32 keys) accumulates in
+        // f16 (full-rate mma on GeForce) and is added to the f32 running output; ATTN_PV_F32ACC=1: f32 accumulate.
         {
             float al[4][2];
 #pragma unroll
             for (int n = 0; n < 4; n++) { al[n][0] = S.alpha[n * 8 + 2 * t4]; al[n][1] = S.alpha[n * 8 + 2 * t4 + 1]; }
+#if ATTN_PV_F32ACC
 #pragma unroll
             for (int a = 0; a < 4; a++)
 #pragma unroll
@@ -309,8 +322,15 @@ k_mla_decode(const int8_t* __restrict__ qi, const float* __restrict__ qsc, const
                     acc[a][n][0] *= al[n][0]; acc[a][n][1] *= al[n][1];
                     acc[a][n][2] *= al[n][0]; acc[a][n][3] *= al[n][1];
                 }
+#else
+            uint32_t th[4][4][2];
 #pragma unroll
+            for (int a = 0; a < 4; a++)
+#pragma unroll
+                for (int n = 0; n < 4; n++) th[a][n][0] = th[a][n][1] = 0u;
+#endif
 #ifndef ATTN_SKIP_PV
+#pragma unroll
             for (int ks = 0; ks < KT / 16; ks++) {
 #else
             for (int ks = 0; ks < 0; ks++) {
@@ -326,9 +346,28 @@ k_mla_decode(const int8_t* __restrict__ qi, const float* __restrict__ qsc, const
                     uint32_t a0, a1, a2, a3;
                     ldsm_x4_t(a0, a1, a2, a3, &S.v[(ks * 16 + rr + 8 * (mi >> 1)) * VP + d0 + 8 * (mi & 1)]);
 #pragma unroll
-                    for (int n = 0; n < 4; n++) mma16816(acc[a][n], a0, a1, a2, a3, b[n][0], b[n][1]);
+                    for (int n = 0; n < 4; n++) {
+#if ATTN_PV_F32ACC
+                        mma16816(acc[a][n], a0, a1, a2, a3, b[n][0], b[n][1]);
+#else
+                        mma16816_h(th[a][n], a0, a1, a2, a3, b[n][0], b[n][1]);
+#endif
+                    }
                 }
             }
+#if !ATTN_PV_F32ACC
+#pragma unroll
+            for (int a = 0; a < 4; a++)
+#pragma unroll
+                for (int n = 0; n < 4; n++) {
+                    const float2 lo = __half22float2(*(const half2*)&th[a][n][0]);
+                    const float2 hi = __half22float2(*(const half2*)&th[a][n][1]);
+                    acc[a][n][0] = acc[a][n][0] * al[n][0] + lo.x;
+                    acc[a][n][1] = acc[a][n][1] * al[n][1] + lo.y;
+                    acc[a][n][2] = acc[a][n][2] * al[n][0] + hi.x;
+                    acc[a][n][3] = acc[a][n][3] * al[n][1] + hi.y;
+                }
+#endif
         }
         // the next iteration's first __syncthreads protects S.v / S.p before they are rewritten
     }

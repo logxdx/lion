@@ -25,7 +25,8 @@ def post(path, body):
 
 
 def reference(a, ngl=99):
-    p = subprocess.Popen([a.server, "-m", a.model, "-ngl", str(ngl), "-c", "8192", "-np", "1", "--port", str(PORT),
+    kv = ["-ctk", a.ref_kv, "-ctv", a.ref_kv] if a.ref_kv else []
+    p = subprocess.Popen([a.server, "-m", a.model, "-ngl", str(ngl)] + kv + [ "-c", "65536", "-np", "1", "--port", str(PORT),
                           "--no-warmup"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         for _ in range(300):
@@ -51,7 +52,7 @@ def reference(a, ngl=99):
 
 def run_raon(a, ids):
     r = subprocess.run([a.raon, "-m", a.model, "--tokens", ",".join(map(str, ids)), "-n", str(a.n), "--top",
-                        str(a.top), "--ctx", "8192"], capture_output=True, text=True)
+                        str(a.top), "--ctx", "65536"], capture_output=True, text=True)
     if r.returncode != 0:
         sys.exit("raon failed:\n" + r.stderr[-3000:])
     timing = [l for l in r.stderr.splitlines() if l.startswith("prefill")]
@@ -63,8 +64,13 @@ def main():
     ap.add_argument("--server", required=True); ap.add_argument("--model", required=True)
     ap.add_argument("--raon", required=True); ap.add_argument("-n", type=int, default=24)
     ap.add_argument("--top", type=int, default=5); ap.add_argument("--ref")
+    ap.add_argument("--ref-kv", help="KV cache type for the llama.cpp reference (e.g. q8_0)")
+    ap.add_argument("--long", help="text file: one extra prompt = this document + a question (long-context check)")
     ap.add_argument("--vs-cpu", help="instead of raon, compare against llama.cpp on CPU (-ngl 0), cached at this path")
     a = ap.parse_args()
+    if a.long:
+        doc = open(a.long, encoding="utf-8", errors="replace").read()
+        PROMPTS.append([{"role": "user", "content": doc + "\n\nSummarize the document above in three sentences."}])
     if a.ref and os.path.exists(a.ref):
         ref = json.load(open(a.ref))
     else:
