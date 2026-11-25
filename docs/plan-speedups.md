@@ -190,7 +190,7 @@ The original plan follows.
 
 **Effort:** large; do it incrementally, fusing one boundary at a time with an A/B each.
 
-### 7. Sampler first pass: radix select instead of full bitonic sort: DONE (`HEAD`)
+### 7. Sampler first pass: radix select instead of full bitonic sort: DONE (`7cc5066`)
 
 **Measured:**
 
