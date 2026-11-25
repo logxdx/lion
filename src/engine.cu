@@ -40,6 +40,8 @@ struct Engine::Ws {
     int lmax = 0;
     // prefill attention (expanded form)
     half *qf = nullptr, *cf = nullptr, *E = nullptr, *vf = nullptr;
+    uint8_t* v8 = nullptr;   // e4m3 V^T [H][128][FA_KB] for FP8 P.V
+    float* v8s = nullptr;    // its scales [FA_KB / 128][H][128]
     int8_t *q8 = nullptr, *k8 = nullptr, *hq = nullptr;
     float* hs = nullptr;
     float *qs8 = nullptr, *ks8 = nullptr;
@@ -114,7 +116,13 @@ Engine::Engine(const std::string& gguf, int n_slots, int max_ctx, bool verbose, 
         CK(cudaMalloc(&w.E, (size_t)FA_KB * fa::EW * 2));
     } else {
         if (!KV_ROWSCALE) throw std::runtime_error("int8 expansion needs KV_ROWSCALE=1 (set RAON_EXPAND16 otherwise)");
-        CK(cudaMalloc(&w.vf, (size_t)FA_KB * H * c.v_mla * 2));
+        if (getenv("RAON_PV16")) {   // f16 P.V (A/B)
+            CK(cudaMalloc(&w.vf, (size_t)FA_KB * H * c.v_mla * 2));
+        } else {
+            CK(cudaMalloc(&w.v8, (size_t)FA_KB * H * c.v_mla));
+            CK(cudaMemset(w.v8, 0, (size_t)FA_KB * H * c.v_mla));   // finite everywhere (e4m3 0x7f is NaN)
+            w.v8s = falloc((size_t)(FA_KB / 128) * H * c.v_mla);
+        }
     }
     CK(cudaMalloc(&w.k8, (size_t)FA_KB * H * c.k_mla));
     w.ks8 = falloc((size_t)FA_KB * H * 2);
@@ -177,7 +185,8 @@ Engine::Engine(const std::string& gguf, int n_slots, int max_ctx, bool verbose, 
     w.mlfa = falloc((size_t)H * R * 2);
     CK(cudaMalloc(&w.qf, (size_t)R * H * c.k_mla * 2));
     CK(cudaFuncSetAttribute(k_fa, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sizeof(fa::Smem)));
-    CK(cudaFuncSetAttribute(k_fa8, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sizeof(fa8::Smem)));
+    CK(cudaFuncSetAttribute(k_fa8<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sizeof(fa8::Smem)));
+    CK(cudaFuncSetAttribute(k_fa8<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sizeof(fa8::Smem8)));
     CK(cudaMalloc(&w.q8, (size_t)R * H * c.k_mla));
     CK(cudaMalloc(&w.hq, (size_t)R * E));
     w.hs = falloc((size_t)R * E / 32);
@@ -441,15 +450,19 @@ void Engine::launch_chunk(int R, int nseg, int nout, int nsplit, int pf_slot, in
                         if (!fa16) k_fa_kquant<<<cdiv(nk * H * 32, 256), 256>>>(w.E, w.cf, nk, w.k8, w.ks8);
                     } else {
                         k_expand8<<<dim3(cdiv(nk, ex8::BM), 2 * H), ex8::THREADS>>>(kq, ks, slot_row0 + kb0, nk, Ly.wexp8,
-                                                                                   Ly.wexp8s, w.k8, w.ks8, w.vf);
+                                                                                   Ly.wexp8s, w.k8, w.ks8, w.vf, w.v8,
+                                                                                   w.v8s, FA_KB);
                     }
                     PROF("pf_expand");
                     if (fa16)
                         k_fa<<<dim3(cdiv(R, fa::BQ), H), fa::THREADS, sizeof(fa::Smem)>>>(w.qf, R, pf_pos0, w.E, w.cf, nk,
                                                                                            kb0, w.ofa, w.mlfa);
+                    else if (w.v8 && !ex16)
+                        k_fa8<true><<<dim3(cdiv(R, fa::BQ), H), fa::THREADS, sizeof(fa8::Smem8)>>>(
+                            w.q8, w.qs8, R, pf_pos0, w.k8, w.ks8, nullptr, w.v8, w.v8s, FA_KB, nk, kb0, w.ofa, w.mlfa);
                     else
-                        k_fa8<<<dim3(cdiv(R, fa::BQ), H), fa::THREADS, sizeof(fa8::Smem)>>>(
-                            w.q8, w.qs8, R, pf_pos0, w.k8, w.ks8, ex16 ? w.E + H * fa::NOPE : w.vf,
+                        k_fa8<false><<<dim3(cdiv(R, fa::BQ), H), fa::THREADS, sizeof(fa8::Smem)>>>(
+                            w.q8, w.qs8, R, pf_pos0, w.k8, w.ks8, ex16 ? w.E + H * fa::NOPE : w.vf, nullptr, nullptr,
                             ex16 ? fa::EW : H * fa::DV, nk, kb0, w.ofa, w.mlfa);
                     PROF("pf_flashattn");
                 }

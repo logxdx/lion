@@ -6,7 +6,10 @@
 //   flash attention per (128 queries, head): K = [K_nope_h | pe] (192), V = V_h (128), causal, scale folded into Q
 // Results of key blocks are merged into global (O, m, l); k_fa_final normalises.
 #pragma once
+#include <cuda_fp8.h>
+
 #include <cstdint>
+#include <type_traits>
 
 #include "util.cuh"
 
@@ -328,6 +331,23 @@ struct Smem {
     float ks[2][2][fa::BKEY];      // [nope | pe] scale per key
     half v[2][fa::BKEY * fa::VP];
 };
+// FP8 P.V: V^T tiles in e4m3 [128 dims][64 key positions] and the per-dim scales of the tile
+constexpr int VP8 = fa::BKEY + 16;   // 80-byte rows: ldmatrix conflict-free
+constexpr float kP8 = 448.f;         // P' = 448 P (e4m3 max), P in [0, 1]
+constexpr float kV8 = 2.f;           // V' = V * 2 / max|V| per (128-key tile, dim): |P' V'| <= 896, a 64-key tile sum
+                                     // stays < 65504 in the f16 accumulator
+struct Smem8 {
+    int8_t k[2][fa::BKEY * KP];
+    float ks[2][2][fa::BKEY];
+    uint8_t v[2][fa::DV * VP8];
+    float vs[2][fa::DV];
+};
+// Key order inside each 16-key group of the e4m3 V^T rows: position p = 4t + i holds key i < 2 ? 2t + i : 8 + 2t + i - 2,
+// which is how the thread (t = lane % 4) holds P after QK^T (n8 tiles: keys 2t, 2t+1, 8+2t, 9+2t), so P needs no
+// shuffles to become the A operand of m16n8k32.
+__host__ __device__ constexpr int pos8(int k) {
+    return (k & ~15) + ((k & 15) < 8 ? 4 * ((k & 15) >> 1) + (k & 1) : 4 * (((k & 15) - 8) >> 1) + 2 + (k & 1));
+}
 }  // namespace fa8
 
 #ifndef FA_PV_F32ACC
@@ -338,6 +358,19 @@ __device__ __forceinline__ void fa_mma_h(uint32_t* c, const uint32_t* a, uint32_
         "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
         : "+r"(c[0]), "+r"(c[1])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ void fa_mma_e4m3(uint32_t* c, const uint32_t* a, uint32_t b0, uint32_t b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.f16.e4m3.e4m3.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
+        : "+r"(c[0]), "+r"(c[1])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ uint32_t e4m3x2(float lo, float hi) {   // lo in the low byte
+    return (uint32_t)__nv_cvt_float2_to_fp8x2(make_float2(lo, hi), __NV_SATFINITE, __NV_E4M3);
+}
+__device__ __forceinline__ float2 e4m3x2_f(uint32_t x) {
+    const __half2_raw r = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)x, __NV_E4M3);
+    return __half22float2(*(const half2*)&r);
 }
 __device__ __forceinline__ void fa_mma_s8(int* c, const uint32_t* a, uint32_t b0, uint32_t b1) {
     asm volatile(
@@ -387,7 +420,8 @@ constexpr int BM = 128, BN = 128, BK = 64, P = BK + 16, THREADS = 256, KD = 512;
 }
 __global__ void __launch_bounds__(ex8::THREADS, 2)
 k_expand8(const int8_t* __restrict__ cq, const half* __restrict__ cs, size_t row0, int nk, const int8_t* __restrict__ w8,
-          const float* __restrict__ wsc, int8_t* __restrict__ K8, float* __restrict__ ks8, half* __restrict__ V) {
+          const float* __restrict__ wsc, int8_t* __restrict__ K8, float* __restrict__ ks8, half* __restrict__ V,
+          uint8_t* __restrict__ V8, float* __restrict__ vsc, int v8stride) {
     using namespace ex8;
     __shared__ __align__(16) int8_t sa[2][BM * P], sb[2][BN * P];
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t4 = lane & 3;
@@ -483,6 +517,54 @@ k_expand8(const int8_t* __restrict__ cq, const half* __restrict__ cs, size_t row
                 if (part == 0) ks8[((size_t)key * fa::H + h) * 2 + 1] = __half2float(cs[(row0 + key) * attn::KVS + 1]);
             }
         }
+    } else if (V8) {  // V of head ct - 32 for FP8 P.V: e4m3 V^T [h][d][key position], scale per (128-key tile, dim)
+        const int h = ct - fa::H;
+        float cm[BN / 8][2];
+#pragma unroll
+        for (int j = 0; j < BN / 8; j++) {
+            cm[j][0] = fmaxf(fabsf(v[j][0]), fabsf(v[j][2]));
+            cm[j][1] = fmaxf(fabsf(v[j][1]), fabsf(v[j][3]));
+#pragma unroll
+            for (int o = 4; o < 32; o <<= 1) {
+                cm[j][0] = fmaxf(cm[j][0], __shfl_xor_sync(0xffffffffu, cm[j][0], o));
+                cm[j][1] = fmaxf(cm[j][1], __shfl_xor_sync(0xffffffffu, cm[j][1], o));
+            }
+        }
+        float* red = reinterpret_cast<float*>(&sb[0][0]);   // [8 warps][128 dims], then the column max [128]
+        float* cmax = red + 8 * BN;
+        if (g == 0)
+#pragma unroll
+            for (int j = 0; j < BN / 8; j++) {
+                red[warp * BN + j * 8 + 2 * t4] = cm[j][0];
+                red[warp * BN + j * 8 + 2 * t4 + 1] = cm[j][1];
+            }
+        __syncthreads();
+        if (tid < BN) {
+            float m = 0.f;
+#pragma unroll
+            for (int w = 0; w < 8; w++) m = fmaxf(m, red[w * BN + tid]);
+            cmax[tid] = m;
+            vsc[((size_t)blockIdx.x * fa::H + h) * fa::DV + tid] = m / (fa8::kV8 * fa8::kP8);
+        }
+        __syncthreads();
+        constexpr int TP = BM + 16;
+        uint8_t* T = reinterpret_cast<uint8_t*>(&sa[0][0]);  // [128 dims][128 key positions]
+        const int p0 = fa8::pos8(warp * 16 + g), p1 = fa8::pos8(warp * 16 + g + 8);
+#pragma unroll
+        for (int j = 0; j < BN / 8; j++) {
+            const int d = j * 8 + 2 * t4;
+            const float i0 = cmax[d] > 0.f ? fa8::kV8 / cmax[d] : 0.f, i1 = cmax[d + 1] > 0.f ? fa8::kV8 / cmax[d + 1] : 0.f;
+            T[d * TP + p0] = __nv_cvt_float_to_fp8(v[j][0] * i0, __NV_SATFINITE, __NV_E4M3);
+            T[(d + 1) * TP + p0] = __nv_cvt_float_to_fp8(v[j][1] * i1, __NV_SATFINITE, __NV_E4M3);
+            T[d * TP + p1] = __nv_cvt_float_to_fp8(v[j][2] * i0, __NV_SATFINITE, __NV_E4M3);
+            T[(d + 1) * TP + p1] = __nv_cvt_float_to_fp8(v[j][3] * i1, __NV_SATFINITE, __NV_E4M3);
+        }
+        __syncthreads();
+        // rows past nk hold zeros (their latent scale is 0): the buffer stays finite everywhere
+        for (int c = tid; c < BN * (BM / 16); c += THREADS) {
+            const int d = c / (BM / 16), q = c % (BM / 16);
+            *(uint4*)&V8[((size_t)h * fa::DV + d) * v8stride + m0 + q * 16] = *(const uint4*)&T[d * TP + q * 16];
+        }
     } else {  // V of head ct - 32: f16
         const int h = ct - fa::H;
 #pragma unroll
@@ -518,14 +600,18 @@ __global__ void k_fa_qprep8(const float* __restrict__ q, int n, float scale, int
     if (lane == 0) { qs[((size_t)h * n + r) * 2] = d * scale; qs[((size_t)h * n + r) * 2 + 1] = dp * scale; }
 }
 
+// PV8: P.V on FP8 tensor cores (e4m3 P' and V^T from k_expand8, f16 accumulate per tile, 2x the f16 rate); V8 rows
+// have stride vstride. Otherwise f16 V from Vb with row stride vstride.
+template <bool PV8>
 __global__ void __launch_bounds__(fa::THREADS, 1)
 k_fa8(const int8_t* __restrict__ Q8, const float* __restrict__ qs, int n, int qpos0, const int8_t* __restrict__ K8,
-      const float* __restrict__ ks, const half* __restrict__ Vb, int vstride, int nk, int kpos0, float* __restrict__ O,
-      float* __restrict__ ml) {
+      const float* __restrict__ ks, const half* __restrict__ Vb, const uint8_t* __restrict__ V8,
+      const float* __restrict__ vsc, int vstride, int nk, int kpos0, float* __restrict__ O, float* __restrict__ ml) {
     using namespace fa;
     constexpr int KP8 = fa8::KP;
+    using SM = typename std::conditional<PV8, fa8::Smem8, fa8::Smem>::type;
     extern __shared__ __align__(16) uint8_t smem_raw[];
-    fa8::Smem& S = *reinterpret_cast<fa8::Smem*>(smem_raw);
+    SM& S = *reinterpret_cast<SM*>(smem_raw);
     const int h = blockIdx.y, q0 = blockIdx.x * BQ, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int g = lane >> 2, t4 = lane & 3;
     const int qlast = min(n - 1, q0 + BQ - 1);
@@ -557,14 +643,31 @@ k_fa8(const int8_t* __restrict__ Q8, const float* __restrict__ qs, int n, int qp
     auto issue = [&](int t0, int st) {
         if (t0 < kend) {
             // K: 64 keys x 12 chunks (192 B), V: 64 x 16 chunks, scales: 64 keys x 2 floats (8 B -> one 16 B chunk per 2 keys)
-            for (int c = tid; c < BKEY * 28; c += THREADS) {
-                const int key = c / 28, part = c % 28, j = t0 + key;
-                const bool ok = j < kend;
-                const int jj = ok ? j : 0;
-                if (part < 12) {
-                    fa_cp16(&S.k[st][key * KP8 + part * 16], K8 + ((size_t)jj * H + h) * DK + part * 16, ok);
-                } else {
-                    fa_cp16(&S.v[st][key * VP + (part - 12) * 8], Vb + (size_t)jj * vstride + h * DV + (part - 12) * 8, ok);
+            if constexpr (PV8) {
+                // K: 64 keys x 12 chunks; V^T: 128 dims x 4 chunks (64 key positions); scales: 128 floats = 32 chunks
+                for (int c = tid; c < BKEY * 12 + DV * 4 + DV / 4; c += THREADS) {
+                    if (c < BKEY * 12) {
+                        const int key = c / 12, part = c % 12, j = t0 + key;
+                        const bool ok = j < kend;
+                        fa_cp16(&S.k[st][key * KP8 + part * 16], K8 + ((size_t)(ok ? j : 0) * H + h) * DK + part * 16, ok);
+                    } else if (c < BKEY * 12 + DV * 4) {
+                        const int x = c - BKEY * 12, d = x >> 2, q = x & 3;
+                        fa_cp16(&S.v[st][d * fa8::VP8 + q * 16], V8 + ((size_t)h * DV + d) * vstride + t0 + q * 16, true);
+                    } else {
+                        const int x = c - BKEY * 12 - DV * 4;
+                        fa_cp16(&S.vs[st][x * 4], vsc + ((size_t)(t0 / 128) * H + h) * DV + x * 4, true);
+                    }
+                }
+            } else {
+                for (int c = tid; c < BKEY * 28; c += THREADS) {
+                    const int key = c / 28, part = c % 28, j = t0 + key;
+                    const bool ok = j < kend;
+                    const int jj = ok ? j : 0;
+                    if (part < 12) {
+                        fa_cp16(&S.k[st][key * KP8 + part * 16], K8 + ((size_t)jj * H + h) * DK + part * 16, ok);
+                    } else {
+                        fa_cp16(&S.v[st][key * VP + (part - 12) * 8], Vb + (size_t)jj * vstride + h * DV + (part - 12) * 8, ok);
+                    }
                 }
             }
             if (tid < BKEY) {
@@ -636,16 +739,28 @@ k_fa8(const int8_t* __restrict__ Q8, const float* __restrict__ qs, int n, int qp
             const float a1 = mn1 == -INFINITY ? 1.f : __expf(m1 - mn1);
             float ps0 = 0.f, ps1 = 0.f;
             uint32_t pa[BKEY / 16][4];
+            uint32_t pa8[BKEY / 32][4] = {};
 #pragma unroll
             for (int j = 0; j < BKEY / 8; j++) {
                 const float p0 = s[j][0] == -INFINITY ? 0.f : __expf(s[j][0] - mn0);
                 const float p1 = s[j][1] == -INFINITY ? 0.f : __expf(s[j][1] - mn0);
                 const float p2 = s[j][2] == -INFINITY ? 0.f : __expf(s[j][2] - mn1);
                 const float p3 = s[j][3] == -INFINITY ? 0.f : __expf(s[j][3] - mn1);
-                ps0 += p0 + p1;
-                ps1 += p2 + p3;
-                pa[j >> 1][(j & 1) * 2 + 0] = pack_h2(p0, p1);
-                pa[j >> 1][(j & 1) * 2 + 1] = pack_h2(p2, p3);
+                if constexpr (PV8) {
+                    // P' = 448 P in e4m3; l sums the quantized values, so numerator and denominator see the same P
+                    const uint32_t x01 = e4m3x2(p0 * fa8::kP8, p1 * fa8::kP8), x23 = e4m3x2(p2 * fa8::kP8, p3 * fa8::kP8);
+                    const float2 f01 = e4m3x2_f(x01), f23 = e4m3x2_f(x23);
+                    ps0 += (f01.x + f01.y) * (1.f / fa8::kP8);
+                    ps1 += (f23.x + f23.y) * (1.f / fa8::kP8);
+                    const int kk = j >> 2, reg = (j & 2), sh = (j & 1) * 16;
+                    pa8[kk][reg] |= x01 << sh;
+                    pa8[kk][reg + 1] |= x23 << sh;
+                } else {
+                    ps0 += p0 + p1;
+                    ps1 += p2 + p3;
+                    pa[j >> 1][(j & 1) * 2 + 0] = pack_h2(p0, p1);
+                    pa[j >> 1][(j & 1) * 2 + 1] = pack_h2(p2, p3);
+                }
             }
             ps0 += __shfl_xor_sync(0xffffffffu, ps0, 1);
             ps0 += __shfl_xor_sync(0xffffffffu, ps0, 2);
@@ -655,6 +770,37 @@ k_fa8(const int8_t* __restrict__ Q8, const float* __restrict__ qs, int n, int qp
             l1 = l1 * a1 + ps1;
             m0 = mn0;
             m1 = mn1;
+            if constexpr (PV8) {
+                // per 64 dims: P'(16 x 32 keys) . V'^T rows (e4m3, f16 accumulate), then scaled into the f32 output
+#pragma unroll
+                for (int hd = 0; hd < 2; hd++) {
+                    uint32_t th[DV / 16][2];
+#pragma unroll
+                    for (int i = 0; i < DV / 16; i++) th[i][0] = th[i][1] = 0u;
+#pragma unroll
+                    for (int kk = 0; kk < BKEY / 32; kk++) {
+#pragma unroll
+                        for (int i = 0; i < DV / 16; i += 2) {
+                            uint32_t b0, b1, b2, b3;
+                            fa_ldsm_x4(b0, b1, b2, b3,
+                                       &S.v[st][(hd * 64 + i * 8 + (lane & 7) + ((lane >> 4) & 1) * 8) * fa8::VP8 + kk * 32 +
+                                                ((lane >> 3) & 1) * 16]);
+                            fa_mma_e4m3(th[i], pa8[kk], b0, b1);
+                            fa_mma_e4m3(th[i + 1], pa8[kk], b2, b3);
+                        }
+                    }
+#pragma unroll
+                    for (int i = 0; i < DV / 16; i++) {
+                        const int d = hd * 64 + i * 8 + 2 * t4;
+                        const float sc0 = S.vs[st][d], sc1 = S.vs[st][d + 1];
+                        float* oo = o[hd * 8 + i];
+                        const float2 lo = __half22float2(*(const half2*)&th[i][0]);
+                        const float2 hi = __half22float2(*(const half2*)&th[i][1]);
+                        oo[0] = oo[0] * a0 + lo.x * sc0; oo[1] = oo[1] * a0 + lo.y * sc1;
+                        oo[2] = oo[2] * a1 + hi.x * sc0; oo[3] = oo[3] * a1 + hi.y * sc1;
+                    }
+                }
+            } else {
 #if FA_PV_F32ACC
 #pragma unroll
             for (int i = 0; i < DV / 8; i++) { o[i][0] *= a0; o[i][1] *= a0; o[i][2] *= a1; o[i][3] *= a1; }
@@ -699,6 +845,7 @@ k_fa8(const int8_t* __restrict__ Q8, const float* __restrict__ qs, int n, int qp
                 }
             }
 #endif
+            }
         }
         __syncthreads();
     }
