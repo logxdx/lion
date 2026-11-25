@@ -94,6 +94,7 @@ public:
 
 private:
     void run_chunk(const Row* rows, int n);
+    void launch_chunk(int R, int nseg, int nout, int nsplit);
     Model m_;
     int n_slots_, max_ctx_, rmax_;
     // per-slot state

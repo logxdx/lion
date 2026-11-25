@@ -31,6 +31,7 @@ struct Engine::Ws {
     int8_t* xq = nullptr;
     float* xs = nullptr;
     float *hn, *hsel, *logits;
+    std::map<int, cudaGraphExec_t> graphs;  // decode step graphs by batch size
 };
 
 static float* falloc(size_t n) {
@@ -165,11 +166,7 @@ static inline int cdiv(int a, int b) { return (a + b - 1) / b; }
 
 // ---------------------------------------------------------------- forward over one chunk of rows
 void Engine::run_chunk(const Row* rows, int R) {
-    const Config& c = m_.cfg;
     Ws& w = *ws_;
-    const int E = c.n_embd, HC = c.hc, H = c.mla_heads, RH = c.rda_heads, D = c.rda_dim, C = RH * D;
-    const int NL = c.n_layer, G = c.n_ple, L = c.latent();
-
     std::vector<RowMeta> meta(R);
     std::vector<Seg> segs;
     std::vector<int> toks(R), sel;
@@ -186,6 +183,37 @@ void Engine::run_chunk(const Row* rows, int R) {
     CK(cudaMemcpy(w.rows, meta.data(), R * sizeof(RowMeta), cudaMemcpyHostToDevice));
     CK(cudaMemcpy(w.segs, segs.data(), nseg * sizeof(Seg), cudaMemcpyHostToDevice));
     CK(cudaMemcpy(w.toks, toks.data(), R * 4, cudaMemcpyHostToDevice));
+    const int nout = (int)sel.size();
+    if (nout) CK(cudaMemcpy(w.sel, sel.data(), nout * 4, cudaMemcpyHostToDevice));
+    // attention splits per row: ~60 blocks in total (3 waves at 1 block/SM), within the partials buffer
+    const int nsplit = std::max(1, std::min(60 / R, (int)w.opart_n / R));
+
+    // decode batches (one row per slot, all with logits) replay a CUDA graph captured once per batch size; the
+    // kernels read positions/tokens from device memory, so the graph is valid for every step and context length
+    const bool graph = nseg == R && nout == R && !g_prof.on && !getenv("RAON_NOGRAPH");
+    if (!graph) {
+        launch_chunk(R, nseg, nout, nsplit);
+        return;
+    }
+    auto it = w.graphs.find(R);
+    if (it == w.graphs.end()) {
+        cudaGraph_t gr;
+        CK(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+        launch_chunk(R, nseg, nout, nsplit);
+        CK(cudaStreamEndCapture(cudaStreamPerThread, &gr));
+        cudaGraphExec_t ex;
+        CK(cudaGraphInstantiate(&ex, gr, 0));
+        CK(cudaGraphDestroy(gr));
+        it = w.graphs.emplace(R, ex).first;
+    }
+    CK(cudaGraphLaunch(it->second, cudaStreamPerThread));
+}
+
+void Engine::launch_chunk(int R, int nseg, int nout, int nsplit) {
+    const Config& c = m_.cfg;
+    Ws& w = *ws_;
+    const int E = c.n_embd, HC = c.hc, H = c.mla_heads, RH = c.rda_heads, D = c.rda_dim, C = RH * D;
+    const int NL = c.n_layer, G = c.n_ple, L = c.latent();
 
     // embeddings
     g_prof.start();
@@ -198,12 +226,6 @@ void Engine::run_chunk(const Row* rows, int R) {
 
     const size_t conv_slot = (size_t)m_.n_rda * 3 * 3 * C, rda_slot = (size_t)m_.n_rda * RH * D * D;
     const size_t kv_slot_rows = (size_t)m_.n_mla * max_ctx_;
-    int maxkeys = 0;
-    for (int i = 0; i < R; i++) maxkeys = std::max(maxkeys, rows[i].pos + 1);
-    // split keys so that R * nsplit <= opart capacity, at least 2048 keys per split
-    int split = std::max(2048, cdiv(maxkeys, std::max(1, (int)w.opart_n / R)));
-    split = cdiv(split, attn::KT) * attn::KT;
-    const int nsplit = cdiv(maxkeys, split);
 
     auto hc_pre = [&](const Mat& fn, const float* base, const float* chart, const float* norm_w) {
         k_rmsnorm<<<dim3(R, 1), 256>>>(w.X, HC * E, w.flat, HC * E, nullptr, HC * E, c.hc_eps);
@@ -251,7 +273,7 @@ void Engine::run_chunk(const Row* rows, int R) {
                                                         w.qsc);
             PROF("mla_kb+qprep");
             k_mla_decode<RowMeta><<<dim3(R, nsplit), attn::THREADS, sizeof(attn::Smem)>>>(
-                w.qi, w.qsc, kq, ks, kv_slot_rows, w.rows, split, nsplit, w.opart, w.ml);
+                w.qi, w.qsc, kq, ks, kv_slot_rows, w.rows, nsplit, w.opart, w.ml);
             PROF("mla_attn");
             k_mla_combine<<<dim3(R, H), 128>>>(w.opart, w.ml, nsplit, w.olat);
             PROF("mla_combine");
@@ -279,11 +301,9 @@ void Engine::run_chunk(const Row* rows, int R) {
         k_add_streams<<<cdiv(R * E, 256), 256>>>(w.X, w.y2, E, R);
         PROF("ple_layer");
     }
-    if (sel.empty()) return;
-    const int nout = (int)sel.size();
+    if (nout == 0) return;
     k_stream_sum<<<cdiv(R * E, 256), 256>>>(w.X, w.s, E, R, 1.f / HC);
     k_rmsnorm<<<dim3(R, 1), 256>>>(w.s, E, w.hn, E, m_.output_norm, E, c.eps);
-    CK(cudaMemcpy(w.sel, sel.data(), nout * 4, cudaMemcpyHostToDevice));
     k_gather<<<nout, 256>>>(w.hn, w.sel, nout, E, w.hsel);
     mm(m_.tok_embd, w.hsel, E, nout, w.logits, c.n_vocab, w.xq, w.xs);
     PROF("lm_head");

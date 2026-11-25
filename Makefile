@@ -1,6 +1,6 @@
 NVCC  ?= /opt/cuda/bin/nvcc
 ARCH  ?= sm_89
-FLAGS ?= -O3 -std=c++17 -arch=$(ARCH) -lineinfo -Xcompiler -Wall,-Wno-unused-function
+FLAGS ?= -O3 -std=c++17 -arch=$(ARCH) -lineinfo --default-stream per-thread -Xcompiler -Wall,-Wno-unused-function
 BUILD := build
 
 SRC  := src/model.cu src/engine.cu

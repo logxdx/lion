@@ -122,13 +122,16 @@ __global__ void k_mla_qprep(const float* __restrict__ qlat, const float* __restr
 template <class RowT>
 __global__ void __launch_bounds__(attn::THREADS, 1)
 k_mla_decode(const int8_t* __restrict__ qi, const float* __restrict__ qsc, const int8_t* __restrict__ cq,
-             const half* __restrict__ cs, size_t slot_rows, const RowT* __restrict__ rows, int split, int nsplit,
+             const half* __restrict__ cs, size_t slot_rows, const RowT* __restrict__ rows, int nsplit,
              float* __restrict__ opart, float* __restrict__ ml) {
     using namespace attn;
     extern __shared__ __align__(16) uint8_t smem_raw[];
     Smem& S = *reinterpret_cast<Smem*>(smem_raw);
     const int r = blockIdx.x, sp = blockIdx.y, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int nkeys = rows[r].pos + 1;
+    // keys of this row divided evenly over the nsplit blocks (in whole tiles): independent of the context length on the
+    // host side, so a captured graph stays valid as contexts grow
+    const int split = ((nkeys + nsplit - 1) / nsplit + KT - 1) / KT * KT;
     const int k0 = sp * split, k1 = min(nkeys, k0 + split);
     float* op = opart + (((size_t)r * nsplit + sp) * H) * RK;
     float* mlp = ml + (((size_t)r * nsplit + sp) * H) * 2;
