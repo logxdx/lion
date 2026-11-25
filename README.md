@@ -47,15 +47,15 @@ Synthetic caches (`--bench --slots N --depth D`):
 ### Prefill, one stream
 
 `build/raon -m M --bench --prefill N`, 1 slot. The chunk size is chosen automatically from free VRAM: 4,096 rows here,
-1,366 MiB of workspace. Device memory used is 3,758 MiB (Q8_0) / 3,538 MiB (Q6_K) at 150k.
+1,312 MiB of workspace. Device memory used is 3,680 MiB (Q8_0) / 3,460 MiB (Q6_K) at 150k.
 
 | | 2048 tokens | 8192 tokens | 150k prompt |
 |---|---|---|---|
-| Q8_0 | **8,352 tok/s** (llama.cpp 6,970) | **7,515** (5,830) | **67.8 s, 2,265 tok/s** (llama.cpp ~235 s, ~640) |
-| Q6_K | 6,420 (llama.cpp 6,670) | **5,826** (5,620) | **73.9 s, 2,079 tok/s** |
+| Q8_0 | **8,501 tok/s** (llama.cpp 6,970) | **7,769** (5,830) | **56.9 s, 2,697 tok/s** (llama.cpp ~235 s, ~640) |
+| Q6_K | 6,471 (llama.cpp 6,670) | **5,975** (5,620) | **63.2 s, 2,432 tok/s** |
 
 With 4 × 128k slots resident (`raon-server --slots 4 --ctx 131072`, 4 checkpoints per slot), Q6_K still gets
-4,096-row chunks: 5,134 of 5,822 MiB used.
+4,096-row chunks: 5,056 of 5,822 MiB used.
 
 ### Correctness
 
@@ -129,9 +129,22 @@ prefill 8% faster.
 
 **MLA in expanded form**, per 4096-key block:
 
-1. `k_b`/`v_b` expansion GEMM;
-2. int8 K and Q with nope/pe scales;
-3. flash attention with int8 QKᵀ and f16 PV, causal, merged across key blocks.
+1. **Expansion** (`k_expand8`), on int8 tensor cores:
+   - reads the int8 latent cache directly;
+   - `k_b`/`v_b` are quantized to int8 at load, one scale per output channel;
+   - int32 accumulation over the 512 latent values.
+
+   Its epilogue writes:
+   - int8 K, one scale per key and head, with the pe part copied from the cache;
+   - V transposed in e4m3, one scale per 128-key tile and dim.
+2. **Q** in int8, with nope/pe scales.
+3. **Flash attention**, causal, merged across key blocks:
+   - QKᵀ on int8 `m16n8k32`;
+   - P·V on FP8 `m16n8k32` with f16 accumulation per 64-key tile (2 × the f16 rate on this GPU), with P' = 448 P in
+     e4m3;
+   - V's keys are permuted within 16-key groups so that P needs no shuffles.
+
+`RAON_PV16` switches P·V back to f16; `RAON_EXPAND16` switches the expansion to the earlier dequantize + f16 GEMM.
 
 ### Fusion
 
@@ -216,7 +229,7 @@ Environment knobs:
 
 - `RAON_PROFILE=1`: per-kernel-group timing; it also names the group in which a CUDA error surfaces.
 - `RAON_CHUNK`: overrides the prefill chunk size.
-- A/B switches: `RAON_NOGRAPH`, `RAON_NOGEMM`, `RAON_NOFA`, `RAON_FA16`, `RAON_NSPLIT`.
+- A/B switches: `RAON_NOGRAPH`, `RAON_NOGEMM`, `RAON_NOFA`, `RAON_FA16`, `RAON_EXPAND16`, `RAON_PV16`, `RAON_NSPLIT`.
 - Debugging: `RAON_DUMP`, `RAON_PERTURB`.
 
 Compile switches: `ATTN_PV_F32ACC`, `FA_PV_F32ACC`, `KV_ROWSCALE`.

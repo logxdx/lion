@@ -1,11 +1,13 @@
 # raon-engine: plan for further speed-ups
 
-Status: 2026-11-25, after `e4916fa`.
+Status: 2026-11-25, after `0d8b5f6`.
 
-Done in this round:
+Done:
 
 - prefill chunks up to 4,096 rows;
-- the Q6_K GEMM prefetch and mma-magic conversion.
+- the Q6_K GEMM prefetch and mma-magic conversion;
+- items 3 and 4 below. Together they make a 128k Q6_K prefill 56.5 → 48.85 s, and a 150k prefill 73.9 → 63.2 s (Q6_K)
+  and 67.8 → 56.9 s (Q8_0).
 
 Every item below says:
 
@@ -33,11 +35,22 @@ These apply to every item:
 |---|---|---|
 | decode, 4 × 128k | 16.8 ms/step (59.4 tok/s/stream) | MLA attention 9.0 ms at ~88 % of DRAM bandwidth; weight GEMVs at 95-100 % of bandwidth (`tests/gemv_bench.cu`); ~1.5-2.5 ms launch/latency overhead over ~300 small kernels; sampling 0.36 ms |
 | prefill, 2,048-token chunk | ~320 ms | GEMMs ~67 %, mHC 13 %, RDA scan + conv/gates 12 % |
-| prefill, 128k prompt | 56.5 s | flash attention ~49 %, per-chunk k_b/v_b re-expansion ~15 % (after 4,096-row chunks), GEMMs ~25 % |
+| prefill, 128k prompt | 56.5 s (48.85 s after items 3 and 4) | at 56.5 s: flash attention ~53 %, per-chunk re-expansion ~10 %, GEMMs ~25 % |
 
 ## Plan, in order
 
-### 3. FP8 for P·V in prefill flash attention
+### 3. FP8 for P·V in prefill flash attention: DONE (`0d8b5f6`)
+
+**Measured result:**
+
+- e4m3 `m16n8k32` with f16 accumulation runs at 97.6 TFLOPS against 48.8 for f16 (`tests/mma_rate.cu`). With f32
+  accumulation FP8 would not be faster than f16 on this GPU.
+- Q6_K 128k prefill: 53.4 → 48.85 s (−8.5 %). Removing P·V entirely saves 22 % of FA; the extra gain over the
+  estimate comes from V moving at 1 byte per element.
+- Parity: Q6_K 181/181, worst 0.710 (f16 0.635); Q8_0 181/181, worst 0.858.
+- `RAON_PV16` keeps the f16 path.
+
+The original plan follows.
 
 **Basis:**
 - FA is ~49 % of a 128k prefill.
@@ -59,7 +72,17 @@ These apply to every item:
 
 **Effort:** medium.
 
-### 4. int8 k_b/v_b expansion fused with the K/V quantization
+### 4. int8 k_b/v_b expansion fused with the K/V quantization: DONE (`422fb1d`)
+
+**Measured result:**
+
+- The old expansion was an f16 GEMM with f32 accumulation, which runs at 1/4 of the int8 rate here.
+- `pf_expand` 159 → 72 ms per chunk.
+- Q6_K 128k prefill 56.5 → 53.4 s; −62 MiB VRAM.
+- Parity: Q6_K 181/181, worst 0.635; Q8_0 as with the f16 path.
+- `RAON_EXPAND16` keeps the f16 path.
+
+The original plan follows.
 
 **Basis:**
 - The expansion (latent → per-head K_nope / V) is re-done for every chunk over all previous keys. It is ~15 % of a
