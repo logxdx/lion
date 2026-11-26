@@ -39,8 +39,14 @@ static std::string dump(const json& j) { return j.dump(-1, ' ', false, json::err
 struct Options {
     std::string model, alias = "raon-1-nano", host = "127.0.0.1";
     int port = 8080, slots = 4, ctx = 131072, threads = 32;
-    int chunk_busy = 2048;    // prefill tokens per iteration while other requests are generating
-    float prefill_share = 0.5f;   // share of GPU time given to prefill while other requests are generating
+    int chunk_busy = 2048;    // prefill tokens per iteration while other requests are generating (mixed: the largest)
+    float prefill_share = 0.5f;   // --no-mixed: share of GPU time given to prefill while other requests are generating
+    // mixed steps: while others generate, a prompt chunk and their decode rows run as one batch (the weights are read
+    // once). The chunk is sized so that a step takes about mixed_budget x a decode step (measured), within
+    // [mixed_min, chunk_busy]. mixed = false: alternate prompt chunks and decode steps by prefill_share.
+    bool mixed = true;
+    float mixed_budget = 1.5f;
+    int mixed_min = 32;
     int chunk_idle = 4096;    // ... while none is (= the engine chunk: one progress update per chunk)
     int checkpoints = 4;      // recurrent-state checkpoints per slot (~19 MB each); 0 disables
     SamplingParams defaults;  // generation_config.json of Raon-1 nano: temperature 0.1, presence_penalty 1.5
@@ -304,65 +310,47 @@ private:
         }
     }
 
-    void iterate() {
-        for (Slot& s : slots_)
-            if (s.req && s.req->cancel) finish(s, s.req->cancel_reason);
-        admit();
-        // one prefill chunk: the oldest request still in prefill. While others are generating, prefill gets
-        // `prefill_share` of the time: after a chunk that took t, decode-only steps run for t * (1 - share) / share.
-        Slot* pf = nullptr;
-        bool decoding = false;
-        for (Slot& s : slots_) {
-            if (s.st == PREFILL && (!pf || s.seq < pf->seq)) pf = &s;
-            decoding |= s.st == DECODE;
-        }
-        if (pf && decoding && Clock::now() < next_prefill_) pf = nullptr;
-        if (pf) {
-            const auto tp0 = Clock::now();
-            Slot& s = *pf;
-            Req& r = *s.req;
-            const int n0 = (int)s.cached.size(), P = (int)r.prompt.size();
-            int end = std::min(P, n0 + (decoding ? opt_.chunk_busy : opt_.chunk_idle));
-            const bool ck = !s.ck.empty() && r.ckpt_pos > n0 && r.ckpt_pos < P;
-            if (ck && r.ckpt_pos < end) end = r.ckpt_pos;
-            std::vector<Row> rows;
-            rows.reserve(end - n0);
-            for (int i = n0; i < end; i++) rows.push_back({s.id, i, r.prompt[i], i == P - 1});
-            std::vector<SampleIn> in;
-            if (end == P) in.push_back(sample_in(s));
-            const auto out = eng_->step(rows, in);
-            s.cached.insert(s.cached.end(), r.prompt.begin() + n0, r.prompt.begin() + end);
-            r.n_done = end;
-            if (ck && end == r.ckpt_pos) {   // into a free or the least recently used checkpoint
-                int k = 0;
-                for (int j = 0; j < (int)s.ck.size(); j++) {
-                    if (!s.ck[j].valid) { k = j; break; }
-                    if (s.ck[j].used < s.ck[k].used) k = j;
-                }
-                eng_->save_state(s.id, k);
-                s.ck[k].toks.assign(r.prompt.begin(), r.prompt.begin() + end);
-                s.ck[k].valid = true;
-                s.ck[k].used = ++use_clock_;
+    // after prompt rows [n0, end) of s were fed: checkpoint at ckpt_pos, DECODE (first token: *first) at the end
+    void after_prefill(Slot& s, int n0, int end, bool ck, const SampleOut* first) {
+        Req& r = *s.req;
+        const int P = (int)r.prompt.size();
+        s.cached.insert(s.cached.end(), r.prompt.begin() + n0, r.prompt.begin() + end);
+        r.n_done = end;
+        if (ck && end == r.ckpt_pos) {   // into a free or the least recently used checkpoint
+            int k = 0;
+            for (int j = 0; j < (int)s.ck.size(); j++) {
+                if (!s.ck[j].valid) { k = j; break; }
+                if (s.ck[j].used < s.ck[k].used) k = j;
             }
-            if (end == P) {
-                r.prompt_ms = ms_since(s.t0);
-                if (r.max_tokens == 0) {   // prefill only (n_predict = 0): the prompt is in the state and checkpoints
-                    finish(s, "length");
-                } else {
-                    s.t1 = Clock::now();
-                    r.t_gen0 = s.t1;
-                    r.generating = true;
-                    s.st = DECODE;
-                    emit(s, out[0]);
-                }
-            }
-            const float sh = std::min(1.f, std::max(0.05f, opt_.prefill_share));
-            next_prefill_ = Clock::now() + std::chrono::duration_cast<Clock::duration>((Clock::now() - tp0) * ((1.f - sh) / sh));
+            eng_->save_state(s.id, k);
+            s.ck[k].toks.assign(r.prompt.begin(), r.prompt.begin() + end);
+            s.ck[k].valid = true;
+            s.ck[k].used = ++use_clock_;
         }
-        // one decode step over every generating request
-        std::vector<Row> rows;
-        std::vector<SampleIn> in;
-        std::vector<Slot*> who;
+        if (end == P) {
+            r.prompt_ms = ms_since(s.t0);
+            if (r.max_tokens == 0) {   // prefill only (n_predict = 0): the prompt is in the state and checkpoints
+                finish(s, "length");
+            } else {
+                s.t1 = Clock::now();
+                r.t_gen0 = s.t1;
+                r.generating = true;
+                s.st = DECODE;
+                emit(s, *first);
+            }
+        }
+    }
+    // end of the next prompt chunk of s from n0, at most `chunk` rows, cut at the checkpoint position
+    int chunk_end(const Slot& s, int n0, int chunk, bool& ck) const {
+        const Req& r = *s.req;
+        const int P = (int)r.prompt.size();
+        int end = std::min(P, n0 + chunk);
+        ck = !s.ck.empty() && r.ckpt_pos > n0 && r.ckpt_pos < P;
+        if (ck && r.ckpt_pos < end) end = r.ckpt_pos;
+        return end;
+    }
+    // decode rows of every generating request (cancelled ones are finished here)
+    void decode_rows(std::vector<Row>& rows, std::vector<SampleIn>& in, std::vector<Slot*>& who) {
         for (Slot& s : slots_) {
             if (s.st != DECODE) continue;
             if (s.req->cancel) { finish(s, s.req->cancel_reason); continue; }
@@ -370,8 +358,91 @@ private:
             in.push_back(sample_in(s));
             who.push_back(&s);
         }
+    }
+    // prompt chunk for a mixed step: the decode step's time budget left over, at the measured cost per prompt row
+    int mixed_chunk(int nd) const {
+        const double dec = dec_ms_[std::min(nd, 64)] > 0 ? dec_ms_[std::min(nd, 64)] : 20.0;
+        const double per_row = row_ms_ > 0 ? row_ms_ : 0.1;
+        int c = (int)((opt_.mixed_budget - 1.0) * dec / per_row) / 32 * 32;
+        c = std::max(opt_.mixed_min, std::min(c, opt_.chunk_busy));
+        return std::min(c, eng_->chunk_rows() - nd);
+    }
+
+    void iterate() {
+        for (Slot& s : slots_)
+            if (s.req && s.req->cancel) finish(s, s.req->cancel_reason);
+        admit();
+        Slot* pf = nullptr;
+        bool decoding = false;
+        for (Slot& s : slots_) {
+            if (s.st == PREFILL && (!pf || s.seq < pf->seq)) pf = &s;
+            decoding |= s.st == DECODE;
+        }
+        if (pf && decoding && opt_.mixed) {
+            // one mixed step: a prompt chunk of the oldest request in prefill + every generating request's next token
+            std::vector<Row> drows;
+            std::vector<SampleIn> din;
+            std::vector<Slot*> who;
+            decode_rows(drows, din, who);
+            Slot& s = *pf;
+            Req& r = *s.req;
+            const int n0 = (int)s.cached.size(), P = (int)r.prompt.size();
+            bool ck = false;
+            const int end = chunk_end(s, n0, mixed_chunk((int)drows.size()), ck);
+            std::vector<Row> rows;
+            std::vector<SampleIn> in;
+            rows.reserve(end - n0 + drows.size());
+            for (int i = n0; i < end; i++) rows.push_back({s.id, i, r.prompt[i], i == P - 1});
+            if (end == P) in.push_back(sample_in(s));
+            rows.insert(rows.end(), drows.begin(), drows.end());
+            in.insert(in.end(), din.begin(), din.end());
+            const auto t0 = Clock::now();
+            const auto out = eng_->step(rows, in);
+            const double dt = ms_since(t0);
+            const double dec = drows.empty() ? 0 : dec_ms_[std::min((int)drows.size(), 64)];
+            if (dec > 0 && end > n0) {
+                const double per_row = std::max(1e-4, (dt - dec) / (end - n0));
+                row_ms_ = row_ms_ > 0 ? 0.7 * row_ms_ + 0.3 * per_row : per_row;
+            }
+            const int k = end == P ? 1 : 0;
+            after_prefill(s, n0, end, ck, k ? &out[0] : nullptr);
+            for (size_t i = 0; i < who.size(); i++) {
+                who[i]->cached.push_back(who[i]->last);
+                emit(*who[i], out[k + i]);
+            }
+            return;
+        }
+        // one prefill chunk: the oldest request still in prefill. While others are generating (--no-mixed), prefill
+        // gets `prefill_share` of the time: after a chunk that took t, decode-only steps run for t * (1 - share) / share.
+        if (pf && decoding && Clock::now() < next_prefill_) pf = nullptr;
+        if (pf) {
+            const auto tp0 = Clock::now();
+            Slot& s = *pf;
+            Req& r = *s.req;
+            const int n0 = (int)s.cached.size(), P = (int)r.prompt.size();
+            bool ck = false;
+            const int end = chunk_end(s, n0, decoding ? opt_.chunk_busy : opt_.chunk_idle, ck);
+            std::vector<Row> rows;
+            rows.reserve(end - n0);
+            for (int i = n0; i < end; i++) rows.push_back({s.id, i, r.prompt[i], i == P - 1});
+            std::vector<SampleIn> in;
+            if (end == P) in.push_back(sample_in(s));
+            const auto out = eng_->step(rows, in);
+            after_prefill(s, n0, end, ck, end == P ? &out[0] : nullptr);
+            const float sh = std::min(1.f, std::max(0.05f, opt_.prefill_share));
+            next_prefill_ = Clock::now() + std::chrono::duration_cast<Clock::duration>((Clock::now() - tp0) * ((1.f - sh) / sh));
+        }
+        // one decode step over every generating request
+        std::vector<Row> rows;
+        std::vector<SampleIn> in;
+        std::vector<Slot*> who;
+        decode_rows(rows, in, who);
         if (rows.empty()) return;
+        const auto t0 = Clock::now();
         const auto out = eng_->step(rows, in);
+        const double dt = ms_since(t0);
+        double& e = dec_ms_[std::min((int)rows.size(), 64)];
+        e = e > 0 ? 0.8 * e + 0.2 * dt : dt;
         for (size_t i = 0; i < who.size(); i++) {
             Slot& s = *who[i];
             s.cached.push_back(s.last);
@@ -391,6 +462,8 @@ private:
     std::string load_error_;
     uint64_t seq_ = 0, use_clock_ = 0;
     Clock::time_point next_prefill_ = Clock::now();
+    double dec_ms_[65] = {};   // decode step time by batch size (EMA), for sizing mixed chunks
+    double row_ms_ = 0;        // per prompt row in a mixed step, beyond the decode rows (EMA)
     std::mutex info_mu_;
     json info_ = json::array();
     std::string vram_;
@@ -616,7 +689,12 @@ static void usage() {
             "  --host H / --port P  listen address (default 127.0.0.1:8080)\n"
             "  --alias NAME         model name reported by the API (default raon-1-nano)\n"
             "  --chunk-busy N       prefill tokens per iteration while others generate (default 2048)\n"
-            "  --prefill-share F    share of GPU time for prefill while others generate (default 0.5)\n"
+            "  --no-mixed           while others generate, alternate prompt chunks and decode steps (by --prefill-share)\n"
+            "                       instead of running the prompt chunk and the decode rows as one batch (default)\n"
+            "  --mixed-budget F     mixed step time target as a multiple of a decode step (default 1.5; lower = faster\n"
+            "                       streams while a prompt is fed, slower prompt)\n"
+            "  --mixed-min N        smallest prompt chunk of a mixed step (default 32)\n"
+            "  --prefill-share F    --no-mixed: share of GPU time for prefill while others generate (default 0.5)\n"
             "  --checkpoints N      recurrent-state checkpoints per slot for prompt reuse (default 4, ~19 MB each; 0 = off)\n"
             "  --temp T --top-p P --top-k K --min-p M --presence-penalty X --frequency-penalty X --repeat-penalty X\n"
             "                       default sampling (default: temp 0.1, presence 1.5 from generation_config.json)\n"
@@ -648,6 +726,9 @@ int main(int argc, char** argv) {
         else if (a == "--alias") opt.alias = next();
         else if (a == "--chunk-busy") opt.chunk_busy = std::stoi(next());
         else if (a == "--prefill-share") opt.prefill_share = std::stof(next());
+        else if (a == "--no-mixed") opt.mixed = false;
+        else if (a == "--mixed-budget") opt.mixed_budget = std::stof(next());
+        else if (a == "--mixed-min") opt.mixed_min = std::stoi(next());
         else if (a == "--checkpoints") opt.checkpoints = std::max(0, std::stoi(next()));
         else if (a == "--threads") opt.threads = std::stoi(next());
         else if (a == "--ui-dir") opt.ui_dir = next();

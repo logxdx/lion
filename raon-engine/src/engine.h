@@ -134,7 +134,8 @@ public:
 private:
     void run_chunk(const Row* rows, int n);
     void sample_chunk(const SampleIn* in, int nout, SampleOut* out);
-    void launch_chunk(int R, int nseg, int nout, int nsplit, int pf_slot, int pf_pos0);
+    void launch_chunk(int R, int nseg, int nout, int nsplit, int pf_slot, int pf_pos0, int pf_rows);
+    int chunk_len(const std::vector<Row>& rows, size_t b0) const;
     Model m_;
     int n_slots_, max_ctx_, rmax_, rdec_ = 64;
     // per-slot state

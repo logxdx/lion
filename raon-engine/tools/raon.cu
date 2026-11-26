@@ -52,7 +52,9 @@ static void emit(int step, const float* lg, int V, int top, int chosen) {
 int main(int argc, char** argv) {
     std::string model, toks_s;
     int n = 16, top = 5, ctx = 8192, slots = 1, depth = 0, steps = 32, prefill_n = 0;
-    bool bench = false, sample = false;
+    bool bench = false, sample = false, test_mixed = false, bench_mixed = false;
+    int mixed_chunk = 256, pf_depth = 0;
+    std::vector<int> chunks = {32, 64, 128, 256, 512, 1024, 2048};
     float b_temp = 0.8f, b_top_p = 0.95f;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -71,7 +73,150 @@ int main(int argc, char** argv) {
         else if (a == "--depth") depth = atoi(next().c_str());
         else if (a == "--steps") steps = atoi(next().c_str());
         else if (a == "--prefill") prefill_n = atoi(next().c_str());
+        // mixed steps (decode rows inside prefill chunks):
+        //   --test-mixed [--chunk C] [--prefill P] [-n G]   fed slot must match a plain prefill exactly
+        //   --bench-mixed --slots N --depth D [--pf-depth Q] [--chunks a,b,..]
+        else if (a == "--test-mixed") test_mixed = true;
+        else if (a == "--bench-mixed") bench_mixed = true;
+        else if (a == "--chunk") mixed_chunk = atoi(next().c_str());
+        else if (a == "--pf-depth") pf_depth = atoi(next().c_str());
+        else if (a == "--chunks") chunks = parse_ids(next());
         else { fprintf(stderr, "unknown argument %s\n", a.c_str()); return 1; }
+    }
+    if (test_mixed && !model.empty()) {
+        // slots 0 and 1 decode (greedy) while slot 2's prompt is fed in mixed chunks of `chunk` rows; reference: slot 2
+        // fed alone in chunks of the same size, then greedy. The fed slot runs the same kernels on the same chunk
+        // boundaries, so its logits and tokens must be IDENTICAL; the decode rows run k_mhc + the GEMMs instead of the
+        // small-batch mHC + GEMVs, so on this (numerically chaotic) model they may part ways: reported, not failed.
+        const int C = mixed_chunk, P = prefill_n > 0 ? prefill_n : 3000, G = n;
+        raon::Engine eng(model, 3, P + G + 1024);
+        const int V = eng.cfg().n_vocab;
+        auto synth = [](int n_, uint32_t seed) {
+            std::vector<int> t(n_);
+            for (auto& x : t) { seed = seed * 1664525u + 1013904223u; x = 1000 + (int)(seed % 200000u); }
+            return t;
+        };
+        const std::vector<int> pa = synth(500, 1), pb = synth(700, 2), pc = synth(P, 3);
+        auto argmax = [&](const float* lg) { int b = 0; for (int i = 1; i < V; i++) if (lg[i] > lg[b]) b = i; return b; };
+        auto feed_chunks = [&](int slot, const std::vector<int>& t) {   // chunks of C rows, logits of the last row
+            std::vector<float> lg;
+            for (int p0 = 0; p0 < (int)t.size(); p0 += C) {
+                std::vector<raon::Row> rows;
+                for (int i = p0; i < std::min((int)t.size(), p0 + C); i++) rows.push_back({slot, i, t[i], i + 1 == (int)t.size()});
+                auto o = eng.forward(rows);
+                if (!o.empty()) lg = o;
+            }
+            return lg;
+        };
+        auto greedy = [&](int slot, int pos, int tok, int count, std::vector<int>& out) {
+            for (int i = 0; i < count; i++) {
+                auto lg = eng.forward({{slot, pos++, tok, true}});
+                tok = argmax(lg.data());
+                out.push_back(tok);
+            }
+        };
+        // references, each alone in slot 0
+        std::vector<int> ref_a, ref_b, ref_c;
+        eng.reset(0); { auto lg = feed_chunks(0, pa); ref_a.push_back(argmax(lg.data())); greedy(0, 500, ref_a[0], G - 1, ref_a); }
+        eng.reset(0); { auto lg = feed_chunks(0, pb); ref_b.push_back(argmax(lg.data())); greedy(0, 700, ref_b[0], G - 1, ref_b); }
+        eng.reset(0);
+        const std::vector<float> lg_c_ref = feed_chunks(0, pc);
+        ref_c.push_back(argmax(lg_c_ref.data()));
+        greedy(0, P, ref_c[0], G - 1, ref_c);
+        // mixed
+        for (int s = 0; s < 3; s++) eng.reset(s);
+        std::vector<int> got_a, got_b, got_c;
+        { auto lg = feed_chunks(0, pa); got_a.push_back(argmax(lg.data())); }
+        { auto lg = feed_chunks(1, pb); got_b.push_back(argmax(lg.data())); }
+        int pos_a = 500, pos_b = 700, steps_mixed = 0;
+        std::vector<float> lg_c;
+        for (int p0 = 0; p0 < P; p0 += C) {
+            std::vector<raon::Row> rows;
+            const int end = std::min(P, p0 + C);
+            for (int i = p0; i < end; i++) rows.push_back({2, i, pc[i], i + 1 == P});
+            rows.push_back({0, pos_a++, got_a.back(), true});
+            rows.push_back({1, pos_b++, got_b.back(), true});
+            auto o = eng.forward(rows);
+            int k = 0;
+            if (end == P) { lg_c.assign(o.begin(), o.begin() + V); k = 1; }
+            got_a.push_back(argmax(o.data() + (size_t)k * V));
+            got_b.push_back(argmax(o.data() + (size_t)(k + 1) * V));
+            steps_mixed++;
+        }
+        got_c.push_back(argmax(lg_c.data()));
+        greedy(2, P, got_c[0], G - 1, got_c);
+        double dmax = 0;
+        for (int i = 0; i < V; i++) dmax = std::max(dmax, (double)std::fabs(lg_c[i] - lg_c_ref[i]));
+        auto cmp = [](const std::vector<int>& a, const std::vector<int>& b) {
+            size_t k = 0;
+            while (k < a.size() && k < b.size() && a[k] == b[k]) k++;
+            return k;
+        };
+        const size_t na = std::min(got_a.size(), ref_a.size()), nb_ = std::min(got_b.size(), ref_b.size());
+        const size_t ka = cmp(got_a, ref_a), kb = cmp(got_b, ref_b), kc = cmp(got_c, ref_c);
+        printf("slot 2 (fed in %d mixed chunks of %d): last-prompt logits max |diff| %.3g, %zu tokens, first mismatch at %zu -> %s\n",
+               steps_mixed, C, dmax, ref_c.size(), kc, kc == ref_c.size() && dmax == 0 ? "IDENTICAL" : "DIFF");
+        printf("slot 0 (decoding during them): %zu tokens, first mismatch at %zu -> %s\n", na, ka, ka == na ? "IDENTICAL" : "DIFF");
+        printf("slot 1 (decoding during them): %zu tokens, first mismatch at %zu -> %s\n", nb_, kb, kb == nb_ ? "IDENTICAL" : "DIFF");
+        const bool ok = kc == ref_c.size() && dmax == 0;
+        printf("%s\n", ok ? "PASS" : "FAIL (the fed slot must match exactly)");
+        return ok ? 0 : 1;
+    }
+    if (bench_mixed && !model.empty()) {
+        // `slots` streams decode at `depth` (synthetic caches) while one more slot is fed chunks at `pf_depth`. Per chunk
+        // size, interleaved: decode = one decode step, chunk = the prompt chunk alone, mixed = both in one step.
+        // The server used to alternate chunk and decode steps; a mixed step replaces both with one pass.
+        int cmax = 0;
+        for (int c : chunks) cmax = std::max(cmax, c);
+        raon::Engine eng(model, slots + 1, std::max(depth, pf_depth) + cmax + steps + 64);
+        for (int s = 0; s < slots; s++) eng.bench_fill(s, depth);
+        const int ps = slots;
+        eng.bench_fill(ps, pf_depth);
+        raon::SampleIn si;
+        si.p.temperature = 0.f;
+        std::vector<int> pt(cmax);
+        uint32_t x = 777;
+        for (auto& t : pt) { x = x * 1664525u + 1013904223u; t = 1000 + (int)(x % 200000u); }
+        int dpos = depth;
+        auto decode_rows = [&]() {
+            std::vector<raon::Row> r;
+            for (int s = 0; s < slots; s++) r.push_back({s, dpos, 1000 + 37 * s, true});
+            dpos++;
+            if (dpos >= depth + steps) dpos = depth;
+            return r;
+        };
+        auto prompt_rows = [&](int C) {
+            std::vector<raon::Row> r;
+            for (int i = 0; i < C; i++) r.push_back({ps, pf_depth + i, pt[i], false});
+            return r;
+        };
+        auto timed = [&](const std::vector<raon::Row>& rows, int nlog) {
+            const auto a = std::chrono::steady_clock::now();
+            eng.step(rows, std::vector<raon::SampleIn>(nlog, si));
+            return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count();
+        };
+        const auto w0 = std::chrono::steady_clock::now();   // warm-up >= 1.5 s (clocks ramp up; graphs get captured)
+        while (std::chrono::duration<double>(std::chrono::steady_clock::now() - w0).count() < 1.5) timed(decode_rows(), slots);
+        printf("%d decoding slots at depth %d, prompt at depth %d; VRAM %s\n", slots, depth, pf_depth, eng.vram_report().c_str());
+        printf("| chunk | decode ms | chunk ms | mixed ms | alternating: decode t/s/stream, prefill t/s | mixed: decode t/s/stream, prefill t/s |\n");
+        printf("|---|---|---|---|---|---|\n");
+        for (int C : chunks) {
+            double td = 0, tc = 0, tm = 0;
+            const int reps = 5;
+            for (int r = 0; r <= reps; r++) {
+                const double d = timed(decode_rows(), slots);
+                const double c = timed(prompt_rows(C), 0);
+                auto mrows = prompt_rows(C);
+                for (auto& row : decode_rows()) mrows.push_back(row);
+                const double m = timed(mrows, slots);
+                if (r == 0) continue;
+                td += d / reps; tc += c / reps; tm += m / reps;
+            }
+            printf("| %d | %.2f | %.2f | %.2f | %.1f, %.0f | %.1f, %.0f |\n", C, td, tc, tm, 1e3 / (tc + td), C * 1e3 / (tc + td),
+                   1e3 / tm, C * 1e3 / tm);
+            fflush(stdout);
+        }
+        return 0;
     }
     if (bench && prefill_n > 0 && !model.empty()) {
         // prefill benchmark: prefill_n synthetic tokens into slot 0, timed per 16k-token segment

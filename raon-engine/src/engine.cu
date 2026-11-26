@@ -309,6 +309,15 @@ static inline int cdiv(int a, int b) { return (a + b - 1) / b; }
 #define PROF(name) g_prof.mark(name)
 
 // ---------------------------------------------------------------- forward over one chunk of rows
+// a prefill run of more than 16 rows followed by single rows, each of a different slot than its neighbours and than
+// the run (the decode rows of a mixed chunk)
+static bool is_mixed(const std::vector<Seg>& segs) {
+    if (segs.size() < 2 || segs[0].n <= 16) return false;
+    for (size_t i = 1; i < segs.size(); i++)
+        if (segs[i].n != 1 || segs[i].slot == segs[0].slot) return false;
+    return true;
+}
+
 void Engine::run_chunk(const Row* rows, int R) {
     Ws& w = *ws_;
     std::vector<RowMeta> meta(R);
@@ -330,27 +339,31 @@ void Engine::run_chunk(const Row* rows, int R) {
     const int nout = (int)sel.size();
     if (nout > w.lmax) throw std::runtime_error("too many rows with logits in one chunk");
     if (nout) CK(cudaMemcpy(w.sel, sel.data(), nout * 4, cudaMemcpyHostToDevice));
-    // attention splits per row: ~60 blocks in total (3 waves at 1 block/SM), within the partials buffer
-    static const int nsplit_env = getenv("RAON_NSPLIT") ? atoi(getenv("RAON_NSPLIT")) : 0;  // experiments
-    const int nsplit = std::max(1, std::min(nsplit_env ? nsplit_env : 60 / R, (int)w.opart_n / R));
-    // a single segment of more than 16 rows is a prefill chunk: expanded attention (RAON_NOFA: decode kernel per row)
+    // a first segment of more than 16 rows is a prefill run: expanded attention (RAON_NOFA: decode kernel per row).
+    // It may be followed by single rows of other slots (a mixed chunk, see is_mixed): those run the decode-path
+    // attention, while everything else (mHC, GEMMs, the delta-rule conv / scan per segment) serves all rows at once.
     static const bool no_fa = getenv("RAON_NOFA") != nullptr;
-    const bool pf = !no_fa && nseg == 1 && R > 16;
-    if (!pf && R > rdec_) throw std::runtime_error("decode-path chunk larger than its buffers");
+    const bool pf = !no_fa && segs[0].n > 16 && (nseg == 1 || is_mixed(segs));
+    const int pf_rows = pf ? segs[0].n : 0;
+    if (R - pf_rows > rdec_) throw std::runtime_error("decode-path chunk larger than its buffers");
     const int pf_slot = pf ? segs[0].slot : -1, pf_pos0 = pf ? rows[0].pos : 0;
+    // attention splits per decode-path row: ~60 blocks in total (3 waves at 1 block/SM), within the partials buffer
+    static const int nsplit_env = getenv("RAON_NSPLIT") ? atoi(getenv("RAON_NSPLIT")) : 0;  // experiments
+    const int nd = std::max(1, R - pf_rows);
+    const int nsplit = std::max(1, std::min(nsplit_env ? nsplit_env : 60 / nd, (int)w.opart_n / nd));
 
     // decode batches (one row per slot, all with logits) replay a CUDA graph captured once per batch size; the
     // kernels read positions/tokens from device memory, so the graph is valid for every step and context length
     const bool graph = nseg == R && nout == R && !g_prof.on && !getenv("RAON_NOGRAPH");
     if (!graph) {
-        launch_chunk(R, nseg, nout, nsplit, pf_slot, pf_pos0);
+        launch_chunk(R, nseg, nout, nsplit, pf_slot, pf_pos0, pf_rows);
         return;
     }
     auto it = w.graphs.find(R);
     if (it == w.graphs.end()) {
         cudaGraph_t gr;
         CK(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
-        launch_chunk(R, nseg, nout, nsplit, pf_slot, pf_pos0);
+        launch_chunk(R, nseg, nout, nsplit, pf_slot, pf_pos0, pf_rows);
         CK(cudaStreamEndCapture(cudaStreamPerThread, &gr));
         cudaGraphExec_t ex;
         CK(cudaGraphInstantiate(&ex, gr, 0));
@@ -360,7 +373,7 @@ void Engine::run_chunk(const Row* rows, int R) {
     CK(cudaGraphLaunch(it->second, cudaStreamPerThread));
 }
 
-void Engine::launch_chunk(int R, int nseg, int nout, int nsplit, int pf_slot, int pf_pos0) {
+void Engine::launch_chunk(int R, int nseg, int nout, int nsplit, int pf_slot, int pf_pos0, int pf_rows) {
     const Config& c = m_.cfg;
     Ws& w = *ws_;
     const int E = c.n_embd, HC = c.hc, H = c.mla_heads, RH = c.rda_heads, D = c.rda_dim, C = RH * D;
@@ -441,15 +454,16 @@ void Engine::launch_chunk(int R, int nseg, int nout, int nsplit, int pf_slot, in
             k_mla_cache_write_q8<<<R, 256>>>(w.kv, Ly.kv_a_norm, c.eps_latent, w.rows, kq, ks, kv_slot_rows);
             PROF("mla_proj");
             if (pf_slot >= 0) {
-                // prefill segment: expanded attention, key blocks of up to FA_KB keys
+                // prefill segment (rows [0, P)): expanded attention, key blocks of up to FA_KB keys
+                const int P = pf_rows;
                 const float scale = 1.f / sqrtf((float)c.k_mla);
                 static const bool fa16 = getenv("RAON_FA16") != nullptr;  // f16 QK^T (A/B)
                 static const bool ex16 = fa16 || getenv("RAON_EXPAND16") != nullptr;  // f16 expansion (A/B)
-                if (fa16) k_fa_qprep<<<cdiv(R * H * c.k_mla, 256), 256>>>(w.q, R, scale, w.qf);
-                else k_fa_qprep8<<<cdiv(R * H * 32, 256), 256>>>(w.q, R, scale, w.q8, w.qs8);
-                k_fa_init<<<cdiv(H * R * c.v_mla, 256), 256>>>(w.ofa, w.mlfa, H * R);
+                if (fa16) k_fa_qprep<<<cdiv(P * H * c.k_mla, 256), 256>>>(w.q, P, scale, w.qf);
+                else k_fa_qprep8<<<cdiv(P * H * 32, 256), 256>>>(w.q, P, scale, w.q8, w.qs8);
+                k_fa_init<<<cdiv(H * P * c.v_mla, 256), 256>>>(w.ofa, w.mlfa, H * P);
                 const size_t slot_row0 = (size_t)pf_slot * kv_slot_rows;
-                const int kmax = pf_pos0 + R;
+                const int kmax = pf_pos0 + P;
                 for (int kb0 = 0; kb0 < kmax; kb0 += FA_KB) {
                     const int nk = std::min(FA_KB, kmax - kb0);
                     if (ex16) {
@@ -464,30 +478,36 @@ void Engine::launch_chunk(int R, int nseg, int nout, int nsplit, int pf_slot, in
                     }
                     PROF("pf_expand");
                     if (fa16)
-                        k_fa<<<dim3(cdiv(R, fa::BQ), H), fa::THREADS, sizeof(fa::Smem)>>>(w.qf, R, pf_pos0, w.E, w.cf, nk,
+                        k_fa<<<dim3(cdiv(P, fa::BQ), H), fa::THREADS, sizeof(fa::Smem)>>>(w.qf, P, pf_pos0, w.E, w.cf, nk,
                                                                                            kb0, w.ofa, w.mlfa);
                     else if (w.v8 && !ex16)
-                        k_fa8<true><<<dim3(cdiv(R, fa::BQ), H), fa::THREADS, sizeof(fa8::Smem8)>>>(
-                            w.q8, w.qs8, R, pf_pos0, w.k8, w.ks8, nullptr, w.v8, w.v8s, FA_KB, nk, kb0, w.ofa, w.mlfa);
+                        k_fa8<true><<<dim3(cdiv(P, fa::BQ), H), fa::THREADS, sizeof(fa8::Smem8)>>>(
+                            w.q8, w.qs8, P, pf_pos0, w.k8, w.ks8, nullptr, w.v8, w.v8s, FA_KB, nk, kb0, w.ofa, w.mlfa);
                     else
-                        k_fa8<false><<<dim3(cdiv(R, fa::BQ), H), fa::THREADS, sizeof(fa8::Smem)>>>(
-                            w.q8, w.qs8, R, pf_pos0, w.k8, w.ks8, ex16 ? w.E + H * fa::NOPE : w.vf, nullptr, nullptr,
+                        k_fa8<false><<<dim3(cdiv(P, fa::BQ), H), fa::THREADS, sizeof(fa8::Smem)>>>(
+                            w.q8, w.qs8, P, pf_pos0, w.k8, w.ks8, ex16 ? w.E + H * fa::NOPE : w.vf, nullptr, nullptr,
                             ex16 ? fa::EW : H * fa::DV, nk, kb0, w.ofa, w.mlfa);
                     PROF("pf_flashattn");
                 }
-                k_fa_final<<<cdiv(R * H * c.v_mla, 256), 256>>>(w.ofa, w.mlfa, R, w.o);
+                k_fa_final<<<cdiv(P * H * c.v_mla, 256), 256>>>(w.ofa, w.mlfa, P, w.o);
                 PROF("mla_prefill_attn");
-            } else {
-                mm(Ly.k_b, w.q, H * c.k_mla, R, w.qlat, H * c.kv_lora, w.xq, w.xs, c.kv_lora, c.k_mla);
-                k_mla_qprep<<<cdiv(mla_qprep_threads(R), 256), 256>>>(w.qlat, w.q, c.k_mla, 1.f / sqrtf((float)c.k_mla), R, w.qi,
-                                                            w.qsc);
+            }
+            if (pf_rows < R) {
+                // decode-path rows [r0, R) (all rows of a decode batch; the decode rows of a mixed chunk): absorbed
+                // attention, one row per sequence position, each over its own slot's latent cache
+                const int r0 = pf_rows, nd = R - r0;
+                mm(Ly.k_b, w.q + (size_t)r0 * H * c.k_mla, H * c.k_mla, nd, w.qlat, H * c.kv_lora, w.xq, w.xs, c.kv_lora,
+                   c.k_mla);
+                k_mla_qprep<<<cdiv(mla_qprep_threads(nd), 256), 256>>>(w.qlat, w.q + (size_t)r0 * H * c.k_mla, c.k_mla,
+                                                                       1.f / sqrtf((float)c.k_mla), nd, w.qi, w.qsc);
                 PROF("mla_kb+qprep");
-                k_mla_decode<RowMeta><<<dim3(R, nsplit), attn::THREADS, sizeof(attn::Smem)>>>(
-                    w.qi, w.qsc, kq, ks, kv_slot_rows, w.rows, nsplit, w.opart, w.ml);
+                k_mla_decode<RowMeta><<<dim3(nd, nsplit), attn::THREADS, sizeof(attn::Smem)>>>(
+                    w.qi, w.qsc, kq, ks, kv_slot_rows, w.rows + r0, nsplit, w.opart, w.ml);
                 PROF("mla_attn");
-                k_mla_combine<<<dim3(R, H), 128>>>(w.opart, w.ml, nsplit, w.olat);
+                k_mla_combine<<<dim3(nd, H), 128>>>(w.opart, w.ml, nsplit, w.olat);
                 PROF("mla_combine");
-                mm(Ly.v_b, w.olat, H * c.kv_lora, R, w.o, H * c.v_mla, w.xq, w.xs, c.v_mla, c.kv_lora);
+                mm(Ly.v_b, w.olat, H * c.kv_lora, nd, w.o + (size_t)r0 * H * c.v_mla, H * c.v_mla, w.xq, w.xs, c.v_mla,
+                   c.kv_lora);
             }
             mmq(Ly.attn_gate, w.hq, w.hs, w.gate, H * c.v_mla);
             k_sigmul_quant<<<cdiv(R * H * c.v_mla, 256), 256>>>(w.o, w.gate, H * c.v_mla, R, w.xq, w.xs);
@@ -524,14 +544,30 @@ void Engine::launch_chunk(int R, int nseg, int nout, int nsplit, int pf_slot, in
     PROF("lm_head");
 }
 
+// rows of the next chunk starting at b0: up to rmax_ rows of one sequence; a mixed batch (prefill run + decode rows)
+// whole when it fits; otherwise a chunk mixing sequences runs the decode-path attention: at most rdec_ rows
+int Engine::chunk_len(const std::vector<Row>& rows, size_t b0) const {
+    const int n = (int)std::min<size_t>(rmax_, rows.size() - b0);
+    int k = 1;
+    while (k < n && rows[b0 + k].slot == rows[b0].slot) k++;
+    if (k == n) return n;
+    if (k > 16) {
+        const size_t rest = rows.size() - b0 - k;
+        bool single = rest <= (size_t)rdec_ && k + rest <= (size_t)rmax_;
+        for (size_t i = 0; single && i < rest; i++) {
+            const Row& r = rows[b0 + k + i];
+            single = r.slot != rows[b0].slot && (i == 0 || r.slot != rows[b0 + k + i - 1].slot);
+        }
+        return single ? k + (int)rest : k;   // the prefill run alone first, if the rest does not ride along
+    }
+    return std::min(n, rdec_);
+}
+
 std::vector<float> Engine::forward(const std::vector<Row>& rows) {
     const int V = m_.cfg.n_vocab;
     std::vector<float> out;
     for (size_t b0 = 0; b0 < rows.size();) {
-        int n = (int)std::min<size_t>(rmax_, rows.size() - b0);
-        // a chunk mixing sequences runs the decode-path attention: at most rdec_ rows
-        for (int i = 1; i < n; i++)
-            if (rows[b0 + i].slot != rows[b0].slot) { n = std::min(n, rdec_); break; }
+        const int n = chunk_len(rows, b0);
         run_chunk(rows.data() + b0, n);
         g_prof.calls++;
         int nout = 0;
@@ -692,9 +728,7 @@ std::vector<SampleOut> Engine::step(const std::vector<Row>& rows, const std::vec
     std::vector<SampleOut> out(in.size());
     size_t used = 0;
     for (size_t b0 = 0; b0 < rows.size();) {
-        int n = (int)std::min<size_t>(rmax_, rows.size() - b0);
-        for (int i = 1; i < n; i++)
-            if (rows[b0 + i].slot != rows[b0].slot) { n = std::min(n, rdec_); break; }
+        const int n = chunk_len(rows, b0);
         run_chunk(rows.data() + b0, n);
         g_prof.calls++;
         int nout = 0;
