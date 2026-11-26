@@ -207,9 +207,16 @@ They cost 0.10-0.13 ms per step for 4 rows (`tests/sample_bench.cu`). At 4 × 12
 **Scheduling:**
 
 - One thread owns the GPU.
-- Each iteration runs at most one prefill chunk (2,048 tokens), then one batched decode step over all generating
-  requests.
-- While others generate, prefill gets `--prefill-share` of the GPU time (default 0.5).
+- While others generate, each iteration is one **mixed step**: a prompt chunk of the oldest request in prefill and
+  the next token of every generating request in one batch (`Engine::step` keeps such a batch in one chunk). The
+  weights are read once for both; the prompt rows take the expanded (flash) attention, the decode rows the absorbed
+  decode attention on their own slots; mHC, the GEMMs and the delta-rule conv / scan (per segment) serve all rows.
+  The chunk is sized from measured step times so a mixed step takes about `--mixed-budget` (default 1.5) x a
+  decode step, within [`--mixed-min` 32, `--chunk-busy` 2,048]. NOT YET MEASURED ON THE GPU (2026-11-26):
+  `tests/validate_mixed.sh`; `build/raon --test-mixed` (the fed prompt must match a plain prefill exactly) and
+  `build/raon --bench-mixed`.
+- `--no-mixed`: the old policy. Each iteration runs at most one prefill chunk (2,048 tokens), then one batched
+  decode step over all generating requests; prefill gets `--prefill-share` of the GPU time (default 0.5).
 - A client disconnect cancels its request.
 
 **Prompt reuse:**

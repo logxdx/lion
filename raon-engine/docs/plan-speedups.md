@@ -247,7 +247,8 @@ switch, against the noise floor.
 
 ### Scheduling (server) items
 
-- **Decode rows inside prefill chunks.**
+- **Decode rows inside prefill chunks: IMPLEMENTED 2026-11-26, not yet measured** (mixed chunks, see README
+  "Scheduling"; `tests/validate_mixed.sh`).
   - *Problem:* while a long prompt prefills, the generating streams get their tokens only in the decode-only steps
     (`--prefill-share`).
   - *Change:* the chunk's GEMMs could carry the decode rows. The weights are then read once; attention for those rows

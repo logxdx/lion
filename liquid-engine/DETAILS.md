@@ -161,8 +161,16 @@ How it works:
   identical to llama-server's `/apply-template` on the test conversations (`tests/compare_template.py`); output is
   parsed into reasoning / content / tool calls (typed by each tool's JSON schema), streaming-safe.
 - **Scheduler** (one GPU thread): FIFO queue (`--max-queue`, then 503) -> free slot with the longest reusable prefix
-  -> prompt fed in chunks; while other slots decode, one decode step runs after every `--busy-chunk` prompt tokens,
-  so a long new prompt no longer freezes running streams. Finished sequences leave the batch at once.
+  -> prompt fed in chunks. While other slots decode, each step is a **mixed step** (`Engine::mixed_step`): the
+  prompt chunk and one token of every decoding slot go through one forward pass, so the weights are streamed once
+  for both (the decode rows use the decode attention kernel on their own slots, everything else is shared). The
+  chunk is sized from measured step times so a mixed step takes about `--mixed-budget` (default 1.5) x a plain
+  decode step, within [`--mixed-min` 32, `--busy-chunk` 1024]; `--no-mixed` restores the old alternation (one
+  decode step after every `--busy-chunk` prompt tokens). Mixed decode rows go through the int8 GEMMs instead of
+  the decode GEMVs, so their logits can differ from a plain decode step's in the last bits (the fed prompt is
+  bit-identical to a plain prefill: `build/liquid --test-mixed`). `build/liquid --bench-mixed` measures decode,
+  chunk and mixed step times per chunk size. NOT YET MEASURED ON THE GPU (2026-11-26):
+  `bench/validate_fp8_mixed.sh`. Finished sequences leave the batch at once.
 - **Prefix reuse**: LFM3's conv layers cannot be rewound, so every slot keeps state checkpoints (conv state + the
   256-token sliding-window KV, ~1.9 MB) at the end of each prompt and every 16k tokens; a new request resumes from
   the newest checkpoint inside its shared prefix. All restore paths are bit-identical (`tests/test_engine_api.cpp`).
@@ -357,6 +365,13 @@ times its phases).
   P·V partial sums), double-buffered K/V tiles (cp.async for f16; register prefetch + `prmt` dequantisation for
   q8, bit-identical to the f32 conversion, `tests/dequant_q8_test.cu`); ~28 TFLOPS useful at 32k, bound by the
   f32-accumulate QK^T MMAs.
+- With the q8 KV cache (default), prefill attention runs `k_flash_prefill8` (`src/flash8.cuh`): QK^T on int8
+  m16n8k32 (int8 queries with one scale per token and head; K as stored, one k32 step = one q8_0 block, scaled by
+  its block scale) and P.V on FP8 e4m3 m16n8k32 with f16 accumulation per 64-key tile (P' = 448 P; V' scaled per
+  tile and 32-dim block by the largest q8 scale, so the f16 sum cannot overflow), raon-engine's recipe. Expected
+  ~2x the attention throughput (int8 / FP8 run at 4x the f32-accumulate f16 rate). `LIQUID_FA16=1` selects the
+  f16 kernel. Checks: `build/flash8_check` (both kernels vs an f64 reference, and their times),
+  `tests/kv_compare.py`. NOT YET MEASURED ON THE GPU (2026-11-26).
 
 ## Tests
 
