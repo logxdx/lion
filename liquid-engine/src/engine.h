@@ -104,6 +104,13 @@ public:
     // One batched decode step: every listed slot consumes its pending token and samples the next one
     // (which becomes pending). done[i] = a stop token was sampled.
     void decode_step(const std::vector<int>& slots, std::vector<int>& toks, std::vector<char>& done);
+    // feed() of n prompt tokens of slot pslot (1 <= n <= max_chunk()) and decode_step(dslots) in one forward pass:
+    // the weights are streamed once for both, so the decoding slots keep generating while a prompt is fed. The
+    // decode rows go through the prefill GEMMs (int8 tensor cores) instead of the decode GEMVs, so their logits can
+    // differ from a decode_step's in the last bits. Not in exact mode, not for decision models.
+    void mixed_step(int pslot, const int* tokens, int n, const std::vector<int>& dslots, std::vector<int>& toks,
+                    std::vector<char>& done);
+    int max_chunk() const { return pf_tmax_; }
     // Exact state of a slot after n_past consumed tokens, minus the global-attention KV: short-conv states and
     // the sliding-window KV rows still in reach. Restoring it requires the global KV rows [0, n_past) to be valid.
     struct Checkpoint {
@@ -154,7 +161,9 @@ private:
     int8_t* d_hq_ = nullptr;
     float* d_hd_ = nullptr;
     float* d_logits_ = nullptr;
-    void run_layers(int slot, int T, int p0, const int* grp, const int* gspan, bool prefix_all = false);
+    // nd > 0: rows [T, T + nd) of the chunk are decode rows (mixed_step): batch row i -> slot B_->slots[i], position
+    // and token from its ctrl block
+    void run_layers(int slot, int T, int p0, const int* grp, const int* gspan, bool prefix_all = false, int nd = 0);
     std::vector<Layer> L_;
     QWeight emb_;                 // token_embd == output (tied)
     float* out_norm_ = nullptr;

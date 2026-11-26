@@ -155,6 +155,34 @@ __global__ void k_conv_state_update(const float* bcx, int T, float* state) {
     for (int j = 0; j < 6; j++) state[ch * 6 + j] = nw[j];
 }
 
+// mixed steps (Engine::mixed_step): the short conv of nb decode rows, one token each from its slot's state.
+// bcx: the rows' in_proj outputs [nb][6144]; grid (2048 / 256, nb). Same arithmetic as the decode GEMV's EPI_CONV
+// epilogue (finished sequences keep their state), output quantized per 32 channels like k_conv_prefill.
+__global__ void __launch_bounds__(256) k_conv_rows(const float* bcx, const float* conv_w, float* conv_state, SlotTab st,
+                                                   int8_t* yq, float* yd) {
+    const int b = blockIdx.y, ch = blockIdx.x * 256 + threadIdx.x;
+    const float* row = bcx + (size_t)b * 6144;
+    const float bx = row[bcx_col(0, ch)] * row[bcx_col(2, ch)];
+    float* s_ = conv_state + (size_t)st.slots[b] * (2048 * 6) + (size_t)ch * 6;
+    const float* cw = conv_w + (size_t)ch * 7;
+    float s[6];
+#pragma unroll
+    for (int j = 0; j < 6; j++) s[j] = s_[j];
+    float o = cw[6] * bx;
+#pragma unroll
+    for (int j = 0; j < 6; j++) o += cw[j] * s[j];
+    if (!slot_ctrl(st, b)[CTRL_DONE]) {
+#pragma unroll
+        for (int j = 0; j < 5; j++) s_[j] = s[j + 1];
+        s_[5] = bx;
+    }
+    const float y = row[bcx_col(1, ch)] * o;
+    const float amax = warp_max(fabsf(y));
+    const float d = amax / 127.f, id = d > 0 ? 1.f / d : 0.f;
+    yq[(size_t)b * 2048 + ch] = (int8_t)roundf(y * id);
+    if ((threadIdx.x & 31) == 0) yd[(size_t)b * 64 + (ch >> 5)] = d;
+}
+
 // q/k RMS norm + NEOX rope; q -> qh (f16, pre-scaled by 1/sqrt(128)), k/v -> cache (f16)
 // With q8out: q -> int8 [t][16][128] with one scale per (token, head) in qs8 (times 1/sqrt(128) * log2(e)), for
 // k_flash_prefill8; qh is not written.

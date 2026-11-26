@@ -39,6 +39,9 @@ static void usage() {
             "  --bench            benchmark: --pp N prompt tokens, --tg N generated tokens, --reps N\n"
             "  --parallel N       with --bench: N concurrent sequences (batched decode), aggregate t/s\n"
             "  --test-multi N     check: N prompts decoded together == each decoded alone (greedy)\n"
+            "  --test-mixed       check: 2 slots decoding while a 3rd prompt is fed through mixed steps vs each alone\n"
+            "  --bench-mixed      --parallel N slots decoding at depth --pp while a prompt (at depth --pf-depth) is fed:\n"
+            "                     decode step, prefill chunk and mixed step times per chunk size (--chunks a,b,..)\n"
             "  --tokenize TEXT    print token ids\n"
             "  --dump-logits      after the prompt, print the top-10 next-token logits\n"
             "  --seq-prefill      process the prompt token by token (debug)\n"
@@ -110,6 +113,9 @@ int main(int argc, char** argv) {
     bool seq_prefill = false, show_special = false, do_tokenize = false, exact = false, profile = false;
     bool kv_q8 = true;  // default q8_0 KV: faster decode at every context, half the memory (see README)
     int n_predict = 2048, ctx = 32768, pp = 512, tg = 128, reps = 3, parallel = 1, test_multi = 0;
+    bool test_mixed = false, bench_mixed = false;
+    int pf_depth = 0;
+    std::vector<int> chunks = {32, 64, 128, 256, 512, 1024};
     SamplingParams sp;      // filled from the GGUF's general.sampling.* keys, then the flags below
     SamplingOverrides ov;
     for (int i = 1; i < argc; i++) {
@@ -150,6 +156,19 @@ int main(int argc, char** argv) {
         else if (a == "--reps") reps = std::stoi(next());
         else if (a == "--parallel" || a == "-np") parallel = std::stoi(next());
         else if (a == "--test-multi") test_multi = std::stoi(next());
+        else if (a == "--test-mixed") test_mixed = true;
+        else if (a == "--bench-mixed") bench_mixed = true;
+        else if (a == "--pf-depth") pf_depth = std::stoi(next());
+        else if (a == "--chunks") {
+            chunks.clear();
+            std::string v = next();
+            for (size_t i = 0; i < v.size();) {
+                size_t j = v.find(',', i);
+                if (j == std::string::npos) j = v.size();
+                chunks.push_back(std::stoi(v.substr(i, j - i)));
+                i = j + 1;
+            }
+        }
         else if (a == "--tokenize") { do_tokenize = true; tok_text = next(); }
         else if (a == "--dump-logits") dump_logits = true;
         else if (a == "--seq-prefill") seq_prefill = true;
@@ -231,6 +250,126 @@ int main(int argc, char** argv) {
             }
             printf("%s\n", fails ? "FAIL" : "PASS");
             return fails ? 1 : 0;
+        }
+        if (test_mixed) {
+            // slots 0 and 1 decode while slot 2's prompt is fed in mixed steps (chunks of 256), then all three decode.
+            // Reference: each prompt alone (prefill + greedy generate). The fed slot goes through the same kernels as a
+            // plain prefill, so it must be IDENTICAL; the decode rows run the prefill GEMMs instead of the decode GEMVs,
+            // so they may part ways at a near-tie (reported; judge it against the logit gap).
+            Engine eng(model, std::max(ctx, 8192), !quiet, false, kv_q8, 3);
+            SamplingParams g; g.temperature = 0; g.repeat_penalty = 1.0f;
+            const char* qs[3] = {"Explain how a compiler works, step by step.", "Write a short story about a lighthouse keeper.",
+                                 "Summarise the following notes and list the open questions."};
+            std::vector<std::vector<int>> prompts(3);
+            for (int i = 0; i < 3; i++) {
+                std::string q = qs[i];
+                if (i == 2)
+                    for (int r = 0; r < 120; r++)
+                        q += " Note " + std::to_string(r) + ": the meeting moved the launch by a week because the vendor missed the certification window.";
+                prompts[i] = tk.encode(render_chat(std::vector<Msg>{{"user", q}}, "", false, true));
+            }
+            const int n_gen = tg;
+            std::vector<std::vector<int>> ref(3);
+            for (int i = 0; i < 3; i++) {
+                eng.reset(0);
+                eng.prefill(prompts[i], 0);
+                ref[i] = eng.generate(n_gen, g, {});
+            }
+            eng.reset();
+            std::vector<std::vector<int>> got(3);
+            for (int i = 0; i < 3; i++) eng.set_sampling(i, g, {});
+            for (int i = 0; i < 2; i++) {
+                eng.feed(i, prompts[i].data(), (int)prompts[i].size() - 1);
+                eng.set_pending(i, prompts[i].back());
+            }
+            const auto& P = prompts[2];
+            const int target = (int)P.size() - 1;
+            int fed = 0, mixed_steps = 0;
+            std::vector<int> ids = {0, 1}, toks;
+            std::vector<char> done;
+            while (fed < target) {
+                const int n = std::min(256, target - fed);
+                eng.mixed_step(2, P.data() + fed, n, ids, toks, done);
+                fed += n;
+                mixed_steps++;
+                for (int k = 0; k < 2; k++) got[k].push_back(toks[k]);
+            }
+            eng.set_pending(2, P.back());
+            ids = {0, 1, 2};
+            while ((int)got[2].size() < n_gen) {
+                eng.decode_step(ids, toks, done);
+                for (int k = 0; k < 3; k++) got[k].push_back(toks[k]);
+            }
+            int fails = 0;
+            for (int i = 0; i < 3; i++) {
+                const size_t n = std::min(got[i].size(), ref[i].size());
+                size_t k = 0;
+                while (k < n && got[i][k] == ref[i][k]) k++;
+                const bool same = k == n;
+                if (i == 2 && !same) fails++;
+                printf("slot %d (%s, prompt %zu tok): %zu tokens compared, first mismatch at %zu -> %s\n", i,
+                       i == 2 ? "fed in mixed steps" : "decoding during them", prompts[i].size(), n, k,
+                       same ? "IDENTICAL" : "DIFF");
+            }
+            printf("%d mixed steps; %s\n", mixed_steps, fails ? "FAIL (the fed slot must match exactly)" : "PASS");
+            return fails ? 1 : 0;
+        }
+        if (bench_mixed) {
+            // N slots decode at depth pp; slot N is fed chunks of C tokens from depth pf_depth. Per C, interleaved:
+            //   decode = decode_step alone, chunk = feed(C) alone, mixed = mixed_step(C).
+            // The server used to alternate chunk + decode; a mixed step replaces both with one pass.
+            const int N = std::max(1, parallel);
+            int cmax = 0;
+            for (int c : chunks) cmax = std::max(cmax, c);
+            Engine eng(model, std::max(ctx, std::max(pp, pf_depth) + cmax + 4096), !quiet, false, kv_q8, N + 1);
+            SamplingParams g; g.temperature = 0; g.repeat_penalty = 1.0f;
+            std::vector<int> ids(N);
+            for (int i = 0; i < N; i++) {
+                ids[i] = i;
+                eng.set_sampling(i, g, {});
+                std::vector<int> t(pp);
+                for (int j = 0; j < pp; j++) t[j] = 1000 + ((j + 7 * i) * 7919) % 100000;
+                eng.feed(i, t.data(), pp - 1);
+                eng.set_pending(i, t.back());
+            }
+            const int ps = N;
+            std::vector<int> pt(pf_depth + cmax + 1);
+            for (size_t j = 0; j < pt.size(); j++) pt[j] = 1000 + ((j + 13) * 7919) % 100000;
+            if (pf_depth > 0) eng.feed(ps, pt.data(), pf_depth);
+            Engine::Checkpoint cp;
+            eng.save_checkpoint(ps, cp);  // every chunk starts from depth pf_depth
+            std::vector<int> toks;
+            std::vector<char> done;
+            using clk = std::chrono::steady_clock;
+            auto ms = [](clk::time_point a) { return std::chrono::duration<double, std::milli>(clk::now() - a).count(); };
+            for (int w = 0; w < 30; w++) eng.decode_step(ids, toks, done);  // warm-up (clocks ramp)
+            const std::string mname = model.substr(model.find_last_of('/') + 1);
+            printf("%s, %d decoding slots at depth %d, prompt at depth %d, VRAM %.0f MiB\n", mname.c_str(), N, pp, pf_depth,
+                   eng.gpu_bytes() / 1048576.0);
+            printf("| chunk | decode ms | chunk ms | mixed ms | alternating: decode t/s/stream, prefill t/s | mixed: decode t/s/stream, prefill t/s |\n");
+            printf("|---|---|---|---|---|---|\n");
+            for (int C : chunks) {
+                double td = 0, tc = 0, tm = 0;
+                for (int r = 0; r < reps + 1; r++) {
+                    auto t0 = clk::now();
+                    eng.decode_step(ids, toks, done);
+                    const double d = ms(t0);
+                    eng.load_checkpoint(ps, cp);
+                    t0 = clk::now();
+                    eng.feed(ps, pt.data() + pf_depth, C);
+                    const double c = ms(t0);
+                    eng.load_checkpoint(ps, cp);
+                    t0 = clk::now();
+                    eng.mixed_step(ps, pt.data() + pf_depth, C, ids, toks, done);
+                    const double m = ms(t0);
+                    eng.load_checkpoint(ps, cp);
+                    if (r == 0) continue;
+                    td += d / reps; tc += c / reps; tm += m / reps;
+                }
+                printf("| %d | %.2f | %.2f | %.2f | %.1f, %.0f | %.1f, %.0f |\n", C, td, tc, tm, 1e3 / (tc + td),
+                       C * 1e3 / (tc + td), 1e3 / tm, C * 1e3 / tm);
+            }
+            return 0;
         }
         if (bench && parallel > 1) {
             const int N = parallel;

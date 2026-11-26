@@ -1020,7 +1020,7 @@ Engine::Engine(const std::string& path, int max_ctx, bool verbose, bool exact, b
     CK(cudaMemset(b.slots, 0, MAX_SLOTS * 4));
     CK(cudaMallocHost(&b.h_snap, SNAP_RING * MAX_SLOTS * CTRL_N * 4));
     CK(cudaMallocHost(&b.h_stage, STAGE_RING * 16 * 4));
-    prefill_alloc(b.pf, cfg_, pf_tmax_, [this](size_t n) { return alloc(n); });
+    prefill_alloc(b.pf, cfg_, pf_tmax_ + MAX_SLOTS, [this](size_t n) { return alloc(n); });  // + mixed_step's decode rows
     if (decision_) {
         d_grp_ = (int*)alloc((size_t)max_ctx_ * 4);
         d_gspan_ = (int*)alloc((size_t)2 * (max_ctx_ + 1) * 4);
@@ -1578,25 +1578,30 @@ void Engine::prefill_batched(int slot, const int* tokens, int n, const float* em
 
 // the layers over T tokens in p.X (positions p0..), residual stream left in p.X + the last FFN output in p.F.
 // grp/gspan (device): decision-model group mask for the global attention layers (see decide()).
-void Engine::run_layers(int slot, int T, int p0, const int* grp, const int* gspan, bool prefix_all) {
+void Engine::run_layers(int slot, int T, int p0, const int* grp, const int* gspan, bool prefix_all, int nd) {
     auto& b = *B_;
     auto& p = b.pf;
     const float eps = cfg_.eps;
+    const int R = T + nd;                      // rows through the norms and GEMMs
+    const SlotTab dst{b.slots, nd, b.ctrl};    // decode rows (mixed_step)
     {
         const float* prevF = nullptr;
         const float* prev_post = nullptr;
         for (int il = 0; il < cfg_.n_layer; il++) {
             const Layer& l = L_[il];
-            k_prep<<<T, 256, 0, st_>>>(p.X, prevF, prev_post, l.attn_norm, eps, p.xq, p.xd);
+            k_prep<<<R, 256, 0, st_>>>(p.X, prevF, prev_post, l.attn_norm, eps, p.xq, p.xd);
             prof_mark("prep", st_);
             GemmArgs gi{};
-            gi.A = p.xq; gi.Ad = p.xd; gi.T = T; gi.w = l.w_in; gi.out = p.big;
+            gi.A = p.xq; gi.Ad = p.xd; gi.T = R; gi.w = l.w_in; gi.out = p.big;
             launch_gemm<2048, GE_STORE>(gi, st_);
-            prof_mark(l.conv ? "gemm.in_proj" : "gemm.qkvg", st_, 2.0 * T * l.w_in.N * 2048);
+            prof_mark(l.conv ? "gemm.in_proj" : "gemm.qkvg", st_, 2.0 * R * l.w_in.N * 2048);
             if (l.conv) {
                 float* cs = l.conv_state + (size_t)slot * cfg_.n_embd * 6;
                 k_conv_prefill<<<dim3((T + 31) / 32, 16), 256, 0, st_>>>(p.big, l.conv_w, cs, T, p.yq, p.yd);
                 k_conv_state_update<<<8, 256, 0, st_>>>(p.big, T, cs);
+                if (nd)
+                    k_conv_rows<<<dim3(8, nd), 256, 0, st_>>>(p.big + (size_t)T * 6144, l.conv_w, l.conv_state, dst,
+                                                             p.yq + (size_t)T * 2048, p.yd + (size_t)T * 64);
                 prof_mark("conv", st_);
             } else {
                 void* kc = (uint8_t*)l.kc + slot * l.kv_slot_bytes;
@@ -1646,21 +1651,34 @@ void Engine::run_layers(int slot, int T, int p0, const int* grp, const int* gspa
                     for (int t = 0; t < T; t++) pairs += W ? std::min(W, p0 + t + 1) : p0 + t + 1;
                     prof_mark(l.swa ? "attn(swa)" : "attn(global)", st_, pairs * 16 * 128 * 4);
                 }
+                if (nd) {  // decode rows: rope + KV write + split attention over their own slots (decode kernel)
+                    AttnArgs at{};
+                    at.st = dst;
+                    at.qkvg = p.big + (size_t)T * 3088; at.qn = l.q_norm; at.kn = l.k_norm; at.ff = l.rope_ff;
+                    at.base = l.swa ? cfg_.rope_base_swa : cfg_.rope_base; at.eps = cfg_.eps;
+                    at.kc = l.kc; at.vc = l.vc; at.ks = l.ks; at.vs = l.vs; at.cap = l.cap; at.window = l.swa ? cfg_.swa_window : 0;
+                    at.kv_stride = l.kv_slot_bytes; at.kvs_stride = l.kvs_slot_elems;
+                    at.part = b.part; at.counter = b.counter;
+                    at.oq = p.yq + (size_t)T * 2048; at.od = p.yd + (size_t)T * 64; at.of = nullptr;
+                    if (kv_q8_) k_attn_decode<true><<<dim3(4, ATT_SMAX, nd), 128, 0, st_>>>(at);
+                    else k_attn_decode<false><<<dim3(4, ATT_SMAX, nd), 128, 0, st_>>>(at);
+                    prof_mark("attn.decode_rows", st_);
+                }
             }
             GemmArgs go{};
-            go.A = p.yq; go.Ad = p.yd; go.T = T; go.w = l.w_out; go.out = p.O;
+            go.A = p.yq; go.Ad = p.yd; go.T = R; go.w = l.w_out; go.out = p.O;
             launch_gemm<2048, GE_STORE>(go, st_);
-            prof_mark("gemm.out", st_, 2.0 * T * 2048 * 2048);
-            k_prep<<<T, 256, 0, st_>>>(p.X, p.O, l.post_attn_norm, l.ffn_norm, eps, p.xq, p.xd);
+            prof_mark("gemm.out", st_, 2.0 * R * 2048 * 2048);
+            k_prep<<<R, 256, 0, st_>>>(p.X, p.O, l.post_attn_norm, l.ffn_norm, eps, p.xq, p.xd);
             prof_mark("prep", st_);
             GemmArgs gg{};
-            gg.A = p.xq; gg.Ad = p.xd; gg.T = T; gg.w = l.w_gu; gg.yq = p.aq; gg.yd = p.ad;
+            gg.A = p.xq; gg.Ad = p.xd; gg.T = R; gg.w = l.w_gu; gg.yq = p.aq; gg.yd = p.ad;
             launch_gemm<2048, GE_SWIGLU>(gg, st_);
-            prof_mark("gemm.gate_up", st_, 2.0 * T * l.w_gu.N * 2048);
+            prof_mark("gemm.gate_up", st_, 2.0 * R * l.w_gu.N * 2048);
             GemmArgs gd{};
-            gd.A = p.aq; gd.Ad = p.ad; gd.T = T; gd.w = l.w_down; gd.out = p.F;
+            gd.A = p.aq; gd.Ad = p.ad; gd.T = R; gd.w = l.w_down; gd.out = p.F;
             launch_gemm<7680, GE_STORE>(gd, st_);
-            prof_mark("gemm.down", st_, 2.0 * T * 2048 * 7680);
+            prof_mark("gemm.down", st_, 2.0 * R * 2048 * 7680);
             prevF = p.F;
             prev_post = l.post_ffn_norm;
         }
@@ -1803,6 +1821,65 @@ void Engine::decode_step(const std::vector<int>& slots, std::vector<int>& toks, 
         pending_[slots[i]] = c[CTRL_TOK];
     }
     timing.decode_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    timing.decode_tokens += nb;
+}
+
+void Engine::mixed_step(int pslot, const int* tokens, int n, const std::vector<int>& dslots, std::vector<int>& toks,
+                        std::vector<char>& done) {
+    auto& b = *B_;
+    auto& p = b.pf;
+    const int nb = (int)dslots.size(), E = cfg_.n_embd;
+    if (decision_ || g_exact_mask) throw std::runtime_error("mixed_step: not in exact mode or for decision models");
+    if (n <= 0) { decode_step(dslots, toks, done); return; }
+    if (nb == 0) { toks.clear(); done.clear(); feed(pslot, tokens, n); return; }
+    if (n > pf_tmax_) throw std::runtime_error("mixed_step: chunk larger than max_chunk()");
+    if (pslot < 0 || pslot >= n_slots_) throw std::runtime_error("bad slot");
+    if (n_past_[pslot] + n + 1 > max_ctx_) throw std::runtime_error("context overflow");
+    toks.assign(nb, -1);
+    done.assign(nb, 0);
+    for (int s : dslots) {
+        if (s == pslot) throw std::runtime_error("mixed_step: the prompt slot cannot decode in the same step");
+        if (pending_[s] < 0) throw std::runtime_error("mixed_step: slot has no pending token");
+        if (n_past_[s] + 1 >= max_ctx_) throw std::runtime_error("context overflow");
+        if (ctrl_dirty_[s]) {
+            const int init[4] = {pending_[s], n_past_[s], 0, 0};  // tok, pos, done, ngen (stamp kept)
+            CK(cudaMemcpyAsync(b.ctrl + s * CTRL_N, stage_ints(b.h_stage, b.stage_i, init, 4), 16, cudaMemcpyHostToDevice, st_));
+            ctrl_dirty_[s] = false;
+        }
+    }
+    if (dslots != cur_slots_) set_slots(dslots.data(), nb);
+    const auto t0 = std::chrono::steady_clock::now();
+    const SlotTab st{b.slots, nb, b.ctrl};
+    // rows [0, n): the prompt chunk; rows [n, n + nb): the decode rows' pending tokens
+    const int p0 = n_past_[pslot];
+    memcpy(p.h_toks, tokens, n * 4);
+    CK(cudaMemcpyAsync(p.toks, p.h_toks, n * 4, cudaMemcpyHostToDevice, st_));
+    k_embed_batch<<<n, 256, 0, st_>>>(emb_, p.toks, p0, b.hist + (size_t)pslot * max_ctx_, p.X);
+    k_embed<<<nb, 256, 0, st_>>>(emb_, st, b.hist, max_ctx_, p.X + (size_t)n * E, Prefetch{});
+    run_layers(pslot, n, p0, nullptr, nullptr, false, nb);
+    // the decode rows' head and sampling, as the decode step's (final norm folded into the lm_head GEMV)
+    GemvArgs h{};
+    h.st = st; h.eps = cfg_.eps; h.w = emb_; h.ntiles = cfg_.n_vocab / 64;
+    h.resid_in = p.X + (size_t)n * E; h.o_in = p.F + (size_t)n * E; h.w_post = L_.back().post_ffn_norm;
+    h.w_pre = out_norm_; h.resid_out = nullptr;
+    h.out = b.logits;
+    launch_gemv<2048, PRO_NORM, EPI_STORE, 64, 2>(h, 0, st_, false, nb);
+    enqueue_sample(nb, st_);
+    CK(cudaMemcpyAsync(b.h_snap, b.ctrl, n_slots_ * CTRL_N * 4, cudaMemcpyDeviceToHost, st_));
+    CK(cudaGetLastError());
+    CK(cudaStreamSynchronize(st_));
+    for (int i = 0; i < nb; i++) {
+        const int* c = b.h_snap + dslots[i] * CTRL_N;
+        toks[i] = c[CTRL_TOK];
+        done[i] = c[CTRL_DONE] != 0;
+        n_past_[dslots[i]] = c[CTRL_POS];
+        pending_[dslots[i]] = c[CTRL_TOK];
+    }
+    n_past_[pslot] += n;
+    ctrl_dirty_[pslot] = true;
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    timing.prefill_ms += ms;  // the step serves both; counted once, under prefill
+    timing.prefill_tokens += n;
     timing.decode_tokens += nb;
 }
 

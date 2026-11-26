@@ -106,7 +106,13 @@ struct Request {
 // ================================================================================================
 struct SchedConfig {
     int idle_chunk = 4096;   // prompt tokens per feed() when nothing is decoding
-    int busy_chunk = 1024;   // ... while others decode (one decode step per chunk); swept: bench/server_load.py stall
+    int busy_chunk = 1024;   // ... while others decode: the largest chunk (swept: bench/server_load.py stall)
+    // mixed steps: while others decode, a prompt chunk and their decode step share one forward pass (the weights are
+    // read once). The chunk is sized so that a step takes about mixed_budget x a plain decode step (from measured
+    // step times), within [mixed_min, busy_chunk]. mixed = false: alternate a chunk and a decode step (old behaviour).
+    bool mixed = true;
+    double mixed_budget = 1.5;
+    int mixed_min = 32;
     int max_queue = 64;
     int checkpoint_every = 16384;  // extra checkpoints inside long prompts
     int max_checkpoints = 6;
@@ -168,6 +174,9 @@ private:
     std::unique_ptr<PromptCache> cache_;
     std::atomic<int> active_{-1};
     int max_ctx_ = 0, swaps_ = 0;
+    // measured step costs for sizing mixed chunks (reset when a model is loaded)
+    double dec_ms_[le::MAX_SLOTS + 1] = {};  // plain decode step, by batch size (EMA)
+    double tok_ms_ = 0;                      // per prompt token in a mixed step, beyond the decode step (EMA)
     std::thread th_;
     std::mutex qm_;
     std::condition_variable qcv_;
@@ -234,6 +243,8 @@ private:
             if (cache_) cache_->flush();
         }
         for (auto& s : slots_) { s.tokens.clear(); s.cps.clear(); s.pending = -1; s.last_use = 0; }
+        for (double& e : dec_ms_) e = 0;  // step costs are per model
+        tok_ms_ = 0;
         active_ = -1;
         cache_.reset();
         vis_.reset();
@@ -425,33 +436,38 @@ private:
         r->cv.notify_all();
     }
 
-    void prefill_one(bool decoders_active) {
+    // the next prompt chunk: the oldest admitted PREFILL slot, at most `chunk` positions, cut at the next periodic
+    // checkpoint and at the end of each image / video (a checkpoint there lets the next question about the same media,
+    // or a regeneration, resume after it instead of encoding and prefilling it again)
+    struct Chunk {
         Slot* s = nullptr;
+        int fed = 0, n = 0, target = 0, img_end = -1;
+    };
+    Chunk plan_chunk(int chunk) {
+        Chunk c;
         for (auto& x : slots_)
-            if (x.st == PREFILL && (!s || x.req->t_admit < s->req->t_admit)) s = &x;
-        if (!s) return;
-        auto& r = *s->req;
-        if (r.cancelled) { finish(*s, "stop"); return; }
-        const int target = (int)r.prompt.size() - 1;  // the last prompt token becomes the pending token
-        const int fed = (int)s->tokens.size();
-        int n = std::min(decoders_active ? cfg_.busy_chunk : cfg_.idle_chunk, target - fed);
-        // stop at the next periodic checkpoint boundary
-        const int next_cp = (fed / cfg_.checkpoint_every + 1) * cfg_.checkpoint_every;
-        if (fed + n > next_cp && next_cp < target) n = next_cp - fed;
-        // ... and at the end of each image / video: a checkpoint there lets the next question about the same media
-        // (or a regeneration) resume after it instead of encoding and prefilling it again
-        int img_end = -1;
+            if (x.st == PREFILL && (!c.s || x.req->t_admit < c.s->req->t_admit)) c.s = &x;
+        if (!c.s) return c;
+        auto& r = *c.s->req;
+        c.target = (int)r.prompt.size() - 1;  // the last prompt token becomes the pending token
+        c.fed = (int)c.s->tokens.size();
+        int n = std::min(chunk, c.target - c.fed);
+        const int next_cp = (c.fed / cfg_.checkpoint_every + 1) * cfg_.checkpoint_every;
+        if (c.fed + n > next_cp && next_cp < c.target) n = next_cp - c.fed;
         for (auto& im : r.images)
-            if (im.media_end && im.pos + im.n > fed && im.pos + im.n < target && (img_end < 0 || im.pos + im.n < img_end)) img_end = im.pos + im.n;
-        if (img_end > 0 && fed + n > img_end) n = img_end - fed;
-        if (n > 0) {
-            try {
-                feed_range(*s, r, fed, n);
-            } catch (const std::exception& ex) {
-                finish(*s, "error", ex.what());
-                return;
-            }
-            s->tokens.insert(s->tokens.end(), r.prompt.begin() + fed, r.prompt.begin() + fed + n);
+            if (im.media_end && im.pos + im.n > c.fed && im.pos + im.n < c.target && (c.img_end < 0 || im.pos + im.n < c.img_end))
+                c.img_end = im.pos + im.n;
+        if (c.img_end > 0 && c.fed + n > c.img_end) n = c.img_end - c.fed;
+        c.n = n;
+        return c;
+    }
+    // bookkeeping after positions [fed, fed + n) were fed (n may be 0): checkpoints, and DECODE at the prompt's end
+    void after_chunk(const Chunk& c) {
+        Slot* s = c.s;
+        auto& r = *s->req;
+        const int target = c.target, img_end = c.img_end;
+        if (c.n > 0) {
+            s->tokens.insert(s->tokens.end(), r.prompt.begin() + c.fed, r.prompt.begin() + c.fed + c.n);
             if (((int)s->tokens.size() % cfg_.checkpoint_every == 0 || (int)s->tokens.size() == img_end) &&
                 (int)s->tokens.size() < target)
                 add_checkpoint(*s);
@@ -465,13 +481,34 @@ private:
         }
     }
 
-    void decode_all() {
+    void prefill_one(bool decoders_active) {
+        Chunk c = plan_chunk(decoders_active ? cfg_.busy_chunk : cfg_.idle_chunk);
+        if (!c.s) return;
+        if (c.s->req->cancelled) { finish(*c.s, "stop"); return; }
+        if (c.n > 0) {
+            try {
+                feed_range(*c.s, *c.s->req, c.fed, c.n);
+            } catch (const std::exception& ex) {
+                finish(*c.s, "error", ex.what());
+                return;
+            }
+        }
+        after_chunk(c);
+    }
+
+    // DECODE slots for the next step (cancelled ones are finished here)
+    std::vector<int> decoding_slots() {
         std::vector<int> ids;
         for (auto& s : slots_) {
             if (s.st != DECODE) continue;
             if (s.req->cancelled) { finish(s, "stop"); continue; }
             ids.push_back(s.id);
         }
+        return ids;
+    }
+
+    void decode_all() {
+        const std::vector<int> ids = decoding_slots();
         if (ids.empty()) return;
         std::vector<int> toks;
         std::vector<char> done;
@@ -483,6 +520,55 @@ private:
             return;
         }
         const double dt = ms_since(t0);
+        double& e = dec_ms_[ids.size()];
+        e = e > 0 ? 0.8 * e + 0.2 * dt : dt;
+        after_decode(ids, toks, done, dt);
+    }
+
+    // prompt chunk + decode step in one forward pass (Engine::mixed_step). Returns false when this step cannot be mixed
+    // (no decoders, nothing to feed, or the chunk starts at an image): the caller then does the plain chunk + step.
+    bool mixed_step() {
+        if (!cfg_.mixed || !eng_ || eng_->decision()) return false;
+        Chunk c = plan_chunk(std::min(mixed_chunk(), eng_->max_chunk()));
+        if (!c.s || c.n <= 0 || c.s->req->cancelled) return false;
+        auto& r = *c.s->req;
+        for (int i = c.fed; i < c.fed + c.n; i++)  // text only: stop before the next image position
+            if (r.prompt[i] < 0) { c.n = i - c.fed; break; }
+        if (c.n <= 0) return false;
+        const std::vector<int> ids = decoding_slots();
+        if (ids.empty()) return false;
+        std::vector<int> toks;
+        std::vector<char> done;
+        const auto t0 = clk::now();
+        try {
+            eng_->mixed_step(c.s->id, r.prompt.data() + c.fed, c.n, ids, toks, done);
+        } catch (const std::exception& ex) {
+            finish(*c.s, "error", ex.what());
+            for (int id : ids) finish(slots_[id], "error", ex.what());
+            return true;
+        }
+        const double dt = ms_since(t0);
+        const double dec = dec_ms_[ids.size()];
+        if (dec > 0) {
+            const double per_tok = std::max(1e-4, (dt - dec) / c.n);
+            tok_ms_ = tok_ms_ > 0 ? 0.7 * tok_ms_ + 0.3 * per_tok : per_tok;
+        }
+        after_chunk(c);
+        after_decode(ids, toks, done, dt);
+        return true;
+    }
+    // chunk for a mixed step: the decode step's time budget left over, at the measured cost per prompt token
+    int mixed_chunk() const {
+        int nb = 0;
+        for (auto& s : slots_) nb += s.st == DECODE;
+        const double dec = dec_ms_[std::min(nb, le::MAX_SLOTS)] > 0 ? dec_ms_[std::min(nb, le::MAX_SLOTS)] : 10.0;
+        const double per_tok = tok_ms_ > 0 ? tok_ms_ : 0.05;
+        int c = (int)((cfg_.mixed_budget - 1.0) * dec / per_tok);
+        c = c / 32 * 32;
+        return std::max(cfg_.mixed_min, std::min(c, cfg_.busy_chunk));
+    }
+
+    void after_decode(const std::vector<int>& ids, const std::vector<int>& toks, const std::vector<char>& done, double dt) {
         for (size_t i = 0; i < ids.size(); i++) {
             Slot& s = slots_[ids[i]];
             auto& r = *s.req;
@@ -514,8 +600,10 @@ private:
             admit();
             bool decoders = false, prefills = false;
             for (auto& s : slots_) { decoders |= s.st == DECODE; prefills |= s.st == PREFILL; }
-            if (prefills) prefill_one(decoders);
-            decode_all();
+            if (!(prefills && decoders && mixed_step())) {
+                if (prefills) prefill_one(decoders);
+                decode_all();
+            }
             update_stats();
         }
         for (auto& s : slots_)
@@ -1207,6 +1295,11 @@ static void usage() {
             "  --reasoning-preserve       keep reasoning of earlier assistant turns in the prompt\n"
             "  --busy-chunk N             prompt tokens per step while others decode (default 1024; 512 = smoother streams, slower new prompts)\n"
             "  --idle-chunk N             prompt tokens per step otherwise (default 4096)\n"
+            "  --no-mixed                 while others decode, alternate a prompt chunk and a decode step instead of\n"
+            "                             running both in one pass (mixed steps, the default)\n"
+            "  --mixed-budget F           mixed step time target as a multiple of a plain decode step (default 1.5;\n"
+            "                             lower = faster streams while a prompt is fed, slower prompt)\n"
+            "  --mixed-min N              smallest prompt chunk of a mixed step (default 32)\n"
             "  --max-queue N              queued requests before 503 (default 64)\n"
             "  --cache-ram-mib N          RAM prompt-cache tier (default 4096, 0 = off)\n"
             "  --cache-disk-mib N         disk prompt-cache tier (default 16384, 0 = off)\n"
@@ -1275,6 +1368,9 @@ int main(int argc, char** argv) {
         else if (a == "--repeat-last-n") ov.last_n = std::stoi(next());
         else if (a == "--reasoning-preserve") scfg.reasoning_preserve = true;
         else if (a == "--busy-chunk") sch.busy_chunk = std::stoi(next());
+        else if (a == "--no-mixed") sch.mixed = false;
+        else if (a == "--mixed-budget") sch.mixed_budget = std::stod(next());
+        else if (a == "--mixed-min") sch.mixed_min = std::stoi(next());
         else if (a == "--idle-chunk") sch.idle_chunk = std::stoi(next());
         else if (a == "--max-queue") sch.max_queue = std::stoi(next());
         else if (a == "--cache-ram-mib") cache_ram = std::stol(next());
