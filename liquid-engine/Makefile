@@ -16,7 +16,7 @@ tests: $(BUILD)/test_engine_api $(BUILD)/test_chat $(BUILD)/test_vision $(BUILD)
 $(BUILD):
 	mkdir -p $(BUILD)
 
-$(BUILD)/engine.o: src/engine.cu src/engine.h src/kernels.cuh src/prefill.cuh src/gemm.cuh src/repack.cuh src/gguf.h | $(BUILD)
+$(BUILD)/engine.o: src/engine.cu src/engine.h src/kernels.cuh src/prefill.cuh src/flash8.cuh src/gemm.cuh src/repack.cuh src/gguf.h | $(BUILD)
 	$(NVCC) $(NVFLAGS) -c $< -o $@
 
 $(BUILD)/vision.o: src/vision.cu src/vision.h src/engine.h src/kernels.cuh src/gemm.cuh src/repack.cuh src/gguf.h | $(BUILD)
@@ -95,3 +95,7 @@ clean:
 	rm -rf $(BUILD)
 
 .PHONY: all tests clean webtools webui
+
+# kernel check for the int8/FP8 prefill flash attention (needs the GPU)
+$(BUILD)/flash8_check: tests/flash8_check.cu src/engine.cu src/flash8.cuh src/prefill.cuh src/gemm.cuh src/kernels.cuh | $(BUILD)
+	$(NVCC) $(NVFLAGS) $< -o $@

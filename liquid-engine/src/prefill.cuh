@@ -3,6 +3,7 @@
 #pragma once
 #include <cstdint>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 
 #include "engine.h"
 #include "kernels.cuh"
@@ -17,6 +18,8 @@ struct PrefillBufs {
     int8_t *xq = nullptr, *yq = nullptr, *aq = nullptr;                // [T][E], [T][E], [T][FF]
     float *xd = nullptr, *yd = nullptr, *ad = nullptr;
     half* qh = nullptr;                                                // [T][16][128]
+    int8_t* q8 = nullptr;   // int8 queries [T][16][128] (aliases qh; the int8 flash path)
+    float* qs8 = nullptr;   // their scales [T][16] (softmax scale and log2(e) folded in; aliases qh)
     int* toks = nullptr;
     int* h_toks = nullptr;                                             // pinned
 };
@@ -29,6 +32,8 @@ inline void prefill_alloc(PrefillBufs& p, const Config& c, int tmax, Alloc alloc
     p.xq = (int8_t*)alloc(T * E); p.yq = (int8_t*)alloc(T * E); p.aq = (int8_t*)alloc(T * F);
     p.xd = (float*)alloc(T * E / 32 * 4); p.yd = (float*)alloc(T * E / 32 * 4); p.ad = (float*)alloc(T * F / 32 * 4);
     p.qh = (half*)alloc(T * 16 * 128 * 2);
+    p.q8 = (int8_t*)p.qh;
+    p.qs8 = (float*)(p.q8 + T * 16 * 128);
     p.toks = (int*)alloc(T * 4);
     cudaMallocHost(&p.h_toks, T * 4);
 }
@@ -151,9 +156,12 @@ __global__ void k_conv_state_update(const float* bcx, int T, float* state) {
 }
 
 // q/k RMS norm + NEOX rope; q -> qh (f16, pre-scaled by 1/sqrt(128)), k/v -> cache (f16)
+// With q8out: q -> int8 [t][16][128] with one scale per (token, head) in qs8 (times 1/sqrt(128) * log2(e)), for
+// k_flash_prefill8; qh is not written.
 __global__ void __launch_bounds__(768) k_qk_rope_cache(const float* qkvg, int p0, const float* qn, const float* kn,
                                                        const float* ff, float base, float eps, half* qh, void* kc,
-                                                       void* vc, half* ks, half* vs, int cap, bool q8) {
+                                                       void* vc, half* ks, half* vs, int cap, bool q8,
+                                                       int8_t* q8out = nullptr, float* qs8 = nullptr) {
     const int t = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int pos = p0 + t;
     const float* row = qkvg + (size_t)t * 3088;
@@ -163,8 +171,18 @@ __global__ void __launch_bounds__(768) k_qk_rope_cache(const float* qkvg, int p0
         x[0] = v.x; x[1] = v.y; x[2] = v.z; x[3] = v.w;
         rope_norm4(x, qn, ff, base, eps, pos, lane);
         const float s = rsqrtf(128.f);
-        half* dst = qh + ((size_t)t * 16 + warp) * 128 + lane * 4;
-        *(uint2*)dst = make_uint2(pack_h2(x[0] * s, x[1] * s), pack_h2(x[2] * s, x[3] * s));
+        if (q8out) {
+            const float amax = warp_max(fmaxf(fmaxf(fabsf(x[0]), fabsf(x[1])), fmaxf(fabsf(x[2]), fabsf(x[3]))));
+            const float d = amax / 127.f, id = d > 0.f ? 1.f / d : 0.f;
+            char4 q;
+            q.x = (int8_t)roundf(x[0] * id); q.y = (int8_t)roundf(x[1] * id);
+            q.z = (int8_t)roundf(x[2] * id); q.w = (int8_t)roundf(x[3] * id);
+            *(char4*)(q8out + ((size_t)t * 16 + warp) * 128 + lane * 4) = q;
+            if (lane == 0) qs8[(size_t)t * 16 + warp] = d * s * 1.4426950408889634f;
+        } else {
+            half* dst = qh + ((size_t)t * 16 + warp) * 128 + lane * 4;
+            *(uint2*)dst = make_uint2(pack_h2(x[0] * s, x[1] * s), pack_h2(x[2] * s, x[3] * s));
+        }
     } else if (warp < 20) {
         const int h = warp - 16;
         float4 v = *(const float4*)(row + 2048 + h * 128 + lane * 4);

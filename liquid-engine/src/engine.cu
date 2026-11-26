@@ -873,6 +873,7 @@ __global__ void __launch_bounds__(1024) k_select(const float* logits0, int n, Sl
 
 }  // namespace le
 #include "prefill.cuh"
+#include "flash8.cuh"
 namespace le {
 
 // ================================================================================================
@@ -1602,9 +1603,12 @@ void Engine::run_layers(int slot, int T, int p0, const int* grp, const int* gspa
                 void* vc = (uint8_t*)l.vc + slot * l.kv_slot_bytes;
                 half* ks = l.ks ? l.ks + slot * l.kvs_slot_elems : nullptr;
                 half* vs = l.vs ? l.vs + slot * l.kvs_slot_elems : nullptr;
+                // q8 KV: int8 QK^T + FP8 PV flash attention (flash8.cuh); LIQUID_FA16=1 keeps the f16 kernel
+                static const bool fa16 = getenv("LIQUID_FA16") != nullptr;
+                const bool fa8 = kv_q8_ && !fa16;
                 k_qk_rope_cache<<<T, 768, 0, st_>>>(p.big, p0, l.q_norm, l.k_norm, l.rope_ff,
                                                     l.swa ? cfg_.rope_base_swa : cfg_.rope_base, eps, p.qh, kc, vc,
-                                                    ks, vs, l.cap, kv_q8_);
+                                                    ks, vs, l.cap, kv_q8_, fa8 ? p.q8 : nullptr, p.qs8);
                 prof_mark("attn.rope+kv_write", st_);
                 {
                     static bool fa_init = false;
@@ -1613,11 +1617,19 @@ void Engine::run_layers(int slot, int T, int p0, const int* grp, const int* gspa
                         CK(cudaFuncSetAttribute(k_flash_prefill<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)FA_SMEM));
                         CK(cudaFuncSetAttribute(k_flash_prefill<true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)FA_SMEM));
                         CK(cudaFuncSetAttribute(k_flash_prefill<false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)FA_SMEM));
+                        CK(cudaFuncSetAttribute(k_flash_prefill8<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)f8::SMEM));
+                        CK(cudaFuncSetAttribute(k_flash_prefill8<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)f8::SMEM));
                         fa_init = true;
                     }
                     const dim3 fg((T + FA_BQ - 1) / FA_BQ, 4);
                     const int W = l.swa ? cfg_.swa_window : 0;
-                    if (grp && !l.swa) {  // decision model, global layer: group mask, no causal mask
+                    if (fa8) {
+                        const int2* gs = (const int2*)gspan;
+                        if (grp && !l.swa)
+                            k_flash_prefill8<true><<<fg, 256, f8::SMEM, st_>>>(p.q8, p.qs8, p.big, kc, vc, ks, vs, l.cap, 0, p0, T, p.yq, p.yd, grp, gs, prefix_all);
+                        else
+                            k_flash_prefill8<false><<<fg, 256, f8::SMEM, st_>>>(p.q8, p.qs8, p.big, kc, vc, ks, vs, l.cap, W, p0, T, p.yq, p.yd);
+                    } else if (grp && !l.swa) {  // decision model, global layer: group mask, no causal mask
                         const int2* gs = (const int2*)gspan;
                         if (kv_q8_) k_flash_prefill<true, true><<<fg, 256, FA_SMEM, st_>>>(p.qh, p.big, kc, vc, ks, vs, l.cap, 0, p0, T, p.yq, p.yd, grp, gs, prefix_all);
                         else k_flash_prefill<false, true><<<fg, 256, FA_SMEM, st_>>>(p.qh, p.big, kc, vc, ks, vs, l.cap, 0, p0, T, p.yq, p.yd, grp, gs, prefix_all);
