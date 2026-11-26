@@ -89,6 +89,11 @@ int main(int argc, char** argv) {
         // boundaries, so its logits and tokens must be IDENTICAL; the decode rows run k_mhc + the GEMMs instead of the
         // small-batch mHC + GEMVs, so on this (numerically chaotic) model they may part ways: reported, not failed.
         const int C = mixed_chunk, P = prefill_n > 0 ? prefill_n : 3000, G = n;
+        if (C <= 16 || (P % C > 0 && P % C <= 16)) {
+            fprintf(stderr, "--test-mixed: every prompt chunk must have more than 16 rows (--chunk > 16, prefill %% chunk "
+                            "0 or > 16), else it takes the decode path and differs from the reference by design\n");
+            return 1;
+        }
         raon::Engine eng(model, 3, P + G + 1024);
         const int V = eng.cfg().n_vocab;
         auto synth = [](int n_, uint32_t seed) {

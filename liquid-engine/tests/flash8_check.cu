@@ -47,7 +47,7 @@ Data make_data(const Case& c, std::mt19937& rng) {
     std::vector<float> row(128);
     const int first = c.window ? std::max(0, npos - d.cap) : 0;
     for (int pos = first; pos < npos; pos++) {
-        const float vdrift = std::exp(0.7f * N(rng));
+        const float vdrift = pos == first ? 0.02f : std::exp(0.7f * N(rng));
         for (int h = 0; h < 4; h++) {
             const size_t r = (size_t)h * d.cap + pos % d.cap;
             for (int i = 0; i < 128; i++) row[i] = N(rng) * kmag[h * 128 + i];
@@ -61,9 +61,11 @@ Data make_data(const Case& c, std::mt19937& rng) {
     for (int t = 0; t < c.T; t++)
         for (int qh = 0; qh < 16; qh++) {
             const int h = qh / 4;
-            const int tgt = std::max(first, (int)(rng() % (c.p0 + t + 1)));
+            const int lo_vis = c.window ? std::max(0, c.p0 + t - c.window + 1) : 0;
+            const bool sink = lo_vis == first && rng() % 3 == 0;   // the sink key is visible to this query
+            const int tgt = sink ? first : std::max(first, (int)(rng() % (c.p0 + t + 1)));
             const size_t r = (size_t)h * d.cap + tgt % d.cap;
-            const float a = 0.25f * (rng() % 4);
+            const float a = sink ? 1.5f : 0.25f * (rng() % 4);
             for (int i = 0; i < 128; i++) {
                 const float kd = d.kq[r * 128 + i] * __half2float(d.ksc[r * 4 + i / 32]);
                 d.q[((size_t)t * 16 + qh) * 128 + i] = 0.6f * N(rng) + a * kd / (kmag[h * 128 + i] * kmag[h * 128 + i]);
@@ -149,6 +151,8 @@ struct Dev {
     }
     void run(bool fp8, const Case& c, int cap) {
         const dim3 fg((T + FA_BQ - 1) / FA_BQ, 4);
+        CK(cudaMemset(oq, 0x80, (size_t)T * 2048));     // -128 everywhere
+        CK(cudaMemset(od, 0xFF, (size_t)T * 64 * 4));   // NaN scales: an unwritten block fails the comparison
         if (fp8)
             k_flash_prefill8<false><<<fg, 256, f8::SMEM>>>(q8, qs8, qkvg, kq, vq, ksc, vsc, cap, c.window, c.p0, T, oq, od);
         else
@@ -169,6 +173,7 @@ struct Err { double rel_rms, rel_max; };
 Err compare(const std::vector<double>& got, const std::vector<double>& ref) {
     double se = 0, sr = 0, mx = 0, rmax = 0;
     for (size_t i = 0; i < ref.size(); i++) {
+        if (!std::isfinite(got[i])) return {INFINITY, INFINITY};
         se += (got[i] - ref[i]) * (got[i] - ref[i]);
         sr += ref[i] * ref[i];
         mx = std::max(mx, std::fabs(got[i] - ref[i]));

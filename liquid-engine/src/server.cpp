@@ -177,6 +177,7 @@ private:
     // measured step costs for sizing mixed chunks (reset when a model is loaded)
     double dec_ms_[le::MAX_SLOTS + 1] = {};  // plain decode step, by batch size (EMA)
     double tok_ms_ = 0;                      // per prompt token in a mixed step, beyond the decode step (EMA)
+    int mixed_run_ = 0;                      // mixed steps since the last plain decode step
     std::thread th_;
     std::mutex qm_;
     std::condition_variable qcv_;
@@ -245,6 +246,7 @@ private:
         for (auto& s : slots_) { s.tokens.clear(); s.cps.clear(); s.pending = -1; s.last_use = 0; }
         for (double& e : dec_ms_) e = 0;  // step costs are per model
         tok_ms_ = 0;
+        mixed_run_ = 0;
         active_ = -1;
         cache_.reset();
         vis_.reset();
@@ -522,6 +524,7 @@ private:
         const double dt = ms_since(t0);
         double& e = dec_ms_[ids.size()];
         e = e > 0 ? 0.8 * e + 0.2 * dt : dt;
+        mixed_run_ = 0;
         after_decode(ids, toks, done, dt);
     }
 
@@ -553,9 +556,17 @@ private:
             const double per_tok = std::max(1e-4, (dt - dec) / c.n);
             tok_ms_ = tok_ms_ > 0 ? 0.7 * tok_ms_ + 0.3 * per_tok : per_tok;
         }
+        mixed_run_++;
         after_chunk(c);
         after_decode(ids, toks, done, dt);
         return true;
+    }
+    // the mixed chunk is sized from the plain decode step time: measure it when it is unknown for this batch size,
+    // and refresh it every 16 mixed steps (the decoders' contexts grow during a long prompt)
+    bool need_decode_sample() const {
+        int nb = 0;
+        for (auto& s : slots_) nb += s.st == DECODE;
+        return dec_ms_[std::min(nb, le::MAX_SLOTS)] <= 0 || mixed_run_ >= 16;
     }
     // chunk for a mixed step: the decode step's time budget left over, at the measured cost per prompt token
     int mixed_chunk() const {
@@ -600,7 +611,9 @@ private:
             admit();
             bool decoders = false, prefills = false;
             for (auto& s : slots_) { decoders |= s.st == DECODE; prefills |= s.st == PREFILL; }
-            if (!(prefills && decoders && mixed_step())) {
+            if (prefills && decoders && cfg_.mixed && need_decode_sample()) {
+                decode_all();
+            } else if (!(prefills && decoders && mixed_step())) {
                 if (prefills) prefill_one(decoders);
                 decode_all();
             }

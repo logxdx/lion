@@ -378,6 +378,13 @@ private:
             if (s.st == PREFILL && (!pf || s.seq < pf->seq)) pf = &s;
             decoding |= s.st == DECODE;
         }
+        // the mixed chunk is sized from the decode step time: measure it (a decode-only step) when it is unknown for
+        // this batch size, and refresh it every 16 mixed steps (the decoders' contexts grow during a long prompt)
+        int ndec = 0;
+        for (const Slot& s : slots_) ndec += s.st == DECODE;
+        const bool sample_decode = dec_ms_[std::min(ndec, 64)] <= 0 || mixed_run_ >= 16;
+        if (pf && decoding && opt_.mixed && sample_decode) pf = nullptr;
+        if (pf && decoding && opt_.mixed && mixed_chunk(ndec) <= 16) pf = nullptr, mixed_run_ = 0;   // no room: decode
         if (pf && decoding && opt_.mixed) {
             // one mixed step: a prompt chunk of the oldest request in prefill + every generating request's next token
             std::vector<Row> drows;
@@ -404,6 +411,7 @@ private:
                 const double per_row = std::max(1e-4, (dt - dec) / (end - n0));
                 row_ms_ = row_ms_ > 0 ? 0.7 * row_ms_ + 0.3 * per_row : per_row;
             }
+            mixed_run_++;
             const int k = end == P ? 1 : 0;
             after_prefill(s, n0, end, ck, k ? &out[0] : nullptr);
             for (size_t i = 0; i < who.size(); i++) {
@@ -414,7 +422,7 @@ private:
         }
         // one prefill chunk: the oldest request still in prefill. While others are generating (--no-mixed), prefill
         // gets `prefill_share` of the time: after a chunk that took t, decode-only steps run for t * (1 - share) / share.
-        if (pf && decoding && Clock::now() < next_prefill_) pf = nullptr;
+        if (pf && decoding && (opt_.mixed || Clock::now() < next_prefill_)) pf = nullptr;
         if (pf) {
             const auto tp0 = Clock::now();
             Slot& s = *pf;
@@ -441,8 +449,13 @@ private:
         const auto t0 = Clock::now();
         const auto out = eng_->step(rows, in);
         const double dt = ms_since(t0);
-        double& e = dec_ms_[std::min((int)rows.size(), 64)];
-        e = e > 0 ? 0.8 * e + 0.2 * dt : dt;
+        // the first step of a batch size captures its CUDA graph: not a sample
+        const int bs = std::min((int)rows.size(), 64);
+        if (dec_seen_[bs]++) {
+            double& e = dec_ms_[bs];
+            e = e > 0 ? 0.8 * e + 0.2 * dt : dt;
+        }
+        mixed_run_ = 0;
         for (size_t i = 0; i < who.size(); i++) {
             Slot& s = *who[i];
             s.cached.push_back(s.last);
@@ -464,6 +477,8 @@ private:
     Clock::time_point next_prefill_ = Clock::now();
     double dec_ms_[65] = {};   // decode step time by batch size (EMA), for sizing mixed chunks
     double row_ms_ = 0;        // per prompt row in a mixed step, beyond the decode rows (EMA)
+    int dec_seen_[65] = {};    // decode steps seen per batch size
+    int mixed_run_ = 0;        // mixed steps since the last decode-only step
     std::mutex info_mu_;
     json info_ = json::array();
     std::string vram_;
