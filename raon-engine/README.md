@@ -212,9 +212,14 @@ They cost 0.10-0.13 ms per step for 4 rows (`tests/sample_bench.cu`). At 4 × 12
   weights are read once for both; the prompt rows take the expanded (flash) attention, the decode rows the absorbed
   decode attention on their own slots; mHC, the GEMMs and the delta-rule conv / scan (per segment) serve all rows.
   The chunk is sized from measured step times so a mixed step takes about `--mixed-budget` (default 1.5) x a
-  decode step, within [`--mixed-min` 32, `--chunk-busy` 2,048]. NOT YET MEASURED ON THE GPU (2026-11-26):
-  `tests/validate_mixed.sh`; `build/raon --test-mixed` (the fed prompt must match a plain prefill exactly) and
-  `build/raon --bench-mixed`.
+  decode step, within [`--mixed-min` 32, `--chunk-busy` 2,048], rounded so that prompt + decode rows fill whole
+  128-row GEMM tiles. `build/raon --test-mixed`: the fed prompt matches a plain prefill exactly (logits max |diff|
+  0). Measured 2026-11-27 (`build/raon --bench-mixed --slots 3 --depth 131072`, Q6_K, 4752 of 5822 MiB): a
+  128-row mixed step takes 37.1 ms vs 41.1 ms for the chunk + decode step (+11 % per stream, 27.0 vs 24.3 t/s;
+  prompt +8 %), equal from 1024 rows. The gain is small because a raon decode step at 128k is mostly each stream
+  reading its own latent cache (not shared) and the Q6_K GEMM is compute-bound per 128-row tile; the point is that
+  streams get a token every ~37 ms instead of stalling behind 2,048-token chunks. Decode (4 x 128k) and prefill
+  (32k) unchanged vs main; greedy output bit-identical.
 - `--no-mixed`: the old policy. Each iteration runs at most one prefill chunk (2,048 tokens), then one batched
   decode step over all generating requests; prefill gets `--prefill-share` of the GPU time (default 0.5).
 - A client disconnect cancels its request.

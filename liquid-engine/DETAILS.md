@@ -165,12 +165,24 @@ How it works:
   prompt chunk and one token of every decoding slot go through one forward pass, so the weights are streamed once
   for both (the decode rows use the decode attention kernel on their own slots, everything else is shared). The
   chunk is sized from measured step times so a mixed step takes about `--mixed-budget` (default 1.5) x a plain
-  decode step, within [`--mixed-min` 32, `--busy-chunk` 1024]; `--no-mixed` restores the old alternation (one
-  decode step after every `--busy-chunk` prompt tokens). Mixed decode rows go through the int8 GEMMs instead of
-  the decode GEMVs, so their logits can differ from a plain decode step's in the last bits (the fed prompt is
-  bit-identical to a plain prefill: `build/liquid --test-mixed`). `build/liquid --bench-mixed` measures decode,
-  chunk and mixed step times per chunk size. NOT YET MEASURED ON THE GPU (2026-11-26):
-  `bench/validate_fp8_mixed.sh`. Finished sequences leave the batch at once.
+  decode step, within [`--mixed-min` 32, `--busy-chunk` 1024], rounded so that prompt rows + decode rows fill
+  whole 128-row GEMM tiles (up to 128 rows cost about what 32 do; one row past a multiple adds a tile). `--no-mixed`
+  restores the old alternation (one decode step after every `--busy-chunk` prompt tokens). Mixed decode rows go
+  through the int8 GEMMs instead of the decode GEMVs, so their logits can differ from a plain decode step's in the
+  last bits (a greedy stream may part ways at a near-tie; the fed prompt is bit-identical to a plain prefill:
+  `build/liquid --test-mixed`). Measured 2026-11-27 (`build/liquid --bench-mixed --parallel 3 --pp 32768`, Q8_0,
+  3 streams decoding at 32k, alone 12 ms/step = 83 t/s/stream; 2.8-3.6 GiB VRAM):
+
+  | prompt depth, chunk rows | alternating: t/s/stream, prompt t/s | mixed: t/s/stream, prompt t/s |
+  |---|---|---|
+  | 0, 128 | 37.7, 4826 | 53.0, 6620 |
+  | 0, 256 | 28.3, 7246 | 34.9, 8832 |
+  | 0, 1024 | 10.0, 10222 | 10.5, 10758 |
+  | 64k, 128 | 23.8, 3043 | 29.7, 3715 |
+  | 64k, 1024 | 5.0, 5103 | 5.2, 5261 |
+
+  With a deep prompt its own attention dominates a step; chunks under 128 rows do not help there because the flash
+  kernel then has too few query blocks (split-K over the keys would). Finished sequences leave the batch at once.
 - **Prefix reuse**: LFM3's conv layers cannot be rewound, so every slot keeps state checkpoints (conv state + the
   256-token sliding-window KV, ~1.9 MB) at the end of each prompt and every 16k tokens; a new request resumes from
   the newest checkpoint inside its shared prefix. All restore paths are bit-identical (`tests/test_engine_api.cpp`).
@@ -368,10 +380,17 @@ times its phases).
 - With the q8 KV cache (default), prefill attention runs `k_flash_prefill8` (`src/flash8.cuh`): QK^T on int8
   m16n8k32 (int8 queries with one scale per token and head; K as stored, one k32 step = one q8_0 block, scaled by
   its block scale) and P.V on FP8 e4m3 m16n8k32 with f16 accumulation per 64-key tile (P' = 448 P; V' scaled per
-  tile and 32-dim block by the largest q8 scale, so the f16 sum cannot overflow), raon-engine's recipe. Expected
-  ~2x the attention throughput (int8 / FP8 run at 4x the f32-accumulate f16 rate). `LIQUID_FA16=1` selects the
-  f16 kernel. Checks: `build/flash8_check` (both kernels vs an f64 reference, and their times),
-  `tests/kv_compare.py`. NOT YET MEASURED ON THE GPU (2026-11-26).
+  tile and 32-dim block by the largest q8 scale, so the f16 sum cannot overflow), raon-engine's recipe. A 3-stage
+  cp.async ring feeds it (each thread copies exactly the V bytes and scales it later converts: one barrier per
+  tile); fully visible tiles skip the masks; the query scale is folded into the exp2 FMA; O is not rescaled when no
+  row max moved. Measured 2026-11-27: 1.31-1.34x the f16 kernel (`build/flash8_check` 32k / 128k;
+  `LIQUID_FA_ALT=1 build/liquid --profile` times both side by side in one run: 392 vs 511 ms over 3 layers at
+  32k), prefill +7 % at 32k, +18 % at 128k (4499 -> 5315 t/s, 3 interleaved rounds vs main), 2k prefill and decode
+  unchanged. Not 2x: ablations show the tensor-core math is a small part; latency (8 warps per SM at 255 / 249
+  registers) and the per-score work dominate, in the f16 kernel too. Accuracy: attention output error vs an f64
+  reference 2.7-3.1 % rms (f16 kernel 0.6-0.9 %, mostly the int8 output); next-token top-5 vs exact
+  (`tests/fa8_compare.py`, 20 prompts of 0.5-6k tokens, q8 KV): mean max |dp| 0.0165 vs 0.0142 with the f16 kernel,
+  argmax 20/20 for both (worse on 11, better on 9 prompts). `LIQUID_FA16=1` selects the f16 kernel.
 
 ## Tests
 
