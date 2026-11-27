@@ -4,7 +4,7 @@
   "start_timeout_s": 300,
   "default_model": "lfm3",
   "ui_dir": ["webui", "build/webui"],
-  "tools_dir": ["tools/webtools", "servers/liquine/tools/webtools"],
+  "tools_dir": "tools/webtools",
   "node": "node",
   "tool_timeout_s": 300,
   "state_dir": "~/.cache/lion",

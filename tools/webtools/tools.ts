@@ -1,4 +1,5 @@
-// web_search / web_fetch as raon-server built-in tools, on the code vendored from the pi extensions
+// web_search / web_fetch / pdf as built-in server tools of liquid-server, raon-server and lion (one shared copy),
+// on the code vendored from the pi extensions
 // (providers.ts, fetch.ts) and the pdf-reader skill (pdf). Names, descriptions, parameters and result text match the pi tools.
 // The wire format is llama-server's server tools (GET/POST /tools, the same as get_info):
 //
@@ -79,7 +80,7 @@ const TOOLS = [
 // pdf: the pi pdf-reader skill's `pdf` command (vendored as ./pdf; wraps liteparse, caches per file, limits output)
 const PDF_SCRIPT = path.join(path.dirname(fileURLToPath(import.meta.url)), "pdf");
 const PDF_TIMEOUT_MS = 600_000;
-const PDF_DOWNLOADS = path.join(os.tmpdir(), "raon-pdf-downloads");
+const PDF_DOWNLOADS = path.join(os.tmpdir(), "lion-pdf-downloads");
 
 function findOnPath(bin: string, extra: string[] = []): string | null {
 	for (const d of [...(process.env.PATH ?? "").split(path.delimiter), ...extra]) {

@@ -25,9 +25,9 @@ assets: $(UI_TAR)
 	rm -rf $(BUILD)/webui-src && mkdir -p $(BUILD)/webui-src && tar -xzf $(UI_TAR) -C $(BUILD)/webui-src
 	python3 brand/build_assets.py $(BUILD)/webui-src
 
-# node dependencies of the server tools the gateway runs (shared with liquid-engine)
+# node dependencies of the server tools (the repo's one copy, tools/webtools, shared with both engines)
 webtools:
-	$(MAKE) -C ../liquid-engine webtools
+	cd ../tools/webtools && npm ci --no-audit --no-fund
 
 clean:
 	rm -rf $(BUILD)

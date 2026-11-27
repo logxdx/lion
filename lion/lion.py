@@ -364,7 +364,8 @@ class Gateway:
         self.tools = None
         if not args.no_tools and cfg.get("tools", True):
             # tools_dir: a directory or a list of candidates; the first with its node dependencies installed is used
-            cands = cfg.get("tools_dir", ["tools/webtools", "servers/liquine/tools/webtools"])
+            # (the repo and the install both have the one shared copy at tools/webtools)
+            cands = cfg.get("tools_dir", "tools/webtools")
             cands = [path_of(base, d) for d in ([cands] if isinstance(cands, str) else cands)]
             tdir = next((d for d in cands if os.path.isdir(os.path.join(d, "node_modules"))), cands[0])
             self.tools = Tools(tdir, cfg.get("node", "node"), cfg.get("tool_timeout_s", 300))

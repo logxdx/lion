@@ -1,0 +1,12 @@
+{
+	"name": "lion-webtools",
+	"private": true,
+	"type": "module",
+	"description": "web_search / web_fetch / pdf server tools for liquid-server, raon-server and lion (code vendored from the pi web-search and web-fetch extensions)",
+	"dependencies": {
+		"@mozilla/readability": "0.5.0",
+		"linkedom": "0.16.11",
+		"turndown": "7.2.4",
+		"unpdf": "1.4.0"
+	}
+}

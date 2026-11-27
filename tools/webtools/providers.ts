@@ -156,7 +156,7 @@ async function fetchText(url: string, signal?: AbortSignal): Promise<string> {
 	let res: Response;
 	try {
 		res = await fetch(url, {
-			headers: { "User-Agent": "raon-web-search/1.0 (local tool)" },
+			headers: { "User-Agent": "lion-web-search/1.0 (local tool)" },
 			signal: AbortSignal.any([AbortSignal.timeout(TIMEOUT_MS), ...(signal ? [signal] : [])]),
 		});
 	} catch (err) {

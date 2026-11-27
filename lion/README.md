@@ -37,7 +37,7 @@ time the model's server ran, or built from `backends.json`. Server logs are in `
 
 ```sh
 make webui                 # the Lion web UI bundle (pinned llama.cpp release, checksum-verified)
-make webtools              # node dependencies of the tools (in servers/liquine/tools/webtools)
+make webtools              # node dependencies of the tools (the repo's tools/webtools, shared with both engines)
 ./serve.sh                 # or: python3 lion.py --config backends.json [--listen host:port] [--idle S] [--no-tools]
 ```
 
