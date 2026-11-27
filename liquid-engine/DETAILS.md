@@ -181,6 +181,11 @@ How it works:
   | 64k, 128 | 23.8, 3043 | 29.7, 3715 |
   | 64k, 1024 | 5.0, 5103 | 5.2, 5261 |
 
+  Live server (`bench/server_load.py stall`: 3 streams decoding, alone 8.6 ms per token, then a ~30k-token
+  prompt arrives; 4 slots x 64k, Q8_0): while the prompt is prefilled the streams get 166.6 t/s in total (median
+  gap 18 ms, worst 25 ms) with mixed steps, vs 26.9 t/s (median 116 ms, worst 144 ms) on main and 28.7 t/s with
+  `--no-mixed`; the prompt's first token comes after 4.0 s instead of 3.0 s (`--mixed-budget` sets this trade-off).
+
   With a deep prompt its own attention dominates a step; chunks under 128 rows do not help there because the flash
   kernel then has too few query blocks (split-K over the keys would). Finished sequences leave the batch at once.
 - **Prefix reuse**: LFM3's conv layers cannot be rewound, so every slot keeps state checkpoints (conv state + the
