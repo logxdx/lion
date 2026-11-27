@@ -1,0 +1,15 @@
+{
+  "listen": "127.0.0.1:11444",
+  "idle_unload_s": 6,
+  "start_timeout_s": 30,
+  "default_model": "a1",
+  "ui_dir": "../build/webui",
+  "tools": false,
+  "state_dir": "/tmp/lion-test",
+  "backends": [
+    {"name": "fakeA", "command": ["python3", "fake_backend.py", "--port", "11600", "--name", "fakeA"], "port": 11600,
+     "models": [{"id": "a1", "n_ctx": 4096}, {"id": "a2", "n_ctx": 4096}]},
+    {"name": "fakeB", "command": ["python3", "fake_backend.py", "--port", "11601", "--name", "fakeB"], "port": 11601,
+     "models": [{"id": "b1", "n_ctx": 8192}]}
+  ]
+}

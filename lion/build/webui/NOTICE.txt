@@ -1,0 +1,2 @@
+This web UI is llama.cpp's (https://github.com/ggml-org/llama.cpp, ui/apps/chat), MIT License,
+Copyright (c) 2023-2026 The ggml authors. Rebranded for Lion by brand/rebrand.py.
