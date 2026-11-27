@@ -8,6 +8,8 @@
   "node": "node",
   "tool_timeout_s": 300,
   "state_dir": "~/.cache/lion",
+  "system_prompt_file": "system_prompt.md",
+  "ui_settings": {},
   "backends": [
     {
       "name": "liquid-engine",

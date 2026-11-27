@@ -51,11 +51,23 @@ symlinks to `../liquid-engine` and `../raon-engine`. Add another server by editi
 
 `ui_dir` and `tools_dir` take a list of candidates; the first present wins (`webui`, then `build/webui`).
 
+**Web UI defaults** (nothing is built into the code; edit the files, no restart needed: they are read at each page
+load):
+
+- `system_prompt_file` (default `system_prompt.md`): its text becomes the UI's default system message. The shipped
+  one asks for math as `$...$` / `$$...$$`, never in code blocks, so formulas render (KaTeX) instead of showing as
+  code. An empty file means no default.
+- `ui_settings`: any other setting of the UI's Settings dialog, by its key (e.g. `{"theme": "dark"}`).
+
+The UI applies these defaults on a browser's first visit and on Settings → "Reset to default"; anything changed in
+the Settings dialog stays the user's own. A browser that used the UI before keeps its saved settings until reset.
+
 **Installed copy.** Everything lives under `~/lion`, and lion starts as `lion` (`~/.local/bin/lion` → `~/lion/serve.sh`):
 
 ```
 ~/lion/
   serve.sh  lion.py  backends.json  README.md    the gateway
+  system_prompt.md                              the web UI's default system message (editable)
   webui/                                        the Lion web UI
   tools/webtools/                               web_search, web_fetch, pdf (one copy, shared)
   servers/liquine/                              liquid-server, liquid, its web UI; serve.sh  (liquid-serve)

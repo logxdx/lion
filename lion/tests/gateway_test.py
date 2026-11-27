@@ -72,6 +72,9 @@ def models_running():
 
 if os.path.exists("/tmp/lion-test/props.json"):   # this test's own props cache, from an earlier run
     os.remove("/tmp/lion-test/props.json")
+PROMPT = "/tmp/lion-test/system_prompt.txt"   # fake_backends.json: system_prompt_file
+os.makedirs("/tmp/lion-test", exist_ok=True)
+open(PROMPT, "w").write("Use LaTeX for math.\n")
 gw = subprocess.Popen([sys.executable, os.path.join(HERE, "..", "lion.py"), "--config", os.path.join(HERE, "fake_backends.json")],
                       stderr=open("/tmp/lion-test-gw.log", "w"))
 try:
@@ -86,6 +89,12 @@ try:
     check("models listed", [x["id"] for x in m["data"]] == ["a1", "a2", "b1"], [x["id"] for x in m["data"]])
     s, p = req("GET", "/props")
     check("router props", p.get("role") == "router")
+    check("UI defaults from the config + system_prompt_file",
+          p.get("ui_settings") == {"theme": "dark", "systemMessage": "Use LaTeX for math."}, p.get("ui_settings"))
+    open(PROMPT, "w").write("Edited prompt.")
+    s, p = req("GET", "/props?model=b1")
+    check("system prompt edits apply without a restart", p.get("ui_settings", {}).get("systemMessage") == "Edited prompt.",
+          p.get("ui_settings"))
     s, p = req("GET", "/props?model=b1")
     check("props of a model never loaded", s == 200 and p["model_alias"] == "b1" and p["n_ctx"] == 8192)
     check("nothing started by listing / props", not any(models_running().values()))

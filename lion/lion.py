@@ -284,6 +284,8 @@ HOP_BY_HOP = {"connection", "keep-alive", "transfer-encoding", "content-length",
 class Gateway:
     def __init__(self, cfg, base, args):
         self.cfg = cfg
+        self.base = base
+        self.config_path = os.path.abspath(args.config)
         self.backends = [Backend(b, base) for b in cfg["backends"]]
         self.by_model = {m["id"]: b for b in self.backends for m in b.models}
         self.default_model = cfg.get("default_model") or self.backends[0].chat_models()[0]["id"]
@@ -340,8 +342,30 @@ class Gateway:
         m = self.model_cfg(mid)
         p.update({"model": mid, "model_alias": mid, "build_info": "lion",
                   "modalities": {"vision": bool(m.get("vision")), "audio": False, "video": bool(m.get("video"))}})
+        p["ui_settings"] = {**(p.get("ui_settings") or {}), **self.ui_settings()}
         p.pop("role", None)
         return p
+
+    def ui_settings(self):
+        """The web UI's default settings: the config's "ui_settings" (any setting of the UI's Settings dialog, by its
+        key, e.g. "systemMessage"), and "system_prompt_file" (a text file whose content becomes "systemMessage").
+        Both are read again on every /props request, so edits apply at the next page load without a restart. The UI
+        uses them for every setting the user has not changed in its Settings dialog."""
+        try:
+            cfg = json.load(open(self.config_path))
+        except (OSError, ValueError) as e:
+            log(f"config {self.config_path} unreadable ({e}); using the one loaded at start")
+            cfg = self.cfg
+        s = dict(cfg.get("ui_settings") or {})
+        f = cfg.get("system_prompt_file")
+        if f:
+            try:
+                text = open(path_of(self.base, f), encoding="utf-8").read().strip()
+                if text:
+                    s["systemMessage"] = text
+            except OSError as e:
+                log(f"system_prompt_file {f}: {e}")
+        return s
 
     def models(self):
         data = []
