@@ -17,6 +17,7 @@ import http.server
 import json
 import mimetypes
 import os
+import queue
 import signal
 import socket
 import subprocess
@@ -27,10 +28,57 @@ import urllib.parse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
+# Logging must never block the gateway: some lines are written while a server starts or while the fleet's lock is held,
+# and a terminal that stops reading (Ctrl+S, a frozen pane) blocks every write to it. So a line goes to the log file
+# (<state_dir>/lion.log) at once and to stderr through a writer thread with a bounded queue; when stderr stalls, lines
+# for it are dropped (and counted) instead.
+_log_q = queue.Queue(maxsize=2000)
+_log_file = None
+_log_dropped = 0
+
+
+def _stderr_writer():
+    global _log_dropped
+    while True:
+        line = _log_q.get()
+        try:
+            if _log_dropped:
+                n, _log_dropped = _log_dropped, 0
+                sys.stderr.write(f"{time.strftime('%H:%M:%S ')}lion: ({n} log lines not shown: stderr was blocked)\n")
+            sys.stderr.write(line)
+            sys.stderr.flush()
+        except (OSError, ValueError):
+            pass
+
+
+threading.Thread(target=_stderr_writer, daemon=True).start()
+
 
 def log(msg):
-    sys.stderr.write(time.strftime("%H:%M:%S ") + "lion: " + msg + "\n")
-    sys.stderr.flush()
+    global _log_dropped
+    line = time.strftime("%H:%M:%S ") + "lion: " + msg + "\n"
+    if _log_file is not None:
+        try:
+            _log_file.write(line)
+            _log_file.flush()
+        except (OSError, ValueError):
+            pass
+    try:
+        _log_q.put_nowait(line)
+    except queue.Full:
+        _log_dropped += 1
+
+
+def open_log_file(path, max_bytes=10 << 20):
+    """<state_dir>/lion.log, appended; moved to lion.log.1 when it passes max_bytes at startup."""
+    global _log_file
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if os.path.exists(path) and os.path.getsize(path) > max_bytes:
+            os.replace(path, path + ".1")
+        _log_file = open(path, "a", encoding="utf-8")
+    except OSError as e:
+        log(f"no log file {path}: {e}")
 
 
 def path_of(base, p):
@@ -109,7 +157,14 @@ class Fleet:
                 self._swap_to(b, on_wait)
                 continue
             if on_wait:
-                on_wait()
+                try:
+                    on_wait()
+                except OSError:   # the client left while waiting: do not leave its swap request behind
+                    with self.cond:
+                        if self.want is b and not self.starting:
+                            self.want = None   # other requests for b set it again on their next turn
+                        self.cond.notify_all()
+                    raise
 
     def release(self):
         with self.cond:
@@ -155,7 +210,10 @@ class Fleet:
         while True:
             if on_wait and time.time() - last_ping >= 1.0:   # e.g. keep the requester's event stream alive
                 last_ping = time.time()
-                on_wait()
+                try:
+                    on_wait()
+                except OSError:   # the client left: finish the start anyway (the next request uses the server;
+                    on_wait = None  # aborting here would leave the process running, untracked, on its port)
             if b.proc.poll() is not None:
                 raise RuntimeError(f"{b.name} exited during start (code {b.proc.returncode}): {tail(b.log_path)}")
             if time.time() - t0 > self.start_timeout:
@@ -290,6 +348,7 @@ class Gateway:
         self.by_model = {m["id"]: b for b in self.backends for m in b.models}
         self.default_model = cfg.get("default_model") or self.backends[0].chat_models()[0]["id"]
         state = path_of(base, cfg.get("state_dir", "~/.cache/lion"))
+        open_log_file(os.path.join(state, "lion.log"))
         self.props_path = os.path.join(state, "props.json")
         try:
             self.props_cache = json.load(open(self.props_path))

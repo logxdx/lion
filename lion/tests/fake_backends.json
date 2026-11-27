@@ -7,11 +7,69 @@
   "tools": false,
   "state_dir": "/tmp/lion-test",
   "system_prompt_file": "/tmp/lion-test/system_prompt.txt",
-  "ui_settings": {"theme": "dark"},
+  "ui_settings": {
+    "theme": "dark"
+  },
   "backends": [
-    {"name": "fakeA", "command": ["python3", "fake_backend.py", "--port", "11600", "--name", "fakeA"], "port": 11600,
-     "models": [{"id": "a1", "n_ctx": 4096}, {"id": "a2", "n_ctx": 4096}]},
-    {"name": "fakeB", "command": ["python3", "fake_backend.py", "--port", "11601", "--name", "fakeB"], "port": 11601,
-     "models": [{"id": "b1", "n_ctx": 8192}]}
+    {
+      "name": "fakeA",
+      "command": [
+        "python3",
+        "fake_backend.py",
+        "--port",
+        "11600",
+        "--name",
+        "fakeA"
+      ],
+      "port": 11600,
+      "models": [
+        {
+          "id": "a1",
+          "n_ctx": 4096
+        },
+        {
+          "id": "a2",
+          "n_ctx": 4096
+        }
+      ]
+    },
+    {
+      "name": "fakeB",
+      "command": [
+        "python3",
+        "fake_backend.py",
+        "--port",
+        "11601",
+        "--name",
+        "fakeB"
+      ],
+      "port": 11601,
+      "models": [
+        {
+          "id": "b1",
+          "n_ctx": 8192
+        }
+      ]
+    },
+    {
+      "name": "fakeC",
+      "command": [
+        "python3",
+        "fake_backend.py",
+        "--port",
+        "11603",
+        "--name",
+        "fakeC",
+        "--start-delay",
+        "4"
+      ],
+      "port": 11603,
+      "models": [
+        {
+          "id": "c1",
+          "n_ctx": 4096
+        }
+      ]
+    }
   ]
 }
