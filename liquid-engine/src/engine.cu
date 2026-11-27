@@ -1192,6 +1192,12 @@ static void launch_gemv(GemvArgs a, int max_grid, cudaStream_t s, bool ex, int n
     fn<<<grid, 256, sm, s>>>(a);
 }
 
+// env switch: set, non-empty and not "0"
+static bool env_on(const char* name) {
+    const char* e = getenv(name);
+    return e && *e && strcmp(e, "0") != 0;
+}
+
 static int g_pf_kb = -1;  // total L2 prefetch per transition (KiB); env LIQUID_PF_KB
 static Prefetch make_pf(const QWeight& w, int kb) {
     Prefetch f{};
@@ -1609,8 +1615,11 @@ void Engine::run_layers(int slot, int T, int p0, const int* grp, const int* gspa
                 half* ks = l.ks ? l.ks + slot * l.kvs_slot_elems : nullptr;
                 half* vs = l.vs ? l.vs + slot * l.kvs_slot_elems : nullptr;
                 // q8 KV: int8 QK^T + FP8 PV flash attention (flash8.cuh); LIQUID_FA16=1 keeps the f16 kernel
-                static const bool fa16 = getenv("LIQUID_FA16") != nullptr;
-                const bool fa8 = kv_q8_ && !fa16;
+                static const bool fa16 = env_on("LIQUID_FA16");
+                // LIQUID_FA_ALT=1 (profiling): global layers alternate the two kernels, timed side by side in one run
+                static const bool fa_alt = env_on("LIQUID_FA_ALT");
+                static int fa_alt_i = 0;
+                const bool fa8 = kv_q8_ && (fa_alt && !l.swa ? (fa_alt_i++ & 1) == 0 : !fa16);
                 k_qk_rope_cache<<<T, 768, 0, st_>>>(p.big, p0, l.q_norm, l.k_norm, l.rope_ff,
                                                     l.swa ? cfg_.rope_base_swa : cfg_.rope_base, eps, p.qh, kc, vc,
                                                     ks, vs, l.cap, kv_q8_, fa8 ? p.q8 : nullptr, p.qs8);
@@ -1649,7 +1658,7 @@ void Engine::run_layers(int slot, int T, int p0, const int* grp, const int* gspa
                     double pairs = 0;
                     const int W = l.swa ? cfg_.swa_window : 0;
                     for (int t = 0; t < T; t++) pairs += W ? std::min(W, p0 + t + 1) : p0 + t + 1;
-                    prof_mark(l.swa ? "attn(swa)" : "attn(global)", st_, pairs * 16 * 128 * 4);
+                    prof_mark(l.swa ? "attn(swa)" : fa8 ? "attn(global)" : "attn(global,f16)", st_, pairs * 16 * 128 * 4);
                 }
                 if (nd) {  // decode rows: rope + KV write + split attention over their own slots (decode kernel)
                     AttnArgs at{};

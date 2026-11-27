@@ -346,7 +346,7 @@ int main(int argc, char** argv) {
             const std::string mname = model.substr(model.find_last_of('/') + 1);
             printf("%s, %d decoding slots at depth %d, prompt at depth %d, VRAM %.0f MiB\n", mname.c_str(), N, pp, pf_depth,
                    eng.gpu_bytes() / 1048576.0);
-            printf("| chunk | decode ms | chunk ms | mixed ms | alternating: decode t/s/stream, prefill t/s | mixed: decode t/s/stream, prefill t/s |\n");
+            printf("| chunk | decode ms | chunk ms | mixed ms | alternating: decode t/s/stream, prefill t/s | mixed (chunk - N prompt rows + N decode rows): decode t/s/stream, prefill t/s |\n");
             printf("|---|---|---|---|---|---|\n");
             for (int C : chunks) {
                 double td = 0, tc = 0, tm = 0;
@@ -360,14 +360,14 @@ int main(int argc, char** argv) {
                     const double c = ms(t0);
                     eng.load_checkpoint(ps, cp);
                     t0 = clk::now();
-                    eng.mixed_step(ps, pt.data() + pf_depth, C, ids, toks, done);
+                    eng.mixed_step(ps, pt.data() + pf_depth, std::max(1, C - N), ids, toks, done);  // C rows in all (GEMM tiles)
                     const double m = ms(t0);
                     eng.load_checkpoint(ps, cp);
                     if (r == 0) continue;
                     td += d / reps; tc += c / reps; tm += m / reps;
                 }
                 printf("| %d | %.2f | %.2f | %.2f | %.1f, %.0f | %.1f, %.0f |\n", C, td, tc, tm, 1e3 / (tc + td),
-                       C * 1e3 / (tc + td), 1e3 / tm, C * 1e3 / tm);
+                       C * 1e3 / (tc + td), 1e3 / tm, std::max(1, C - N) * 1e3 / tm);
             }
             return 0;
         }

@@ -575,8 +575,11 @@ private:
         const double dec = dec_ms_[std::min(nb, le::MAX_SLOTS)] > 0 ? dec_ms_[std::min(nb, le::MAX_SLOTS)] : 10.0;
         const double per_tok = tok_ms_ > 0 ? tok_ms_ : 0.05;
         int c = (int)((cfg_.mixed_budget - 1.0) * dec / per_tok);
-        c = c / 32 * 32;
-        return std::max(cfg_.mixed_min, std::min(c, cfg_.busy_chunk));
+        c = std::max(cfg_.mixed_min, std::min(c, cfg_.busy_chunk));
+        // prompt + decode rows fill whole 128-row GEMM tiles: up to 128 rows cost about the same as 32 (the weight
+        // read dominates), and one row past a multiple adds a whole tile (measured: --bench-mixed)
+        const int rows = std::max(128, (c + nb) / 128 * 128);
+        return rows - nb;
     }
 
     void after_decode(const std::vector<int>& ids, const std::vector<int>& toks, const std::vector<char>& done, double dt) {
