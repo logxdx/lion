@@ -363,9 +363,12 @@ private:
     int mixed_chunk(int nd) const {
         const double dec = dec_ms_[std::min(nd, 64)] > 0 ? dec_ms_[std::min(nd, 64)] : 20.0;
         const double per_row = row_ms_ > 0 ? row_ms_ : 0.1;
-        int c = (int)((opt_.mixed_budget - 1.0) * dec / per_row) / 32 * 32;
+        int c = (int)((opt_.mixed_budget - 1.0) * dec / per_row);
         c = std::max(opt_.mixed_min, std::min(c, opt_.chunk_busy));
-        return std::min(c, eng_->chunk_rows() - nd);
+        // prompt + decode rows fill whole 128-row GEMM tiles: up to 128 rows cost about the same as 32 (the weight
+        // read dominates), and one row past a multiple adds a whole tile (measured: --bench-mixed)
+        const int rows = std::min(std::max(128, (c + nd) / 128 * 128), eng_->chunk_rows() / 128 * 128);
+        return rows - nd;
     }
 
     void iterate() {

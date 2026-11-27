@@ -211,14 +211,14 @@ int main(int argc, char** argv) {
             for (int r = 0; r <= reps; r++) {
                 const double d = timed(decode_rows(), slots);
                 const double c = timed(prompt_rows(C), 0);
-                auto mrows = prompt_rows(C);
+                auto mrows = prompt_rows(C - slots);   // C rows in all: whole 128-row GEMM tiles
                 for (auto& row : decode_rows()) mrows.push_back(row);
                 const double m = timed(mrows, slots);
                 if (r == 0) continue;
                 td += d / reps; tc += c / reps; tm += m / reps;
             }
             printf("| %d | %.2f | %.2f | %.2f | %.1f, %.0f | %.1f, %.0f |\n", C, td, tc, tm, 1e3 / (tc + td), C * 1e3 / (tc + td),
-                   1e3 / tm, C * 1e3 / tm);
+                   1e3 / tm, (C - slots) * 1e3 / tm);
             fflush(stdout);
         }
         return 0;
